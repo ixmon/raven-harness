@@ -1,0 +1,94 @@
+use std::path::PathBuf;
+
+/// Computed budget limits derived from the server's actual context window size.
+/// All tool-result truncation limits, file-read line caps, etc. flow from this
+/// so the agent automatically adapts to any model / backend.
+#[derive(Clone, Debug)]
+pub struct ContextBudget {
+    /// Raw context size in tokens (from server probe or CLI override)
+    pub context_tokens: u32,
+    /// Max bytes per tool result before truncation
+    pub tool_result_bytes: usize,
+    /// Max lines for a default (no range) file read
+    pub read_line_limit: usize,
+    /// How the value was obtained
+    pub source: ContextSource,
+}
+
+#[derive(Clone, Debug)]
+pub enum ContextSource {
+    Probed,
+    CliOverride,
+    Default,
+}
+
+impl std::fmt::Display for ContextSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Probed => write!(f, "probed"),
+            Self::CliOverride => write!(f, "override"),
+            Self::Default => write!(f, "default"),
+        }
+    }
+}
+
+impl ContextBudget {
+    /// Compute budget from context window size and desired tool rounds.
+    ///
+    /// Budget allocation (% of estimated context bytes):
+    ///   system + session:   10%
+    ///   conversation:       20%
+    ///   tool results:       60%  ← the lever we size
+    ///   response reserve:   10%
+    pub fn from_context_tokens(n_ctx: u32, desired_rounds: u32) -> Self {
+        let bytes_per_token: f64 = 3.5; // conservative average for code
+        let context_bytes = n_ctx as f64 * bytes_per_token;
+        let tool_budget = context_bytes * 0.60;
+        let rounds = (desired_rounds as f64).max(1.0);
+
+        let tool_result_bytes = ((tool_budget / rounds) as usize)
+            .max(500)    // floor: always allow *some* output
+            .min(50_000); // cap: even 1M-token contexts shouldn't dump 200KB per result
+
+        let read_line_limit = (tool_result_bytes / 45) // ~45 bytes per line of code
+            .max(20)
+            .min(1_000);
+
+        Self {
+            context_tokens: n_ctx,
+            tool_result_bytes,
+            read_line_limit,
+            source: ContextSource::Probed,
+        }
+    }
+
+    /// Safe fallback when probing fails and no CLI override is given.
+    pub fn default_fallback() -> Self {
+        let mut b = Self::from_context_tokens(8192, 10);
+        b.source = ContextSource::Default;
+        b
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub workspace: PathBuf,
+    pub temperature: f32,
+    pub max_tokens: u32,
+    pub max_rounds: u32,
+    /// Optional pre-initialized session from main (for trust prompt + repo cache bootstrap).
+    /// If present, Agent will use it instead of doing its own Session::init.
+    pub prebuilt_session: Option<crate::session::Session>,
+    /// Computed context budget — derived from server probe, CLI override, or default.
+    pub context_budget: ContextBudget,
+}
+
+impl Config {
+    pub fn chat_url(&self) -> String {
+        let base = self.base_url.trim_end_matches('/');
+        format!("{}/chat/completions", base)
+    }
+}
