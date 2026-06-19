@@ -92,3 +92,24 @@ impl Config {
         format!("{}/chat/completions", base)
     }
 }
+
+/// Runtime representation of an inference endpoint (API key decrypted in memory).
+#[derive(Clone, Debug)]
+pub struct InferenceEndpoint {
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>, // decrypted, in-memory only
+}
+
+impl InferenceEndpoint {
+    /// Build from the CLI/config defaults (the always-present "local" endpoint).
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            label: format!("CLI ({})", config.model),
+            base_url: config.base_url.clone(),
+            model: config.model.clone(),
+            api_key: config.api_key.clone(),
+        }
+    }
+}

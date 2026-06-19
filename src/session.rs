@@ -62,6 +62,27 @@ pub struct RepoCache {
     pub project_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecApprovalMode {
+    #[default]
+    Babysitter,     // Always Ask
+    SpringBreak,    // Yolo for remainder of this session (reset on restart)
+    Vegas,          // Yolo inside sandbox only (ask for outside)
+    Thunderdome,    // Eternal Yolo for this workspace (persisted)
+}
+
+impl ExecApprovalMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ExecApprovalMode::Babysitter => "Babysitter - Always Ask",
+            ExecApprovalMode::SpringBreak => "Spring Break - Yolo for remainder of session",
+            ExecApprovalMode::Vegas => "Vegas - Yolo in sandbox",
+            ExecApprovalMode::Thunderdome => "Thunderdome - eternal Yolo, anytime, anywhere",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionMeta {
     pub session_id: String,
@@ -85,6 +106,14 @@ pub struct SessionMeta {
     /// A compact rolling summary of recent work (last ~10 turns or equivalent).
     /// Kept small on purpose so it always fits in the injected block.
     pub recent_turns_summary: String,
+
+    /// Controls approval requirements for side-effecting actions (exec, writes, etc.)
+    #[serde(default)]
+    pub exec_approval_mode: ExecApprovalMode,
+
+    /// Optional summary of initial analysis done on first trust.
+    #[serde(default)]
+    pub initial_analysis: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -659,7 +688,9 @@ pub fn build_repo_cache(workspace: &Path, trusted: bool) -> RepoCache {
 }
 
 /// Convenience: run the trust flow + (re)build cache if trusted, and store result in meta.
+/// On first trust for a new session, perform a basic initial analysis and store it.
 pub fn ensure_repo_cache(session: &mut Session) -> Result<()> {
+    let was_trusted = session.meta.trusted;
     if !session.meta.trusted {
         // Try to prompt
         let trusted_now = trust_prompt(&session.workspace, false);
@@ -668,6 +699,17 @@ pub fn ensure_repo_cache(session: &mut Session) -> Result<()> {
     if session.meta.trusted {
         let cache = build_repo_cache(&session.workspace, true);
         session.meta.repo_cache = cache;
+
+        // On first trust, record an initial analysis into meta
+        if !was_trusted {
+            let analysis = format!(
+                "Initial trust granted. Repo summary: {}. Key files: {}. Project hints: {:?}.",
+                session.meta.repo_cache.short_summary,
+                session.meta.repo_cache.important_paths.len(),
+                session.meta.repo_cache.project_type
+            );
+            session.meta.initial_analysis = Some(analysis);
+        }
     }
     session.meta.updated_at = now_iso();
     session.save_meta()

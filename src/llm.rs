@@ -118,10 +118,23 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
-        let mut request = self.http.post(self.config.chat_url()).json(&body);
+        // Enable reasoning/thinking for providers that support it (OpenRouter, etc.)
+        if is_openrouter(&self.config.base_url) {
+            body["reasoning"] = json!({ "enabled": true });
+        }
+
+        let mut request = self.http.post(self.config.chat_url())
+            .json(&body);
 
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
+        }
+
+        // OpenRouter attribution headers
+        if is_openrouter(&self.config.base_url) {
+            request = request
+                .header("HTTP-Referer", "https://github.com/raven-hotel")
+                .header("X-Title", "Raven Hotel TUI");
         }
 
         let resp = request.send().await?;
@@ -185,10 +198,10 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
-        let mut request = self.http.post(self.config.chat_url()).json(&body);
-
-        if let Some(key) = &self.config.api_key {
-            request = request.bearer_auth(key);
+        // Enable reasoning/thinking for providers that support it
+        let openrouter = is_openrouter(&self.config.base_url);
+        if openrouter {
+            body["reasoning"] = json!({ "enabled": true });
         }
 
         // Spawn the actual streaming work so the caller can immediately get the receiver
@@ -197,7 +210,7 @@ impl LlmClient {
         let api_key = self.config.api_key.clone();
 
         tokio::spawn(async move {
-            let _ = Self::do_stream(http, url, api_key, body, tx).await;
+            let _ = Self::do_stream(http, url, api_key, body, tx, openrouter).await;
         });
 
         Ok(rx)
@@ -209,10 +222,16 @@ impl LlmClient {
         api_key: Option<String>,
         body: serde_json::Value,
         tx: mpsc::Sender<StreamChunk>,
+        openrouter: bool,
     ) -> Result<()> {
         let mut req = http.post(url).json(&body);
         if let Some(k) = api_key {
             req = req.bearer_auth(k);
+        }
+        if openrouter {
+            req = req
+                .header("HTTP-Referer", "https://github.com/raven-hotel")
+                .header("X-Title", "Raven Hotel TUI");
         }
 
         let resp = req.send().await?;
@@ -279,8 +298,12 @@ impl LlmClient {
                             let delta_val = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
                             let delta = &delta_val;
 
-                            // Reasoning / thinking content (Qwen-style)
-                            if let Some(thinking) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                            // Reasoning / thinking content (Qwen-style: reasoning_content,
+                            // OpenRouter/Kimi-style: reasoning)
+                            if let Some(thinking) = delta.get("reasoning_content")
+                                .and_then(|v| v.as_str())
+                                .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()))
+                            {
                                 if !thinking.is_empty() {
                                     let _ = tx.send(StreamChunk::Thinking(thinking.to_string())).await;
                                 }
@@ -432,4 +455,9 @@ pub async fn probe_context_size(base_url: &str, model: &str, api_key: Option<&st
     }
 
     None
+}
+
+/// Detect whether a base URL points to OpenRouter.
+fn is_openrouter(base_url: &str) -> bool {
+    base_url.contains("openrouter.ai")
 }

@@ -4,7 +4,7 @@ Raven Harness exists because I wanted a simple, capable way for a model to do re
 
 At the same time, I wanted the same harness to work smoothly with frontier cloud models when a task calls for maximum capability. This gives genuine flexibility: use fast, private, low-cost local inference (via llama.cpp or similar) for everyday work, and reach for the most powerful models only when you actually need them — all through one consistent interface and toolset.
 
-Privacy and security are first-class concerns. Your code never has to leave your machine unless you explicitly decide to use a remote endpoint. Flexibility is equally important: the system is designed to be pointed at any OpenAI-compatible server, local or remote.
+Privacy and security are first-class concerns. Your code never has to leave your machine unless you explicitly decide to use a remote endpoint. The TUI includes a full execution approval system (`/mode`) with four sandbox levels (Babysitter always-ask through Thunderdome yolo) so you stay in control of writes and shell commands. Flexibility is equally important: the system is designed to be pointed at any OpenAI-compatible server, local or remote.
 
 A significant part of making this practical (especially when using paid APIs) is aggressive, intelligent context management. Features like persistent sessions with goal tracking, repo-aware discovery with importance ranking, mtime-matched file summaries, and dynamic context budgeting are not just nice-to-haves — they let the agent stay coherent over long tasks while dramatically reducing token spend.
 
@@ -50,7 +50,7 @@ Each workspace gets a persistent session:
 
 ```
 ~/.raven-hotel/sessions/<session-id>/
-├── meta.json        # goal, tests, pitfalls, discoveries, repo_cache, recent_turns_summary
+├── meta.json        # goal, tests, pitfalls, discoveries, repo_cache, recent_turns_summary, exec_approval_mode
 ├── full_log.jsonl   # append-only history of turns
 └── context.db       # SQLite cache of mtime-matched file summaries
 ```
@@ -66,6 +66,35 @@ When trusted, a **safe, deterministic repo discovery** is performed:
 - Produces a compact tree + "most important files" list + language hint + short summary
 
 This information (plus current goal, known pitfalls, recent discoveries, and a rolling summary of the last ~10 turns) is injected as a compact **"SESSION CONTEXT"** block at the top of every model prompt.
+
+### Execution Approvals & Sandbox Modes (`/mode`)
+
+The TUI gates side-effecting tool calls behind user approval (separate from the initial "trust this workspace?" indexing prompt).
+
+Press `/mode` at any time to bring up a 4-option menu (↑/↓ or j/k to navigate, Enter to select, Esc to cancel). The current mode is pre-selected and the choice is persisted in `meta.json`.
+
+| Mode          | When it asks                                                                 | Persisted? |
+|---------------|------------------------------------------------------------------------------|------------|
+| **Babysitter**    | Always, for any `write`, `patch`, or `exec` (recommended default)            | No (resets to this on new sessions) |
+| **Spring Break**  | Never (yolo for the rest of this run)                                        | No |
+| **Vegas**         | Only for `exec` commands that look like they escape the workspace sandbox    | Yes |
+| **Thunderdome**   | Never                                                                        | Yes |
+
+**Sandbox detection** (for Vegas) is a simple conservative heuristic on the command string: anything containing `cd /`, `/etc`, `/root`, `curl `, `wget `, `nc `, etc. is treated as "outside".
+
+- Approval shows a compact yellow overlay dialog above the input:
+  - `write path/to/file.rs (1234 bytes)`
+  - `patch src/main.rs`
+  - `exec: cargo test --quiet`
+  - (Full file contents or giant blobs are **never** shown in the prompt.)
+- Answer with **Y** / **N** / **Esc** (deny). Keys work even while the agent is "processing".
+- Denied actions are reported back to the model as tool results so the turn stays coherent; they are never executed.
+- Only the actually-approved subset of tool calls proceeds to `execute_and_record_tool_calls`.
+- Current mode is logged on turn start and visible via `/status`.
+
+This gives you progressive trust: full guardrails when the agent is exploring or editing unfamiliar code, relaxed operation once you're comfortable inside a project.
+
+The same approval channel and dialog infrastructure also protects `update_goal` in Babysitter mode.
 
 ### File Summary Cache (`read_summary` / `store_summary`)
 
@@ -86,6 +115,8 @@ This is one of the most effective ways small local models stay coherent across l
 You can manually scroll either pane. When the right pane has focus (or you hold Shift), arrow keys and PageUp/PageDown control the Trace pane. There's visual feedback (colored borders) and a small "flash" effect when you hit the top or bottom while scrolling.
 
 A dedicated background thread keeps keyboard input responsive even while the model is streaming long responses.
+
+Approval dialogs (Babysitter mode etc.) appear as a yellow "Action Approval" overlay above the input line; Y/N/Esc are handled with priority even during streaming.
 
 ### Token Usage Visibility
 
@@ -108,6 +139,8 @@ Very useful when working close to context limits with local models.
   - `record_discovery(text)`
   - `read_summary(path)`
   - `store_summary(path, mtime, summary)`
+
+**All mutating tools** (`write`, `patch`, `exec`) are subject to the current `/mode` approval policy (see Execution Approvals above).
 
 The agent is instructed to follow Think → Act (minimal tools) → Report actual results, and strongly prefers `read` then `patch` for edits.
 

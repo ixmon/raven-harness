@@ -1,8 +1,11 @@
 #!/bin/bash
 set -e
 
-# Generate high-quality ASCII art for the Raven TUI from a PNG image.
-# This produces a file that can be included in the Rust source.
+# Generate assets for the Raven TUI from a source PNG image.
+#
+# This script now supports two outputs:
+# 1. Clean high-quality PNG (raven.png) - for ratatui-image (real graphics or halfblock fallback).
+# 2. Low-res dithered BMP + ASCII (raven_low.bmp + raven.txt) - for classic ASCII art in the TUI.
 #
 # Requirements on your machine:
 #   - ImageMagick (convert)
@@ -10,15 +13,20 @@ set -e
 #     or fallback python + pillow
 #
 # Usage:
-#   ./scripts/generate_raven.sh /path/to/your/raven_on_perch.png
+#   ./scripts/generate_raven.sh /path/to/your/clean_raven.png
 #
-# Recommended source image:
-#   - Search for "gothic raven on perch illustration" or "edgar allan poe raven dark moody"
-#   - Or generate one with an AI image tool: "highly detailed gothic raven perched on a gnarled wooden branch, black feathers, dark atmospheric lighting, black and white or low color"
-#   - Crop tightly to the raven + perch, good contrast.
+# Recommended source image (generate with Grok Imagine or similar):
+#   "highly detailed gothic raven perched on a gnarled wooden branch, black feathers,
+#    dark atmospheric lighting, clear features and silhouette, good contrast"
+#   - Crop tightly to the raven, dark background preferred.
+#   - For ratatui-image: keep the source clean (no heavy dither/threshold).
 #
-# Then run this script. It will output to assets/raven.txt (plain) and assets/raven.ansi (colored).
-# You can copy the .txt content into the code or load at runtime.
+# Output:
+#   assets/raven.png            - clean version (copy your input or lightly processed)
+#   assets/raven_low.bmp        - low-res for ASCII
+#   assets/raven.txt / .ansi    - ASCII art versions
+#
+# The clean PNG is used by examples/raven_visuals.rs for modern image rendering.
 
 if [ $# -eq 0 ]; then
     echo "Usage: $0 /path/to/raven.png"
@@ -27,10 +35,16 @@ if [ $# -eq 0 ]; then
 fi
 
 INPUT_PNG="$1"
+
+# Preserve a clean high-quality copy for ratatui-image usage.
+# This is the recommended input for modern image rendering (no dither/threshold).
+cp "$INPUT_PNG" assets/raven.png
+echo "==> Saved clean source as assets/raven.png (for ratatui-image)"
+
 # Very low resolution as requested for good TUI fit and "bitmap-like" feel.
 # Example: -geometry 60x30 or even smaller like 40x22.
 # Smaller geometry = chunkier, more "pixel art" / low-res BMP to ASCII look.
-GEOMETRY="80x45"   # As requested. Low-res "bitmap" style for ASCII.
+GEOMETRY="80x45"   # Low-res "bitmap" style for ASCII.
 
 if [ ! -f "$INPUT_PNG" ]; then
     echo "Error: File not found: $INPUT_PNG"

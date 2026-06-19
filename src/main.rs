@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod agent;
 mod config;
+mod keystore;
 mod llm;
 mod session;
 mod tools;
@@ -119,6 +120,52 @@ async fn main() -> Result<()> {
         );
     }
 
+    // === Encrypted endpoint vault ===
+    let raven_home = dirs_next_home().join(".raven-hotel");
+    let keystore_path = raven_home.join("endpoints.json");
+    let mut ks = keystore::Keystore::load_or_create(&keystore_path)
+        .unwrap_or_else(|e| {
+            eprintln!("warning: could not load endpoints.json: {}", e);
+            keystore::Keystore::load_or_create(&keystore_path).unwrap()
+        });
+
+    // If any endpoints have encrypted keys, prompt for vault password
+    // Supports RAVEN_VAULT_PASSWORD env var for non-interactive / testing use
+    if ks.has_encrypted_keys() {
+        if let Ok(pw) = std::env::var("RAVEN_VAULT_PASSWORD") {
+            match ks.unlock(&pw) {
+                Ok(()) => eprintln!("Vault unlocked (from RAVEN_VAULT_PASSWORD)."),
+                Err(e) => eprintln!("RAVEN_VAULT_PASSWORD failed: {}. Encrypted endpoints unavailable.", e),
+            }
+        } else if is_interactive_tui {
+            eprintln!("Encrypted API keys found. Enter vault password:");
+            for attempt in 1..=3u8 {
+                match rpassword::read_password() {
+                    Ok(pw) => match ks.unlock(&pw) {
+                        Ok(()) => {
+                            eprintln!("Vault unlocked.");
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 3 {
+                                eprintln!("Wrong password ({}/3): {}", attempt, e);
+                            } else {
+                                eprintln!("Failed to unlock vault after 3 attempts. Encrypted endpoints will be unavailable.");
+                            }
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!("Could not read password.");
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Decrypt saved endpoints into runtime form
+    let saved_endpoints = ks.decrypt_all_endpoints().unwrap_or_default();
+
     if let Some(prompt) = args.prompt {
         // Non-interactive single shot — still benefits from session (meta is updated on disk)
         // Set the request on the bootstrapped sess before moving it into config.
@@ -161,5 +208,12 @@ async fn main() -> Result<()> {
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.
     // Trust prompt + any eprintln above already happened on the normal terminal.
-    tui_app::run(c).await
+    tui_app::run(c, saved_endpoints, ks).await
+}
+
+/// Get home directory (simple fallback).
+fn dirs_next_home() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
 }

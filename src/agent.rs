@@ -62,7 +62,7 @@ pub struct Agent {
     /// every prompt construction so it stays current.
     conversation: Vec<Message>,
     /// Persistent session (goal tracking, repo cache, full log, meta.json under ~/.raven-hotel/)
-    session: Option<crate::session::Session>,
+    pub(crate) session: Option<crate::session::Session>,
 }
 
 impl Agent {
@@ -298,6 +298,23 @@ impl Agent {
         }
         self.persist_turn().await;
         records
+    }
+
+    /// Record a denied tool call into conversation (so the model sees a tool result)
+    /// without actually executing the side effect.
+    pub fn record_tool_denial(&mut self, tc: &ToolCall, reason: &str) {
+        self.conversation.push(Message {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![tc.clone()]),
+            tool_call_id: None,
+        });
+        self.conversation.push(Message {
+            role: "tool".into(),
+            content: Some(reason.to_string()),
+            tool_calls: None,
+            tool_call_id: Some(tc.id.clone()),
+        });
     }
 
     pub fn push_assistant_text(&mut self, text: &str) {
@@ -622,6 +639,54 @@ impl Agent {
             let trimmed = if sm.len() > 1600 { safe_truncate(&sm, 1600).to_string() + "..." } else { sm };
             let _ = s.set_recent_turns_summary(&trimmed);
         }
+    }
+
+    /// Current exec approval mode from the session (for UI to decide on dialogs)
+    pub fn current_exec_mode(&self) -> crate::session::ExecApprovalMode {
+        self.session.as_ref()
+            .map(|s| s.meta.exec_approval_mode)
+            .unwrap_or_default()
+    }
+
+    /// Update the exec approval mode (from /mode UI) and persist if possible.
+    pub fn set_exec_approval_mode(&mut self, mode: crate::session::ExecApprovalMode) {
+        if let Some(s) = &mut self.session {
+            s.meta.exec_approval_mode = mode;
+            // note: caller should save_meta if needed
+        }
+    }
+
+    /// Estimate the number of tokens consumed by the current conversation.
+    /// Uses the same ~3.5 bytes/token heuristic as the context budget system.
+    pub fn estimated_context_tokens(&self) -> u32 {
+        let total_bytes: usize = self.conversation.iter().map(|m| {
+            let content_len = m.content.as_ref().map_or(0, |c| c.len());
+            let tc_len = m.tool_calls.as_ref().map_or(0, |tcs| {
+                tcs.iter().map(|tc| tc.function.name.len() + tc.function.arguments.len()).sum()
+            });
+            content_len + tc_len + 20 // ~20 bytes overhead for role, formatting
+        }).sum();
+        (total_bytes as f64 / 3.5) as u32
+    }
+
+    /// Switch the inference backend without losing conversation history.
+    /// Re-creates the LlmClient with the new endpoint config.
+    pub fn switch_endpoint(
+        &mut self,
+        endpoint: &crate::config::InferenceEndpoint,
+        budget: crate::config::ContextBudget,
+    ) {
+        self.config.base_url = endpoint.base_url.clone();
+        self.config.model = endpoint.model.clone();
+        self.config.api_key = endpoint.api_key.clone();
+        self.config.context_budget = budget;
+        self.client = LlmClient::new(self.config.clone());
+    }
+
+    /// Read-only access to the current config (for UI to display active endpoint).
+    #[allow(dead_code)]
+    pub fn current_config(&self) -> &Config {
+        &self.config
     }
 }
 
