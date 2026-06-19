@@ -15,6 +15,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 regex = "1.11"
 walkdir = "2.5"
+ignore = "0.4"
 scraper = "0.22"
 url = "2.5"
 html-escape = "0.2"
@@ -24,7 +25,7 @@ crossterm = "0.28"
 futures-util = "0.3"
 urlencoding = "2.1"
 bytes = "1"
-arboard = { version = "3.4", optional = true }  # future clipboard support
+arboard = { version = "3.4", optional = true }  # clipboard support (glm.md)
 rusqlite = { version = "0.31", features = ["bundled"] }
 ratatui-image = "0.9"
 image = { version = "0.24", default-features = false, features = ["bmp"] }
@@ -35,7 +36,8 @@ base64 = "0.22"
 rpassword = "7"
 
 [features]
-default = []
+default = ["clipboard"]
+clipboard = ["dep:arboard"]
 
 [[bin]]
 name = "raven-tui"

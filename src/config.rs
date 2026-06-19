@@ -113,3 +113,20 @@ impl InferenceEndpoint {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_context_budget_bounds() {
+        let b = ContextBudget::from_context_tokens(8192, 10);
+        assert!(b.tool_result_bytes >= 500);
+        assert!(b.tool_result_bytes <= 50_000);
+        assert!(b.read_line_limit >= 20);
+        assert!(b.read_line_limit <= 1000);
+
+        let small = ContextBudget::from_context_tokens(1024, 1);
+        assert!(small.tool_result_bytes >= 500);
+    }
+}

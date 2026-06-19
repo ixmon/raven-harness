@@ -61,6 +61,7 @@ pub struct ChatRequest {
     pub tools: Option<Vec<ToolDef>>,
     pub temperature: f32,
     pub max_tokens: u32,
+    #[allow(dead_code)]
     pub stream: bool,
 }
 
@@ -68,12 +69,14 @@ pub struct ChatRequest {
 pub struct ChatResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
+    #[allow(dead_code)]
     pub finish_reason: Option<String>,
     /// Raw usage if provided by the server
+    #[allow(dead_code)]
     pub usage: Option<Usage>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
@@ -85,7 +88,7 @@ pub struct Usage {
 pub enum StreamChunk {
     Token(String),
     Thinking(String), // for models that emit reasoning_content (Qwen etc.)
-    Done { content: String, tool_calls: Vec<ToolCall>, usage: Option<Usage> },
+    Done { content: String, tool_calls: Vec<ToolCall>, #[allow(dead_code)] usage: Option<Usage> },
     Error(String),
 }
 
@@ -317,39 +320,8 @@ impl LlmClient {
                                 }
                             }
 
-                            // Tool call deltas — accumulate by index (same logic as Raven's inference_router)
                             if let Some(tool_deltas) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                                for td in tool_deltas {
-                                    let idx = td.get("index")
-                                        .and_then(|i| i.as_u64())
-                                        .unwrap_or(0) as usize;
-
-                                    let entry = tool_accum.entry(idx).or_insert_with(|| ToolCall {
-                                        id: String::new(),
-                                        r#type: "function".to_string(),
-                                        function: FunctionCall {
-                                            name: String::new(),
-                                            arguments: String::new(),
-                                        },
-                                    });
-
-                                    if let Some(id) = td.get("id").and_then(|v| v.as_str()) {
-                                        if !id.is_empty() {
-                                            entry.id = id.to_string();
-                                        }
-                                    }
-
-                                    if let Some(func) = td.get("function") {
-                                        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
-                                            if !name.is_empty() {
-                                                entry.function.name = name.to_string();
-                                            }
-                                        }
-                                        if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
-                                            entry.function.arguments.push_str(args);
-                                        }
-                                    }
-                                }
+                                accumulate_tool_call_deltas(&mut tool_accum, tool_deltas);
                             }
                         }
                     }
@@ -460,4 +432,181 @@ pub async fn probe_context_size(base_url: &str, model: &str, api_key: Option<&st
 /// Detect whether a base URL points to OpenRouter.
 fn is_openrouter(base_url: &str) -> bool {
     base_url.contains("openrouter.ai")
+}
+
+/// Accumulate streaming tool-call fragments keyed by index.
+pub(crate) fn accumulate_tool_call_deltas(
+    tool_accum: &mut HashMap<usize, ToolCall>,
+    tool_deltas: &[serde_json::Value],
+) {
+    for td in tool_deltas {
+        let idx = td
+            .get("index")
+            .and_then(|i| i.as_u64())
+            .unwrap_or(0) as usize;
+
+        let entry = tool_accum.entry(idx).or_insert_with(|| ToolCall {
+            id: String::new(),
+            r#type: "function".to_string(),
+            function: FunctionCall {
+                name: String::new(),
+                arguments: String::new(),
+            },
+        });
+
+        if let Some(id) = td.get("id").and_then(|v| v.as_str()) {
+            if !id.is_empty() {
+                entry.id = id.to_string();
+            }
+        }
+
+        if let Some(func) = td.get("function") {
+            if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    entry.function.name = name.to_string();
+                }
+            }
+            if let Some(args) = func.get("arguments").and_then(|v| v.as_str()) {
+                entry.function.arguments.push_str(args);
+            }
+        }
+    }
+}
+
+
+#[cfg(test)]
+fn parse_sse_data_payload(data_str: &str) -> SseParseResult {
+    if data_str == "[DONE]" {
+        return SseParseResult::Done;
+    }
+
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(data_str) else {
+        return SseParseResult::Ignore;
+    };
+
+    if let Some(usage_val) = json.get("usage") {
+        if let Ok(u) = serde_json::from_value::<Usage>(usage_val.clone()) {
+            return SseParseResult::Usage(u);
+        }
+    }
+
+    let Some(choices) = json.get("choices").and_then(|c| c.as_array()) else {
+        return SseParseResult::Ignore;
+    };
+    let Some(choice) = choices.first() else {
+        return SseParseResult::Ignore;
+    };
+
+    let delta = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+
+    if let Some(thinking) = delta
+        .get("reasoning_content")
+        .and_then(|v| v.as_str())
+        .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()))
+    {
+        if !thinking.is_empty() {
+            return SseParseResult::Thinking(thinking.to_string());
+        }
+    }
+
+    if let Some(token) = delta.get("content").and_then(|v| v.as_str()) {
+        if !token.is_empty() {
+            return SseParseResult::Token(token.to_string());
+        }
+    }
+
+    if let Some(tool_deltas) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+        return SseParseResult::ToolDeltas(tool_deltas.clone());
+    }
+
+    SseParseResult::Ignore
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg(test)]
+enum SseParseResult {
+    Ignore,
+    Done,
+    Token(String),
+    Thinking(String),
+    ToolDeltas(Vec<serde_json::Value>),
+    Usage(Usage),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accumulate_tool_call_deltas_across_chunks() {
+        let mut acc = HashMap::new();
+
+        let chunk1 = serde_json::json!([{
+            "index": 0,
+            "id": "call_abc",
+            "function": { "name": "read", "arguments": "{\"path\":" }
+        }]);
+        accumulate_tool_call_deltas(&mut acc, chunk1.as_array().unwrap());
+
+        let chunk2 = serde_json::json!([{
+            "index": 0,
+            "function": { "arguments": "\"main.rs\"}" }
+        }]);
+        accumulate_tool_call_deltas(&mut acc, chunk2.as_array().unwrap());
+
+        let chunk3 = serde_json::json!([{
+            "index": 1,
+            "id": "call_def",
+            "function": { "name": "grep", "arguments": "{}" }
+        }]);
+        accumulate_tool_call_deltas(&mut acc, chunk3.as_array().unwrap());
+
+        assert_eq!(acc.len(), 2);
+        let tc0 = acc.get(&0).unwrap();
+        assert_eq!(tc0.id, "call_abc");
+        assert_eq!(tc0.function.name, "read");
+        assert_eq!(tc0.function.arguments, "{\"path\":\"main.rs\"}");
+
+        let tc1 = acc.get(&1).unwrap();
+        assert_eq!(tc1.id, "call_def");
+        assert_eq!(tc1.function.name, "grep");
+    }
+
+    #[test]
+    fn parse_sse_token_chunk() {
+        let payload = r#"{"choices":[{"delta":{"content":"hello"}}]}"#;
+        assert_eq!(
+            parse_sse_data_payload(payload),
+            SseParseResult::Token("hello".into())
+        );
+    }
+
+    #[test]
+    fn parse_sse_tool_delta_chunk() {
+        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"exec"}}]}}]}"#;
+        match parse_sse_data_payload(payload) {
+            SseParseResult::ToolDeltas(deltas) => {
+                assert_eq!(deltas.len(), 1);
+                assert_eq!(
+                    deltas[0].get("function").unwrap().get("name").unwrap(),
+                    "exec"
+                );
+            }
+            other => panic!("expected ToolDeltas, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_sse_done_sentinel() {
+        assert_eq!(parse_sse_data_payload("[DONE]"), SseParseResult::Done);
+    }
+
+    #[test]
+    fn parse_sse_thinking_chunk() {
+        let payload = r#"{"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#;
+        assert_eq!(
+            parse_sse_data_payload(payload),
+            SseParseResult::Thinking("hmm".into())
+        );
+    }
 }

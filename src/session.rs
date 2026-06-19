@@ -144,7 +144,13 @@ impl Session {
 
         let mut meta: SessionMeta = if meta_path.exists() {
             let data = fs::read_to_string(&meta_path)?;
-            serde_json::from_str(&data).unwrap_or_default()
+            match serde_json::from_str(&data) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("warning: failed to parse meta.json ({}), starting with fresh session meta", e);
+                    SessionMeta::default()
+                }
+            }
         } else {
             SessionMeta::default()
         };

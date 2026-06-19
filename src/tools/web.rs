@@ -151,7 +151,7 @@ pub async fn browse(url: &str, depth: usize, extract: &str) -> String {
         // Format using the single fetched HTML
         let page = match extract {
             "links" => extract_links(&html, &current),
-            "html" => { let end = { let mut e = html.len().min(25000); while e > 0 && !html.is_char_boundary(e) { e -= 1; } e }; format!("<!-- {} -->\n{}", current, &html[..end]) },
+            "html" => { let end = super::safe_truncate(&html, 25000).len(); format!("<!-- {} -->\n{}", current, &html[..end]) },
             _ => extract_text(&html, &current),
         };
         pages.push((current.clone(), page));
@@ -200,7 +200,7 @@ async fn fetch_and_format(client: &reqwest::Client, url: &str, extract: &str) ->
 
     match extract {
         "links" => extract_links(&html, url),
-        "html" => { let end = { let mut e = html.len().min(25000); while e > 0 && !html.is_char_boundary(e) { e -= 1; } e }; format!("<!-- {} -->\n{}", url, &html[..end]) },
+        "html" => { let end = super::safe_truncate(&html, 25000).len(); format!("<!-- {} -->\n{}", url, &html[..end]) },
         _ => extract_text(&html, url),
     }
 }
@@ -232,9 +232,8 @@ fn extract_text(html: &str, url: &str) -> String {
     };
 
     let preview = if text.len() > 12000 {
-        let mut end = 12000;
-        while end > 0 && !text.is_char_boundary(end) { end -= 1; }
-        format!("{}...\n... ({} chars total, truncated)", &text[..end], text.len())
+        let truncated = super::safe_truncate(&text, 12000);
+        format!("{}...\n... ({} chars total, truncated)", truncated, text.len())
     } else {
         text
     };

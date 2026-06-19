@@ -17,6 +17,12 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+enum KeyUpdate {
+    Keep,
+    Remove,
+    Replace(String),
+}
+
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
 const KEY_LEN: usize = 32;
@@ -244,6 +250,46 @@ impl Keystore {
         Ok(())
     }
 
+    /// Update a stored endpoint in place. `api_key`: `None` keeps the existing key,
+    /// `Some("")` removes it, `Some("key")` replaces it.
+    pub fn update_endpoint(
+        &mut self,
+        idx: usize,
+        label: &str,
+        base_url: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> Result<()> {
+        if idx >= self.file.endpoints.len() {
+            bail!("endpoint index {} out of range", idx);
+        }
+
+        let key_update = match api_key {
+            None => KeyUpdate::Keep,
+            Some("") => KeyUpdate::Remove,
+            Some(key) => KeyUpdate::Replace(self.encrypt_key(key)?),
+        };
+
+        let ep = &mut self.file.endpoints[idx];
+        ep.label = label.to_string();
+        ep.base_url = base_url.to_string();
+        ep.model = model.to_string();
+
+        match key_update {
+            KeyUpdate::Keep => {}
+            KeyUpdate::Remove => {
+                ep.encrypted_key = None;
+                ep.has_key = false;
+            }
+            KeyUpdate::Replace(encrypted) => {
+                ep.encrypted_key = Some(encrypted);
+                ep.has_key = true;
+            }
+        }
+
+        self.save()
+    }
+
     /// Number of stored endpoints.
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
@@ -265,5 +311,90 @@ impl Keystore {
         std::fs::write(&self.path, data)
             .with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn unique_test_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "raven_keystore_test_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn cleanup(path: &Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn keystore_init_add_roundtrip_and_wrong_password() {
+        let path = unique_test_path();
+        cleanup(&path);
+
+        let mut ks = Keystore::load_or_create(&path).expect("load");
+        assert!(!ks.is_unlocked());
+        assert!(!ks.has_encrypted_keys());
+
+        // First time setup
+        ks.init_password("test-password-123").expect("init pw");
+
+        // Add an endpoint with a secret key
+        ks.add_endpoint(
+            "test-ep",
+            "https://example.com/v1",
+            "gpt-test",
+            Some("sk-secret-key-xyz"),
+        )
+        .expect("add endpoint with key");
+
+        assert!(ks.has_encrypted_keys());
+        assert!(ks.is_unlocked());
+
+        // Decrypt should give back the key
+        let eps = ks.decrypt_all_endpoints().expect("decrypt all");
+        assert_eq!(eps.len(), 1);
+        assert_eq!(eps[0].label, "test-ep");
+        assert_eq!(eps[0].api_key.as_deref(), Some("sk-secret-key-xyz"));
+
+        // Reload from disk and unlock with correct pw
+        let mut ks2 = Keystore::load_or_create(&path).expect("reload");
+        ks2.unlock("test-password-123").expect("correct password unlock");
+        let eps2 = ks2.decrypt_all_endpoints().expect("decrypt after reload");
+        assert_eq!(eps2[0].api_key.as_deref(), Some("sk-secret-key-xyz"));
+
+        // Wrong password should fail
+        let mut ks3 = Keystore::load_or_create(&path).expect("reload2");
+        let wrong = ks3.unlock("wrong-password");
+        assert!(wrong.is_err(), "wrong password must be rejected");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn keystore_add_without_key_and_remove() {
+        let path = unique_test_path();
+        cleanup(&path);
+
+        let mut ks = Keystore::load_or_create(&path).unwrap();
+        ks.init_password("pw").unwrap();
+
+        ks.add_endpoint("no-key-ep", "http://local", "model", None).unwrap();
+        assert!(!ks.has_encrypted_keys());
+
+        let eps = ks.decrypt_all_endpoints().unwrap();
+        assert!(eps[0].api_key.is_none());
+
+        ks.remove_endpoint(0).unwrap();
+        assert_eq!(ks.len(), 0);
+
+        cleanup(&path);
     }
 }

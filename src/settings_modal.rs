@@ -1,0 +1,624 @@
+//! Settings modal: endpoint list, add, edit, delete, and switch.
+//!
+//! Extracted from `tui_app.rs` per glm.md refactor.
+
+use crossterm::event::{KeyCode, KeyEvent};
+use ratatui::{
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    Frame,
+};
+
+use crate::agent::Agent;
+use crate::config::{Config, ContextBudget, InferenceEndpoint};
+use crate::keystore::Keystore;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+
+/// What the settings modal is currently doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingsMode {
+    List,
+    Adding,
+    Editing,
+}
+
+/// Mutable state for the inference-endpoints settings overlay.
+#[derive(Clone, Debug)]
+pub struct SettingsModal {
+    pub active: bool,
+    pub endpoints: Vec<InferenceEndpoint>,
+    pub selected: usize,
+    pub active_endpoint_idx: usize,
+    pub mode: SettingsMode,
+    /// Shared buffer for the active wizard field (add or edit).
+    pub edit_buf: String,
+    pub add_step: usize,
+    pub new_label: String,
+    pub new_url: String,
+    pub new_model: String,
+    pub new_key: String,
+    /// List index being edited (`None` in list/add modes).
+    pub editing_idx: Option<usize>,
+    pub edit_step: usize,
+    /// When editing API key, empty submit means "keep existing".
+    pub edit_keep_key: bool,
+}
+
+impl SettingsModal {
+    pub fn inactive() -> Self {
+        Self {
+            active: false,
+            endpoints: vec![],
+            selected: 0,
+            active_endpoint_idx: 0,
+            mode: SettingsMode::List,
+            edit_buf: String::new(),
+            add_step: 0,
+            new_label: String::new(),
+            new_url: String::new(),
+            new_model: String::new(),
+            new_key: String::new(),
+            editing_idx: None,
+            edit_step: 0,
+            edit_keep_key: false,
+        }
+    }
+
+    pub fn open(&mut self, config: &Config, saved: &[InferenceEndpoint]) {
+        self.endpoints = vec![InferenceEndpoint::from_config(config)];
+        self.endpoints.extend(saved.iter().cloned());
+        self.selected = self.active_endpoint_idx;
+        self.mode = SettingsMode::List;
+        self.editing_idx = None;
+        self.clear_wizard();
+        self.active = true;
+    }
+
+    fn clear_wizard(&mut self) {
+        self.edit_buf.clear();
+        self.add_step = 0;
+        self.edit_step = 0;
+        self.new_label.clear();
+        self.new_url.clear();
+        self.new_model.clear();
+        self.new_key.clear();
+        self.editing_idx = None;
+        self.edit_keep_key = false;
+    }
+
+    fn rebuild_endpoints(&mut self, config: &Config, keystore: &Keystore) {
+        self.endpoints = vec![InferenceEndpoint::from_config(config)];
+        if let Ok(eps) = keystore.decrypt_all_endpoints() {
+            self.endpoints.extend(eps);
+        }
+        if self.selected >= self.endpoints.len() {
+            self.selected = self.endpoints.len().saturating_sub(1);
+        }
+    }
+
+    fn start_add(&mut self) {
+        self.mode = SettingsMode::Adding;
+        self.add_step = 0;
+        self.edit_buf.clear();
+        self.new_label.clear();
+        self.new_url.clear();
+        self.new_model.clear();
+        self.new_key.clear();
+    }
+
+    fn start_edit(&mut self) {
+        if self.selected == 0 {
+            return; // CLI default is not persisted — handled in key handler
+        }
+        let ep = self.endpoints[self.selected].clone();
+        self.mode = SettingsMode::Editing;
+        self.editing_idx = Some(self.selected);
+        self.edit_step = 0;
+        self.edit_buf = ep.label.clone();
+        self.new_label = ep.label;
+        self.new_url = ep.base_url;
+        self.new_model = ep.model;
+        self.new_key.clear();
+        self.edit_keep_key = ep.api_key.is_some();
+    }
+
+    fn advance_add_field(&mut self) {
+        match self.add_step {
+            0 => {
+                self.new_label = self.edit_buf.clone();
+                self.edit_buf = "https://openrouter.ai/api/v1".to_string();
+                self.add_step = 1;
+            }
+            1 => {
+                self.new_url = self.edit_buf.clone();
+                self.edit_buf.clear();
+                self.add_step = 2;
+            }
+            2 => {
+                self.new_model = self.edit_buf.clone();
+                self.edit_buf.clear();
+                self.add_step = 3;
+            }
+            _ => {}
+        }
+    }
+
+    fn advance_edit_field(&mut self) {
+        match self.edit_step {
+            0 => {
+                self.new_label = self.edit_buf.clone();
+                self.edit_buf = self.new_url.clone();
+                self.edit_step = 1;
+            }
+            1 => {
+                self.new_url = self.edit_buf.clone();
+                self.edit_buf = self.new_model.clone();
+                self.edit_step = 2;
+            }
+            2 => {
+                self.new_model = self.edit_buf.clone();
+                self.edit_buf.clear();
+                self.edit_step = 3;
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Side effects produced by settings key handling.
+pub enum SettingsAction {
+    Redraw,
+    Close,
+    Notify(String),
+    Trace(String),
+    DisplayUpdate { model: String, budget: ContextBudget },
+    ActiveIdx(usize),
+}
+
+pub struct SettingsHandleResult {
+    pub actions: Vec<SettingsAction>,
+}
+
+/// Draw the settings overlay.
+pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) {
+    if !settings.active {
+        return;
+    }
+
+    let modal_w = 64u16.min(area.width.saturating_sub(4));
+    let modal_h = 24u16.min(area.height.saturating_sub(4));
+    let modal_x = (area.width.saturating_sub(modal_w)) / 2;
+    let modal_y = (area.height.saturating_sub(modal_h)) / 2;
+    let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+    let mut modal_lines = Text::default();
+
+    match settings.mode {
+        SettingsMode::Adding => {
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Add New Endpoint",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            modal_lines.lines.push(Line::from(""));
+            render_wizard_fields(
+                &mut modal_lines,
+                &["Label", "Base URL", "Model", "API Key (optional)"],
+                &[&settings.new_label, &settings.new_url, &settings.new_model, &settings.new_key],
+                settings.add_step,
+                &settings.edit_buf,
+            );
+            modal_lines.lines.push(Line::from(""));
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Enter to confirm field • Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        SettingsMode::Editing => {
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Edit Endpoint",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            modal_lines.lines.push(Line::from(""));
+            let key_display = if settings.edit_step > 3 {
+                String::new()
+            } else if !settings.new_key.is_empty() {
+                "*".repeat(settings.new_key.len().min(20))
+            } else if settings.edit_keep_key {
+                "(keep existing)".to_string()
+            } else {
+                String::new()
+            };
+            render_wizard_fields(
+                &mut modal_lines,
+                &["Label", "Base URL", "Model", "API Key (blank=keep)"],
+                &[&settings.new_label, &settings.new_url, &settings.new_model, &key_display],
+                settings.edit_step,
+                &settings.edit_buf,
+            );
+            modal_lines.lines.push(Line::from(""));
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Enter to confirm field • Esc to cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        SettingsMode::List => {
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Inference Endpoints",
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+            modal_lines.lines.push(Line::from(""));
+
+            for (i, ep) in settings.endpoints.iter().enumerate() {
+                let is_sel = i == settings.selected;
+                let is_active = i == settings.active_endpoint_idx;
+                let marker = if is_active { "●" } else { "○" };
+                let name_style = if is_sel {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                let sel_indicator = if is_sel { "▶ " } else { "  " };
+
+                modal_lines.lines.push(Line::from(vec![
+                    Span::styled(
+                        sel_indicator,
+                        if is_sel {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::Gray)
+                        },
+                    ),
+                    Span::styled(
+                        format!("{} ", marker),
+                        if is_active {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        },
+                    ),
+                    Span::styled(&ep.label, name_style),
+                    if is_active {
+                        Span::styled("  [active]", Style::default().fg(Color::Green))
+                    } else {
+                        Span::styled("", Style::default())
+                    },
+                ]));
+                modal_lines.lines.push(Line::from(vec![
+                    Span::styled("      ", Style::default()),
+                    Span::styled(&ep.base_url, Style::default().fg(Color::DarkGray)),
+                ]));
+                let key_indicator = if ep.api_key.is_some() { "  🔑" } else { "" };
+                modal_lines.lines.push(Line::from(vec![
+                    Span::styled("      model: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(&ep.model, Style::default().fg(Color::Gray)),
+                    Span::styled(key_indicator, Style::default().fg(Color::Yellow)),
+                ]));
+                if i < settings.endpoints.len() - 1 {
+                    modal_lines.lines.push(Line::from(""));
+                }
+            }
+
+            modal_lines.lines.push(Line::from(""));
+            modal_lines.lines.push(Line::from(vec![
+                Span::styled("  ↑↓ ", Style::default().fg(Color::DarkGray)),
+                Span::styled("navigate", Style::default().fg(Color::Gray)),
+                Span::styled("  Enter ", Style::default().fg(Color::DarkGray)),
+                Span::styled("switch", Style::default().fg(Color::Gray)),
+                Span::styled("  A ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("add", Style::default().fg(Color::Gray)),
+                Span::styled("  E ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("edit", Style::default().fg(Color::Gray)),
+            ]));
+            modal_lines.lines.push(Line::from(vec![
+                Span::styled("  D ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled("delete", Style::default().fg(Color::Gray)),
+                Span::styled("  Esc ", Style::default().fg(Color::DarkGray)),
+                Span::styled("close", Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+
+    let modal_block = Paragraph::new(modal_lines)
+        .wrap(Wrap { trim: false })
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    " Settings ",
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(Color::Cyan)),
+        );
+    f.render_widget(Clear, modal_area);
+    f.render_widget(modal_block, modal_area);
+}
+
+fn render_wizard_fields(
+    modal_lines: &mut Text,
+    fields: &[&str],
+    values: &[&str],
+    current_step: usize,
+    edit_buf: &str,
+) {
+    for (i, (field, val)) in fields.iter().zip(values.iter()).enumerate() {
+        let is_current = i == current_step;
+        let marker = if i < current_step {
+            "✓"
+        } else if is_current {
+            "▶"
+        } else {
+            " "
+        };
+        let label_style = if is_current {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if i < current_step {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let display_val = if i == 3 && !val.is_empty() && val.chars().all(|c| c == '*') {
+            val.to_string()
+        } else if is_current {
+            edit_buf.to_string()
+        } else {
+            val.to_string()
+        };
+
+        if is_current {
+            modal_lines.lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", marker), label_style),
+                Span::styled(format!("{}: ", field), label_style),
+                Span::styled(display_val, Style::default().fg(Color::White)),
+                Span::styled(
+                    "_",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+            ]));
+        } else {
+            modal_lines.lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", marker), label_style),
+                Span::styled(format!("{}: ", field), label_style),
+                Span::styled(display_val, Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+}
+
+/// Handle a key event while the settings modal is active.
+pub async fn handle_settings_key(
+    settings: &mut SettingsModal,
+    key: KeyEvent,
+    config: &Config,
+    keystore: &mut Keystore,
+    agent: &Arc<Mutex<Agent>>,
+) -> SettingsHandleResult {
+    let mut actions = vec![SettingsAction::Redraw];
+
+    match settings.mode {
+        SettingsMode::Adding | SettingsMode::Editing => {
+            match key.code {
+                KeyCode::Char(c) => {
+                    settings.edit_buf.push(c);
+                }
+                KeyCode::Backspace => {
+                    settings.edit_buf.pop();
+                }
+                KeyCode::Enter => {
+                    if settings.mode == SettingsMode::Adding {
+                        if settings.add_step < 3 {
+                            settings.advance_add_field();
+                        } else {
+                            settings.new_key = settings.edit_buf.clone();
+                            actions.extend(finish_add(settings, config, keystore));
+                        }
+                    } else if settings.edit_step < 3 {
+                        settings.advance_edit_field();
+                    } else {
+                        settings.new_key = settings.edit_buf.clone();
+                        actions.extend(finish_edit(settings, config, keystore, agent).await);
+                    }
+                }
+                KeyCode::Esc => {
+                    settings.mode = SettingsMode::List;
+                    settings.clear_wizard();
+                }
+                _ => {}
+            }
+        }
+        SettingsMode::List => match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if settings.selected > 0 {
+                    settings.selected -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if settings.selected < settings.endpoints.len().saturating_sub(1) {
+                    settings.selected += 1;
+                }
+            }
+            KeyCode::Enter => {
+                if settings.selected != settings.active_endpoint_idx {
+                    actions.extend(
+                        switch_to_endpoint(settings, config, agent, settings.selected).await,
+                    );
+                }
+                settings.active = false;
+                actions.push(SettingsAction::Close);
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                settings.start_add();
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => {
+                if settings.selected == 0 {
+                    actions.push(SettingsAction::Notify(
+                        "CLI default endpoint is session-only — switch to a saved endpoint to edit persistently.".into(),
+                    ));
+                } else {
+                    settings.start_edit();
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                if settings.selected > 0 && settings.selected != settings.active_endpoint_idx {
+                    let keystore_idx = settings.selected - 1;
+                    let _ = keystore.remove_endpoint(keystore_idx);
+                    settings.rebuild_endpoints(config, keystore);
+                    if settings.active_endpoint_idx > settings.selected {
+                        settings.active_endpoint_idx -= 1;
+                    }
+                    actions.push(SettingsAction::Notify("Endpoint deleted.".into()));
+                }
+            }
+            KeyCode::Esc => {
+                settings.active = false;
+                actions.push(SettingsAction::Close);
+            }
+            _ => {}
+        },
+    }
+
+    SettingsHandleResult { actions }
+}
+
+fn finish_add(
+    settings: &mut SettingsModal,
+    config: &Config,
+    keystore: &mut Keystore,
+) -> Vec<SettingsAction> {
+    let mut actions = vec![];
+
+    let api_key_opt = if settings.new_key.is_empty() {
+        None
+    } else {
+        if !keystore.is_unlocked() {
+            actions.push(SettingsAction::Notify(
+                "Setting vault password (first API key). Using 'raven' as default.".into(),
+            ));
+            let _ = keystore.init_password("raven");
+        }
+        Some(settings.new_key.as_str())
+    };
+
+    match keystore.add_endpoint(
+        &settings.new_label,
+        &settings.new_url,
+        &settings.new_model,
+        api_key_opt,
+    ) {
+        Ok(()) => actions.push(SettingsAction::Notify(format!(
+            "Added endpoint: {}",
+            settings.new_label
+        ))),
+        Err(e) => actions.push(SettingsAction::Notify(format!("Failed to save endpoint: {}", e))),
+    }
+
+    settings.rebuild_endpoints(config, keystore);
+    settings.mode = SettingsMode::List;
+    settings.clear_wizard();
+    actions
+}
+
+async fn finish_edit(
+    settings: &mut SettingsModal,
+    config: &Config,
+    keystore: &mut Keystore,
+    agent: &Arc<Mutex<Agent>>,
+) -> Vec<SettingsAction> {
+    let mut actions = vec![];
+
+    let Some(list_idx) = settings.editing_idx else {
+        settings.mode = SettingsMode::List;
+        settings.clear_wizard();
+        return actions;
+    };
+
+    let keystore_idx = list_idx.saturating_sub(1);
+    let key_update = if settings.new_key.is_empty() {
+        None
+    } else {
+        if !keystore.is_unlocked() {
+            actions.push(SettingsAction::Notify(
+                "Setting vault password (first API key). Using 'raven' as default.".into(),
+            ));
+            let _ = keystore.init_password("raven");
+        }
+        Some(settings.new_key.as_str())
+    };
+
+    match keystore.update_endpoint(
+        keystore_idx,
+        &settings.new_label,
+        &settings.new_url,
+        &settings.new_model,
+        key_update,
+    ) {
+        Ok(()) => {
+            actions.push(SettingsAction::Notify(format!(
+                "Updated endpoint: {}",
+                settings.new_label
+            )));
+            settings.rebuild_endpoints(config, keystore);
+            if list_idx == settings.active_endpoint_idx {
+                actions.extend(switch_to_endpoint(settings, config, agent, list_idx).await);
+            }
+        }
+        Err(e) => actions.push(SettingsAction::Notify(format!("Failed to update endpoint: {}", e))),
+    }
+
+    settings.mode = SettingsMode::List;
+    settings.clear_wizard();
+    actions
+}
+
+async fn switch_to_endpoint(
+    settings: &SettingsModal,
+    config: &Config,
+    agent: &Arc<Mutex<Agent>>,
+    idx: usize,
+) -> Vec<SettingsAction> {
+    let mut actions = vec![];
+    let ep = &settings.endpoints[idx];
+
+    actions.push(SettingsAction::Trace(format!(
+        "⟳ Switching to: {} ({})",
+        ep.label, ep.base_url
+    )));
+
+    let budget = match crate::llm::probe_context_size(&ep.base_url, &ep.model, ep.api_key.as_deref())
+        .await
+    {
+        Some(n_ctx) => {
+            actions.push(SettingsAction::Trace(format!(
+                "   ↳ context: {} tokens (probed)",
+                n_ctx
+            )));
+            ContextBudget::from_context_tokens(n_ctx, config.max_rounds)
+        }
+        None => {
+            actions.push(SettingsAction::Trace(
+                "   ↳ context probe failed, using default 8192".into(),
+            ));
+            ContextBudget::default_fallback()
+        }
+    };
+
+    if let Ok(mut ag) = agent.try_lock() {
+        ag.switch_endpoint(ep, budget.clone());
+    }
+
+    actions.push(SettingsAction::DisplayUpdate {
+        model: ep.model.clone(),
+        budget: budget.clone(),
+    });
+    actions.push(SettingsAction::ActiveIdx(idx));
+    actions.push(SettingsAction::Notify(format!(
+        "Switched to: {} ({})",
+        ep.label, ep.model
+    )));
+    actions
+}

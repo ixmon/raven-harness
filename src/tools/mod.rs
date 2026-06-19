@@ -19,7 +19,7 @@ mod web;
 
 /// Safely truncate a string to at most `max_bytes` bytes without splitting
 /// a multi-byte UTF-8 codepoint.
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
     }
@@ -306,5 +306,35 @@ pub async fn execute(name: &str, arguments: &str, workspace: &std::path::Path, m
             Ok(format!("✅ store_summary requested for {}", path))
         }
         other => Ok(format!("❌ Unknown tool: {}", other)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe_truncate;
+
+    #[test]
+    fn test_safe_truncate_basic() {
+        assert_eq!(safe_truncate("hello", 10), "hello");
+        assert_eq!(safe_truncate("hello", 3), "hel");
+        assert_eq!(safe_truncate("", 5), "");
+    }
+
+    #[test]
+    fn test_safe_truncate_utf8_boundary() {
+        // "café" = c a f é  (é is 2 bytes in UTF-8)
+        let s = "café";
+        // Cut in the middle of é (at byte 3 would be inside the char)
+        let t = safe_truncate(s, 3);
+        assert!(t.len() <= 3);
+        assert!(std::str::from_utf8(t.as_bytes()).is_ok());
+        assert_eq!(t, "caf");  // é skipped cleanly
+
+        // Multi-char boundary safety
+        let emoji = "hello😀world"; // 😀 is 4 bytes
+        let t2 = safe_truncate(emoji, 7); // inside the emoji?
+        assert!(std::str::from_utf8(t2.as_bytes()).is_ok());
+        // Should not split the emoji
+        assert!(t2.ends_with("hello") || t2 == "hello");
     }
 }

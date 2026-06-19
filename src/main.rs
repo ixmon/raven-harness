@@ -9,11 +9,15 @@ use std::path::PathBuf;
 
 mod agent;
 mod config;
+mod input_dispatch;
 mod keystore;
 mod llm;
+mod search;
 mod session;
+mod settings_modal;
 mod tools;
 mod tui_app;
+mod tui_render;
 
 #[derive(Parser, Debug)]
 #[command(name = "raven-tui", about = "Agentic coding TUI powered by local LLMs + tools")]
@@ -126,7 +130,8 @@ async fn main() -> Result<()> {
     let mut ks = keystore::Keystore::load_or_create(&keystore_path)
         .unwrap_or_else(|e| {
             eprintln!("warning: could not load endpoints.json: {}", e);
-            keystore::Keystore::load_or_create(&keystore_path).unwrap()
+            keystore::Keystore::load_or_create(&keystore_path)
+                .expect("FATAL: could not create ~/.raven-hotel/endpoints.json (check permissions)")
         });
 
     // If any endpoints have encrypted keys, prompt for vault password

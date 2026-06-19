@@ -12,20 +12,6 @@ use serde_json::json;
 use std::path::Path;
 use tokio::sync::mpsc;
 
-
-/// Safely truncate a string to at most `max_bytes` bytes without splitting
-/// a multi-byte UTF-8 codepoint (which would panic).
-fn safe_truncate(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
 fn make_rel_path(p: &str, workspace: &Path) -> String {
     let abs = std::path::Path::new(p);
     if let Ok(stripped) = abs.strip_prefix(workspace) {
@@ -40,9 +26,15 @@ fn make_rel_path(p: &str, workspace: &Path) -> String {
 
 const MAX_TOOL_ROUNDS: u32 = 12;
 
+// Summary and truncation limits (from glm review cleanup)
+const SUMMARY_CHAR_LIMIT: usize = 1600;
+const GOAL_TRUNCATE: usize = 160;
+const RECENT_SUMMARY_TRUNCATE: usize = 1800;
+
 #[derive(Debug, Clone)]
 pub struct ActionRecord {
     pub tool: String,
+    #[allow(dead_code)]
     pub args: String,
     pub summary: String,
 }
@@ -51,6 +43,7 @@ pub struct ActionRecord {
 pub struct TurnResult {
     pub final_text: String,
     pub actions: Vec<ActionRecord>,
+    #[allow(dead_code)]
     pub rounds_used: u32,
 }
 
@@ -63,6 +56,8 @@ pub struct Agent {
     conversation: Vec<Message>,
     /// Persistent session (goal tracking, repo cache, full log, meta.json under ~/.raven-hotel/)
     pub(crate) session: Option<crate::session::Session>,
+    /// How many conversation messages have been written to full_log.jsonl.
+    logged_message_count: usize,
 }
 
 impl Agent {
@@ -91,17 +86,21 @@ impl Agent {
             }
         }
 
+        let logged_message_count = conversation.len();
+
         Self {
             client,
             config,
             conversation,
             session,
+            logged_message_count,
         }
     }
 
     /// Reset conversation (new "room" / task). The persistent session (goal, repo cache, log) is kept.
     pub fn reset(&mut self) {
         self.conversation.clear();
+        self.logged_message_count = 0;
     }
 
     /// Truncate tool output to fit the context budget.
@@ -394,7 +393,7 @@ impl Agent {
                     format!("{}\n\n(earlier)\n{}", s.meta.recent_turns_summary, summary)
                 };
                 // Keep it small
-                let trimmed = if combined.len() > 1800 { safe_truncate(&combined, 1800).to_string() + "..." } else { combined };
+                let trimmed = if combined.len() > RECENT_SUMMARY_TRUNCATE { tools::safe_truncate(&combined, RECENT_SUMMARY_TRUNCATE).to_string() + "..." } else { combined };
                 let _ = s.set_recent_turns_summary(&trimmed);
             }
         }
@@ -442,7 +441,14 @@ impl Agent {
 
         match self.client.chat(req).await {
             Ok(resp) => resp.content.trim().to_string(),
-            Err(e) => format!("[summarization failed: {}]", e),
+            Err(_e) => {
+                // Better fallback: simple truncation instead of storing error string forever (glm.md review)
+                let combined: String = msgs.iter()
+                    .map(|m| m.content.clone().unwrap_or_default())
+                    .collect::<Vec<_>>().join(" ");
+                let fallback = tools::safe_truncate(&combined, 400).to_string();
+                format!("(summarization failed, using truncated fallback) {}", fallback)
+            }
         }
     }
 
@@ -456,7 +462,7 @@ impl Agent {
             let _ = s.set_last_user_request(user_input);
             // Seed an initial goal from the first real request if we don't have one yet
             if s.meta.current_goal.contains("not yet established") || s.meta.current_goal.trim().is_empty() {
-                let g = safe_truncate(user_input, 160);
+                let g = tools::safe_truncate(user_input, GOAL_TRUNCATE);
                 let _ = s.update_goal(&format!("Initial goal from user: {}", g), None, None);
             }
         }
@@ -596,17 +602,25 @@ impl Agent {
     }
 
     async fn persist_turn(&mut self) {
-        // Append the latest turn(s) to the on-disk full log (jsonl) for resume.
+        // Append all unlogged messages to full_log.jsonl (assistant + tool calls + results).
         if let Some(s) = &self.session {
-            // Simple: append the last 1-2 messages as a small record.
-            if let Some(last) = self.conversation.last() {
+            while self.logged_message_count < self.conversation.len() {
+                let msg = &self.conversation[self.logged_message_count];
+                let tool_names: Vec<&str> = msg
+                    .tool_calls
+                    .as_ref()
+                    .map(|tcs| tcs.iter().map(|tc| tc.function.name.as_str()).collect())
+                    .unwrap_or_default();
                 let entry = serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339(),
-                    "role": last.role,
-                    "content": last.content,
-                    "has_tool_calls": last.tool_calls.is_some(),
+                    "role": msg.role,
+                    "content": msg.content,
+                    "has_tool_calls": msg.tool_calls.is_some(),
+                    "tool_call_id": msg.tool_call_id,
+                    "tool_names": tool_names,
                 });
                 let _ = s.append_log(&entry.to_string());
+                self.logged_message_count += 1;
             }
             // Also refresh the rolling recent-turns summary occasionally
             // (lightweight; the prune path does heavier compression).
@@ -618,7 +632,7 @@ impl Agent {
                         // merge conservatively
                         let prev = &s_mut.meta.recent_turns_summary;
                         let merged = if prev.is_empty() { sm } else { format!("{}\n{}", prev, sm) };
-                        let trimmed = if merged.len() > 1600 { safe_truncate(&merged, 1600).to_string() + "..." } else { merged };
+                        let trimmed = if merged.len() > SUMMARY_CHAR_LIMIT { tools::safe_truncate(&merged, SUMMARY_CHAR_LIMIT).to_string() + "..." } else { merged };
                         let _ = s_mut.set_recent_turns_summary(&trimmed);
                     }
                 }
@@ -636,7 +650,7 @@ impl Agent {
         let sm = self.summarize_messages(&recent).await;
         if let Some(s) = &mut self.session {
             // Replace (not append) — keep it fresh and relevant
-            let trimmed = if sm.len() > 1600 { safe_truncate(&sm, 1600).to_string() + "..." } else { sm };
+            let trimmed = if sm.len() > SUMMARY_CHAR_LIMIT { tools::safe_truncate(&sm, SUMMARY_CHAR_LIMIT).to_string() + "..." } else { sm };
             let _ = s.set_recent_turns_summary(&trimmed);
         }
     }
@@ -656,16 +670,10 @@ impl Agent {
         }
     }
 
-    /// Estimate the number of tokens consumed by the current conversation.
-    /// Uses the same ~3.5 bytes/token heuristic as the context budget system.
+    /// Estimate tokens for the full prompt we would send (system + session injection + conversation).
     pub fn estimated_context_tokens(&self) -> u32 {
-        let total_bytes: usize = self.conversation.iter().map(|m| {
-            let content_len = m.content.as_ref().map_or(0, |c| c.len());
-            let tc_len = m.tool_calls.as_ref().map_or(0, |tcs| {
-                tcs.iter().map(|tc| tc.function.name.len() + tc.function.arguments.len()).sum()
-            });
-            content_len + tc_len + 20 // ~20 bytes overhead for role, formatting
-        }).sum();
+        let messages = self.build_messages_for_model();
+        let total_bytes: usize = messages.iter().map(message_byte_size).sum();
         (total_bytes as f64 / 3.5) as u32
     }
 
@@ -688,6 +696,17 @@ impl Agent {
     pub fn current_config(&self) -> &Config {
         &self.config
     }
+}
+
+fn message_byte_size(m: &Message) -> usize {
+    let content_len = m.content.as_ref().map_or(0, |c| c.len());
+    let tc_len = m.tool_calls.as_ref().map_or(0, |tcs| {
+        tcs.iter()
+            .map(|tc| tc.id.len() + tc.function.name.len() + tc.function.arguments.len())
+            .sum::<usize>()
+    });
+    let id_len = m.tool_call_id.as_ref().map_or(0, |s| s.len());
+    content_len + tc_len + id_len + m.role.len() + 16
 }
 
 fn system_message(workspace: &std::path::Path) -> Message {
@@ -756,6 +775,6 @@ fn truncate_for_context(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         s.to_string()
     } else {
-        format!("{}...\n... ({} bytes total, truncated for context)", safe_truncate(s, limit), s.len())
+        format!("{}...\n... ({} bytes total, truncated for context)", tools::safe_truncate(s, limit), s.len())
     }
 }
