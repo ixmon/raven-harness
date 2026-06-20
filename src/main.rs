@@ -12,6 +12,7 @@ mod config;
 mod input_dispatch;
 mod keystore;
 mod llm;
+mod palette;
 mod search;
 mod session;
 mod settings_modal;
@@ -64,6 +65,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // Detect terminal color depth once. Downsample is applied centrally via
+    // `PaletteBackend` in `tui_app::run`, so this just primes the cache.
+    let color_depth = palette::init();
+    if color_depth != palette::ColorDepth::True {
+        eprintln!("raven: terminal color depth detected as {:?} (RGB will be downsampled)", color_depth);
+    }
 
     let workspace = args
         .workspace

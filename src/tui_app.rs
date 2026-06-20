@@ -69,6 +69,7 @@ fn try_copy_to_clipboard(text: &str) {
 enum Pane {
     Left,
     Right,
+    Input,
 }
 
 /// Holds all the mutable UI state that used to be ~50 local `let mut` variables
@@ -84,6 +85,7 @@ struct App {
 
     // Input
     input: String,
+    cursor_pos: usize, // byte offset into `input`, always on a char boundary
 
     // Navigation / scroll
     left_scroll: u16,
@@ -162,6 +164,7 @@ impl App {
             trace_lines: vec![],
             current_thinking: String::new(),
             input: String::new(),
+            cursor_pos: 0,
             left_scroll: 0,
             right_scroll: 0,
             left_follow_output: true,
@@ -206,9 +209,10 @@ impl App {
 fn render_pane(pane: Pane) -> crate::tui_render::Pane {
     match pane {
         Pane::Left => crate::tui_render::Pane::Left,
-        Pane::Right => crate::tui_render::Pane::Right,
+        Pane::Right | Pane::Input => crate::tui_render::Pane::Right,
     }
 }
+
 
 async fn apply_settings_key(
     app: &mut App,
@@ -233,6 +237,199 @@ async fn apply_settings_key(
     app.needs_redraw = true;
 }
 
+impl App {
+    /// Insert a character at the current cursor position.
+    fn insert_char(&mut self, c: char) {
+        self.input.insert(self.cursor_pos, c);
+        self.cursor_pos += c.len_utf8();
+    }
+
+
+    /// Delete the character before the cursor (Backspace).
+    fn delete_char_before(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        // Find the previous char boundary
+        let prev = self.input[..self.cursor_pos]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.input.drain(prev..self.cursor_pos);
+        self.cursor_pos = prev;
+    }
+
+    /// Delete the character at the cursor (Delete key).
+    fn delete_char_at(&mut self) {
+        if self.cursor_pos >= self.input.len() {
+            return;
+        }
+        let next = self.cursor_pos
+            + self.input[self.cursor_pos..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+        self.input.drain(self.cursor_pos..next);
+    }
+
+    /// Move cursor one character to the left.
+    fn move_cursor_left(&mut self) {
+        if self.cursor_pos == 0 {
+            return;
+        }
+        self.cursor_pos = self.input[..self.cursor_pos]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    /// Move cursor one character to the right.
+    fn move_cursor_right(&mut self) {
+        if self.cursor_pos >= self.input.len() {
+            return;
+        }
+        self.cursor_pos += self.input[self.cursor_pos..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+    }
+
+    /// Move cursor to the start of the input.
+    fn move_cursor_home(&mut self) {
+        self.cursor_pos = 0;
+    }
+
+    /// Move cursor to the end of the input.
+    fn move_cursor_end(&mut self) {
+        self.cursor_pos = self.input.len();
+    }
+
+    /// Replace the full input and put cursor at the end.
+    fn set_input(&mut self, s: String) {
+        self.input = s;
+        self.cursor_pos = self.input.len();
+    }
+
+    /// Clear the input and reset cursor.
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor_pos = 0;
+    }
+
+    /// Cycle focus forward: Left → Right → Input → Left
+    fn cycle_focus_forward(&mut self) {
+        self.focused_pane = match self.focused_pane {
+            Pane::Left => Pane::Right,
+            Pane::Right => Pane::Input,
+            Pane::Input => Pane::Left,
+        };
+    }
+
+    /// Cycle focus backward: Left → Input → Right → Left
+    fn cycle_focus_backward(&mut self) {
+        self.focused_pane = match self.focused_pane {
+            Pane::Left => Pane::Input,
+            Pane::Input => Pane::Right,
+            Pane::Right => Pane::Left,
+        };
+    }
+}
+
+impl App {
+    /// Handle a key when the approval dialog is open.
+    /// Returns `true` if the key was consumed (caller should `continue`).
+    fn handle_approval_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        if self.pending_approval.is_none() {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                if let Some(tx) = self.approval_responder.take() {
+                    let _ = tx.send(true);
+                }
+                self.pending_approval = None;
+                self.left_committed.push("✅ Action approved".to_string());
+                self.left_follow_output = true;
+                self.left_scroll = 10_000;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                if let Some(tx) = self.approval_responder.take() {
+                    let _ = tx.send(false);
+                }
+                self.pending_approval = None;
+                self.left_committed.push("⛔ Action denied".to_string());
+                self.left_follow_output = true;
+                self.left_scroll = 10_000;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Handle a key when the /mode selection menu is open.
+    /// Returns `true` if the key was consumed (caller should `continue`).
+    async fn handle_mode_menu_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        agent: &Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        if !self.mode_menu_active {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_mode_idx > 0 {
+                    self.selected_mode_idx -= 1;
+                }
+                self.needs_redraw = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.selected_mode_idx < 3 {
+                    self.selected_mode_idx += 1;
+                }
+                self.needs_redraw = true;
+            }
+            KeyCode::Enter => {
+                let chosen = self.approval_modes[self.selected_mode_idx];
+                self.left_committed
+                    .push(format!("Execution mode set to: {}", chosen));
+                self.left_follow_output = true;
+                self.left_scroll = 10_000;
+
+                let mode = match self.selected_mode_idx {
+                    0 => crate::session::ExecApprovalMode::Babysitter,
+                    1 => crate::session::ExecApprovalMode::SpringBreak,
+                    2 => crate::session::ExecApprovalMode::Vegas,
+                    3 => crate::session::ExecApprovalMode::Thunderdome,
+                    _ => return true,
+                };
+                if let Ok(mut ag) = agent.try_lock() {
+                    ag.set_exec_approval_mode(mode);
+                    if let Some(s) = &mut ag.session {
+                        let _ = s.save_meta();
+                    }
+                }
+                self.mode_menu_active = false;
+                self.input.clear();
+                self.selected_mode_idx = 0;
+                self.needs_redraw = true;
+            }
+            KeyCode::Esc => {
+                self.mode_menu_active = false;
+                self.input.clear();
+                self.selected_mode_idx = 0;
+                self.needs_redraw = true;
+            }
+            _ => {}
+        }
+        true
+    }
+}
+
 pub async fn run(
     config: Config,
     saved_endpoints: Vec<crate::config::InferenceEndpoint>,
@@ -251,6 +448,7 @@ pub async fn run(
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     )?;
     let backend = CrosstermBackend::new(stdout);
+    let backend = crate::palette::PaletteBackend::new(backend);
     let mut terminal = Terminal::new(backend)?;
 
     // One extra clear via the terminal API (belt + suspenders)
@@ -261,7 +459,7 @@ pub async fn run(
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
-        terminal.backend_mut(),
+        terminal.backend_mut().inner_mut(),
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     )?;
@@ -347,16 +545,19 @@ async fn run_app<B: ratatui::backend::Backend>(
             terminal.draw(|f| {
             let size = f.area();
 
-            // Vertical layout: status bar (1) + content panes (fill) + context gauge (1) + input bar (3)
+            // Vertical layout: status bar (1) + content panes (fill) + context gauge (1) + input bar (dynamic)
             let show_gauge = app.is_processing;
             let gauge_h = if show_gauge { 1 } else { 0 };
+            // Dynamic input height: 3 (single line) up to 8 (multiline)
+            let input_line_count = app.input.lines().count().max(1) as u16;
+            let input_h = (input_line_count + 2).clamp(3, 8); // +2 for borders
             let vertical = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(1),        // status bar
                     Constraint::Min(6),           // content panes
                     Constraint::Length(gauge_h),   // context gauge (only during processing)
-                    Constraint::Length(3),         // input bar
+                    Constraint::Length(input_h),   // input bar (dynamic height)
                 ])
                 .split(size);
 
@@ -406,6 +607,9 @@ async fn run_app<B: ratatui::backend::Backend>(
             };
 
             // Call extracted (split rendering)
+            // When Input pane is focused, neither content pane gets the focus highlight
+            let left_focused = app.focused_pane == Pane::Left;
+            let right_focused = app.focused_pane == Pane::Right;
             crate::tui_render::draw_left_pane(
                 f,
                 &app.left_committed,
@@ -415,7 +619,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 &mut app.last_left_line_count,
                 app.left_follow_output,
                 &mut app.left_scroll,
-                render_pane(app.focused_pane),
+                if left_focused { crate::tui_render::Pane::Left } else { crate::tui_render::Pane::Right }, // hack: Left=focused, Right=unfocused
                 app.scroll_flash_timer,
                 left_highlight,
             );
@@ -429,7 +633,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 &mut app.last_right_line_count,
                 app.right_follow_output,
                 &mut app.right_scroll,
-                render_pane(app.focused_pane),
+                if right_focused { crate::tui_render::Pane::Right } else { crate::tui_render::Pane::Left }, // hack: Right=focused, Left=unfocused
                 app.scroll_flash_timer,
                 right_highlight,
             );
@@ -449,6 +653,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 is_processing: app.is_processing,
                 spinner_tick: app.spinner_tick,
                 search_mode: app.search_mode,
+                focused: app.focused_pane == Pane::Input,
             });
 
             // Overlays: approval popup, slash menu, mode menu, settings modal
@@ -466,8 +671,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                 app.selected_mode_idx,
             );
 
-            // Cursor in input
-            f.set_cursor_position((input_area.x + 1 + app.input.len() as u16, input_area.y + 1));
+            // Cursor in input — compute position from cursor_pos, handling multiline
+            let text_before_cursor = &app.input[..app.cursor_pos];
+            let cursor_line = text_before_cursor.matches('\n').count() as u16;
+            let last_newline = text_before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let cursor_col = app.input[last_newline..app.cursor_pos].chars().count() as u16;
+            f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
             
             // Decrement scroll flash timer
             if app.scroll_flash_timer > 0 {
@@ -655,28 +864,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 Some(ev) = input_rx.recv() => {
                     if let Event::Key(key) = ev {
                         // Highest priority: approval dialog
-                        if app.pending_approval.is_some() {
-                            match key.code {
-                                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                                    if let Some(tx) = app.approval_responder.take() {
-                                        let _ = tx.send(true);
-                                    }
-                                   app.pending_approval = None;
-                                   app.left_committed.push("✅ Action approved".to_string());
-                                  app.left_follow_output = true;
-                                  app.left_scroll = 10_000;
-                                }
-                                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                                    if let Some(tx) = app.approval_responder.take() {
-                                        let _ = tx.send(false);
-                                    }
-                                   app.pending_approval = None;
-                                   app.left_committed.push("⛔ Action denied".to_string());
-                                  app.left_follow_output = true;
-                                  app.left_scroll = 10_000;
-                                }
-                                _ => {}
-                            }
+                        if app.handle_approval_key(key) {
                             continue;
                         }
 
@@ -685,47 +873,21 @@ async fn run_app<B: ratatui::backend::Backend>(
                             continue;
                         }
 
-                        // Handle /mode selection menu first if active
-                        if app.mode_menu_active {
-                            match key.code {
-                                KeyCode::Up | KeyCode::Char('k') => { if app.selected_mode_idx > 0 { app.selected_mode_idx -= 1; } app.needs_redraw = true; }
-                                KeyCode::Down | KeyCode::Char('j') => { if app.selected_mode_idx < 3 { app.selected_mode_idx += 1; } app.needs_redraw = true; }
-                                KeyCode::Enter => {
-                                    let chosen = app.approval_modes[app.selected_mode_idx];
-                                   app.left_committed.push(format!("Execution mode set to: {}", chosen));
-                                  app.left_follow_output = true;
-                                  app.left_scroll = 10_000;
-
-                                    match app.selected_mode_idx {
-                                        0 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::Babysitter); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                        1 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::SpringBreak); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                        2 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::Vegas); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                        3 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::Thunderdome); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                        _ => {}
-                                    }
-                                   app.mode_menu_active = false;
-                                   app.input.clear();
-                                   app.selected_mode_idx = 0;
-                                   app.needs_redraw = true;
-                                }
-                                KeyCode::Esc => {
-                                   app.mode_menu_active = false;
-                                   app.input.clear();
-                                   app.selected_mode_idx = 0;
-                                   app.needs_redraw = true;
-                                }
-                                _ => {}
-                            }
+                        // Handle /mode selection menu
+                        if app.handle_mode_menu_key(key, &agent).await {
                             continue;
                         }
 
                         match key.code {
+                            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                                app.cycle_focus_backward();
+                                app.needs_redraw = true;
+                                continue;
+                            }
                             KeyCode::Tab => {
-                              app.focused_pane = match app.focused_pane {
-                                    Pane::Left => Pane::Right,
-                                    Pane::Right => Pane::Left,
-                                };
-                                continue; // Force redraw to show focus change
+                                app.cycle_focus_forward();
+                                app.needs_redraw = true;
+                                continue;
                             }
                             KeyCode::Esc => {
                                 // STOP: signal the agent task to halt at the next clean point
@@ -755,9 +917,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 return Ok(());
                             }
 
-                            // Allow typing ahead while the model is working
-                            KeyCode::Char(c) => { app.input.push(c); app.history_index = None; clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected); app.needs_redraw = true; }
-                            KeyCode::Backspace => { app.input.pop(); app.history_index = None; clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected); app.needs_redraw = true; }
+                            // Cursor movement during processing
+                            KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
+                            KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
+                            KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
+                            KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }
+
+                            // Type-ahead: insert at cursor position
+                            KeyCode::Char(c) => { app.insert_char(c); app.history_index = None; clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected); app.needs_redraw = true; }
+                            KeyCode::Backspace => { app.delete_char_before(); app.history_index = None; clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected); app.needs_redraw = true; }
+                            KeyCode::Delete => { app.delete_char_at(); app.needs_redraw = true; }
                             _ => {}
                         }
                     }
@@ -773,64 +942,16 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Normal input handling when idle — read from the input channel
         match tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await {
             Ok(Some(Event::Key(key))) => {
-                if app.pending_approval.is_some() {
-                    match key.code {
-                        KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            if let Some(tx) = app.approval_responder.take() {
-                                let _ = tx.send(true);
-                            }
-                           app.pending_approval = None;
-                           app.left_committed.push("✅ Action approved".to_string());
-                          app.left_follow_output = true;
-                          app.left_scroll = 10_000;
-                        }
-                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                            if let Some(tx) = app.approval_responder.take() {
-                                let _ = tx.send(false);
-                            }
-                           app.pending_approval = None;
-                           app.left_committed.push("⛔ Action denied".to_string());
-                          app.left_follow_output = true;
-                          app.left_scroll = 10_000;
-                        }
-                        _ => {}
-                    }
-                    // fallthrough to match below (input guards prevent typing; Enter dispatch will see cleared input)
-                } else if app.mode_menu_active {
-                    match key.code {
-                        KeyCode::Up | KeyCode::Char('k') => { if app.selected_mode_idx > 0 { app.selected_mode_idx -= 1; } app.needs_redraw = true; }
-                        KeyCode::Down | KeyCode::Char('j') => { if app.selected_mode_idx < 3 { app.selected_mode_idx += 1; } app.needs_redraw = true; }
-                        KeyCode::Enter => {
-                            let chosen = app.approval_modes[app.selected_mode_idx];
-                           app.left_committed.push(format!("Execution mode set to: {}", chosen));
-                          app.left_follow_output = true;
-                          app.left_scroll = 10_000;
-
-                            match app.selected_mode_idx {
-                                0 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::Babysitter); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                1 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::SpringBreak); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                2 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::Vegas); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                3 => { if let Ok(mut ag) = agent.try_lock() { ag.set_exec_approval_mode(crate::session::ExecApprovalMode::Thunderdome); if let Some(s) = &mut ag.session { let _ = s.save_meta(); } } }
-                                _ => {}
-                            }
-                           app.mode_menu_active = false;
-                           app.input.clear();
-                           app.selected_mode_idx = 0;
-                           app.needs_redraw = true;
-                        }
-                        KeyCode::Esc => {
-                           app.mode_menu_active = false;
-                           app.input.clear();
-                           app.selected_mode_idx = 0;
-                           app.needs_redraw = true;
-                        }
-                        _ => {}
-                    }
-                    // fallthrough; big match below has guards so chars etc don't mutate input while menu is open
-                } else if app.settings.active {
-                    apply_settings_key(&mut app, key, &config, &mut keystore, &agent).await;
+                if app.handle_approval_key(key) {
+                    continue;
                 }
-                if !app.settings.active {
+                if app.handle_mode_menu_key(key, &agent).await {
+                    continue;
+                }
+                if app.settings.active {
+                    apply_settings_key(&mut app, key, &config, &mut keystore, &agent).await;
+                    continue;
+                }
                 match key.code {
                     // --- Slash command menu navigation (takes precedence when active) ---
                     KeyCode::Up if app.input.starts_with('/') => {
@@ -850,40 +971,55 @@ async fn run_app<B: ratatui::backend::Backend>(
                     KeyCode::Tab if app.input.starts_with('/') => {
                         let filtered = get_filtered_commands(&app.slash_commands, &app.input);
                         if let Some(cmd) = filtered.get(app.slash_selected.min(filtered.len().saturating_sub(1))) {
-                           app.input = format!("/{} ", cmd.name);
+                            app.set_input(format!("/{} ", cmd.name));
                             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
                         }
                     }
 
+                    // --- Focus cycling ---
+                    KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        app.cycle_focus_backward();
+                        app.needs_redraw = true;
+                    }
                     KeyCode::Tab => {
-                      app.focused_pane = match app.focused_pane {
-                            Pane::Left => Pane::Right,
-                            Pane::Right => Pane::Left,
-                        };
+                        app.cycle_focus_forward();
+                        app.needs_redraw = true;
                     }
                     KeyCode::Esc => {
                         if app.input.starts_with('/') {
                             // Dismiss command menu / clear partial command
-                           app.input.clear();
-                           app.slash_selected = 0;
+                            app.clear_input();
+                            app.slash_selected = 0;
+                        } else if app.search_mode {
+                            app.search_mode = false;
+                            app.search.active = false;
                         } else {
-                            // Release focus on escape
-                          app.focused_pane = Pane::Left;
-                          app.left_follow_output = true;
-                          app.right_follow_output = true;
+                            // Reset focus to conversation pane, resume following
+                            app.focused_pane = Pane::Left;
+                            app.left_follow_output = true;
+                            app.right_follow_output = true;
                         }
                     }
-                    KeyCode::PageUp if app.focused_pane == Pane::Right => { app.right_follow_output = false; let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_sub(8); if old_scroll == app.right_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                    KeyCode::PageUp if app.focused_pane == Pane::Left => { app.left_follow_output = false; let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_sub(8); if old_scroll == app.left_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                    KeyCode::PageDown if app.focused_pane == Pane::Right => { let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_add(8); let right_max = app.last_right_line_count.saturating_sub(app.last_right_area.height.saturating_sub(2)); if old_scroll == app.right_scroll && old_scroll >= right_max { app.scroll_flash_timer = 10; } }
-                    KeyCode::PageDown if app.focused_pane == Pane::Left => { let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_add(8); let left_max = app.last_left_line_count.saturating_sub(app.last_left_area.height.saturating_sub(2)); if old_scroll == app.left_scroll && old_scroll >= left_max { app.scroll_flash_timer = 10; } }
-                    KeyCode::Up if !app.mode_menu_active && app.focused_pane == Pane::Right => { app.right_follow_output = false; let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_sub(1); if old_scroll == app.right_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                    KeyCode::Up if !app.mode_menu_active && app.focused_pane == Pane::Left => { app.left_follow_output = false; let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_sub(1); if old_scroll == app.left_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                    KeyCode::Down if !app.mode_menu_active && app.focused_pane == Pane::Right => { let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_add(1); let right_max = app.last_right_line_count.saturating_sub(app.last_right_area.height.saturating_sub(2)); if old_scroll == app.right_scroll && old_scroll >= right_max { app.scroll_flash_timer = 10; } }
-                    KeyCode::Down if !app.mode_menu_active && app.focused_pane == Pane::Left => { let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_add(1); let left_max = app.last_left_line_count.saturating_sub(app.last_left_area.height.saturating_sub(2)); if old_scroll == app.left_scroll && old_scroll >= left_max { app.scroll_flash_timer = 10; } }
+
+                    // --- Ctrl+C: exit ---
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
+
+                    // --- Multiline: Ctrl+J (reliable), Shift+Enter, or Alt+Enter inserts newline ---
+                    // Most terminals can't distinguish Shift+Enter from Enter,
+                    // but Ctrl+J (ASCII line feed) always works.
+                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.insert_char('\n');
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT) => {
+                        app.insert_char('\n');
+                        app.needs_redraw = true;
+                    }
+
+                    // --- Enter: submit prompt (works from any pane) ---
                     KeyCode::Enter => {
                         let prompt = app.input.trim().to_string();
                         if !prompt.is_empty() {
@@ -937,6 +1073,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 }
                                 SlashDispatch::AgentPrompt(()) => {}
                             }
+                            app.cursor_pos = app.input.len(); // reset cursor after slash clears input
                         } else {
                             // === Normal user prompt to the agent ===
                             // Commit any previous live response (from last turn) if present
@@ -960,7 +1097,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                           app.right_follow_output = true;
                           app.right_scroll = 10_000; // auto-scroll trace pane on new turn start
 
-                           app.input.clear();
+                           app.clear_input();
                            app.slash_selected = 0;
                           app.is_processing = true;
                            app.tool_calls_this_turn = 0;
@@ -1140,7 +1277,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         let v: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                                                         let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
                                                         // truncate long commands for the dialog
-                                                        let short = if cmd.len() > 120 { format!("{}...", &cmd[..120]) } else { cmd.to_string() };
+                                                        let short = truncate(cmd, 120);
                                                         format!("exec: {}", short)
                                                     }
                                                     "update_goal" => {
@@ -1148,7 +1285,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                             .ok()
                                                             .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(|s| s.to_string()))
                                                             .unwrap_or_else(|| tc.function.arguments.clone());
-                                                        format!("update_goal: {}", if goal.len() > 80 { format!("{}...", &goal[..80]) } else { goal })
+                                                        format!("update_goal: {}", truncate(&goal, 80))
                                                     }
                                                     other => format!("{} (args omitted for display)", other),
                                                 };
@@ -1275,7 +1412,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             });
                         }
                     }
-                    // History recall (Ctrl+Up / Ctrl+Down to avoid conflicting with pane scroll)
+                    // --- History recall (Ctrl+Up / Ctrl+Down always works) ---
                     KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         if !app.input_history.is_empty() {
                             let idx = match app.history_index {
@@ -1284,7 +1421,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 None => app.input_history.len() - 1,
                             };
                             app.history_index = Some(idx);
-                            app.input = app.input_history[idx].clone();
+                            app.set_input(app.input_history[idx].clone());
                             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
                             app.needs_redraw = true;
                         }
@@ -1294,39 +1431,86 @@ async fn run_app<B: ratatui::backend::Backend>(
                             if i + 1 < app.input_history.len() {
                                 let next = i + 1;
                                 app.history_index = Some(next);
-                                app.input = app.input_history[next].clone();
+                                app.set_input(app.input_history[next].clone());
                             } else {
                                 app.history_index = None;
-                                app.input.clear();
+                                app.clear_input();
                             }
                             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
                             app.needs_redraw = true;
                         }
                     }
 
-                    KeyCode::Char(c) if !app.mode_menu_active && app.pending_approval.is_none() => {
-                       app.input.push(c);
-                        app.history_index = None;
-                        clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                       app.needs_redraw = true;
+                    // --- Cursor navigation (always available) ---
+                    KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
+                    KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
+                    KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
+                    KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }
+
+                    // --- Context-sensitive Up/Down ---
+                    // When Input focused: history recall
+                    KeyCode::Up if !app.mode_menu_active && app.focused_pane == Pane::Input => {
+                        if !app.input_history.is_empty() {
+                            let idx = match app.history_index {
+                                Some(i) if i > 0 => i - 1,
+                                Some(i) => i,
+                                None => app.input_history.len() - 1,
+                            };
+                            app.history_index = Some(idx);
+                            app.set_input(app.input_history[idx].clone());
+                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+                            app.needs_redraw = true;
+                        }
                     }
-                    KeyCode::Backspace if !app.mode_menu_active && app.pending_approval.is_none() => {
-                       app.input.pop();
-                        app.history_index = None;
-                        clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                       app.needs_redraw = true;
+                    KeyCode::Down if !app.mode_menu_active && app.focused_pane == Pane::Input => {
+                        if let Some(i) = app.history_index {
+                            if i + 1 < app.input_history.len() {
+                                let next = i + 1;
+                                app.history_index = Some(next);
+                                app.set_input(app.input_history[next].clone());
+                            } else {
+                                app.history_index = None;
+                                app.clear_input();
+                            }
+                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+                            app.needs_redraw = true;
+                        }
                     }
+
+                    // When Right pane focused: scroll right pane
+                    KeyCode::Up if !app.mode_menu_active && app.focused_pane == Pane::Right => { app.right_follow_output = false; let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_sub(1); if old_scroll == app.right_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
+                    KeyCode::Down if !app.mode_menu_active && app.focused_pane == Pane::Right => { let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_add(1); let right_max = app.last_right_line_count.saturating_sub(app.last_right_area.height.saturating_sub(2)); if old_scroll == app.right_scroll && old_scroll >= right_max { app.scroll_flash_timer = 10; } }
+
+                    // When Left pane focused: scroll left pane
+                    KeyCode::Up if !app.mode_menu_active => { app.left_follow_output = false; app.left_scroll = app.left_scroll.saturating_sub(1); }
+                    KeyCode::Down if !app.mode_menu_active => { app.left_scroll = app.left_scroll.saturating_add(1); }
+
+                    // --- PageUp/PageDown: Shift for right pane, default for left ---
                     KeyCode::PageUp if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => { app.right_follow_output = false; app.right_scroll = app.right_scroll.saturating_sub(12); }
                     KeyCode::PageUp if !app.mode_menu_active => { app.left_follow_output = false; app.left_scroll = app.left_scroll.saturating_sub(12); }
                     KeyCode::PageDown if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => { app.right_scroll = app.right_scroll.saturating_add(12); }
                     KeyCode::PageDown if !app.mode_menu_active => { app.left_scroll = app.left_scroll.saturating_add(12); }
-                    KeyCode::Up if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => { app.right_follow_output = false; app.right_scroll = app.right_scroll.saturating_sub(1); }
-                    KeyCode::Up if !app.mode_menu_active => { app.left_follow_output = false; app.left_scroll = app.left_scroll.saturating_sub(1); }
-                    KeyCode::Down if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => { app.right_scroll = app.right_scroll.saturating_add(1); }
-                    KeyCode::Down if !app.mode_menu_active => { app.left_scroll = app.left_scroll.saturating_add(1); }
+
+                    // --- Text editing (always active, chars go to input from any pane) ---
+                    KeyCode::Char(c) if !app.mode_menu_active && app.pending_approval.is_none() => {
+                        app.insert_char(c);
+                        app.history_index = None;
+                        clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Backspace if !app.mode_menu_active && app.pending_approval.is_none() => {
+                        app.delete_char_before();
+                        app.history_index = None;
+                        clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+                        app.needs_redraw = true;
+                    }
+                    KeyCode::Delete if !app.mode_menu_active && app.pending_approval.is_none() => {
+                        app.delete_char_at();
+                        app.needs_redraw = true;
+                    }
+
                     _ => {}
                 }
-                } // if !app.settings_active
             }
             _ => {} // Timeout, non-key event, or channel closed
         }
@@ -1356,5 +1540,41 @@ fn truncate(s: &str, max: usize) -> String {
             end -= 1;
         }
         format!("{}...", &s[..end])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_ascii_short() {
+        assert_eq!(truncate("hi", 80), "hi");
+    }
+
+    #[test]
+    fn truncate_ascii_long() {
+        assert_eq!(truncate("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_multibyte_no_panic() {
+        // "é" is 2 bytes; slicing at byte 1 would panic without boundary handling.
+        let s = "éééééééééé"; // 20 bytes, 10 chars
+        let out = truncate(s, 5);
+        // Should back off to a char boundary (byte 4 = 2 chars) and append ellipsis.
+        assert!(out.ends_with("..."));
+        // 2 chars + "..." (3 chars) = 5 chars total.
+        assert_eq!(out.chars().count(), 5);
+    }
+
+    #[test]
+    fn truncate_emoji_boundary() {
+        // "🦀" is 4 bytes. Truncating at byte 6 should back off to byte 4.
+        let s = "🦀🦀🦀🦀🦀"; // 20 bytes
+        let out = truncate(s, 6);
+        assert!(out.ends_with("..."));
+        // Should contain exactly one crab + ellipsis.
+        assert_eq!(out, "🦀...");
     }
 }

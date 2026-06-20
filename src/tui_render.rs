@@ -29,7 +29,7 @@ pub struct StatusBarData<'a> {
 pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
     let ctx = data.budget;
     let mut spans = vec![
-        Span::styled(" 🏛 ", Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))),
+        Span::styled(" ⦖ ", Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))),
         Span::styled(
             data.display_model,
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
@@ -119,6 +119,7 @@ pub struct InputBarData<'a> {
     pub is_processing: bool,
     pub spinner_tick: usize,
     pub search_mode: bool,
+    pub focused: bool,
 }
 
 pub fn draw_input_bar(f: &mut Frame, area: Rect, data: &InputBarData<'_>) {
@@ -173,7 +174,7 @@ pub fn draw_input_bar(f: &mut Frame, area: Rect, data: &InputBarData<'_>) {
             ),
             Span::styled("Input", Style::default().fg(Color::Gray)),
             Span::styled(
-                "  Enter send • Ctrl-V paste • Ctrl-F search • ",
+                "  Enter send • Ctrl-J newline • Ctrl-F search • ",
                 Style::default().fg(Color::DarkGray),
             ),
             Span::styled(
@@ -183,6 +184,11 @@ pub fn draw_input_bar(f: &mut Frame, area: Rect, data: &InputBarData<'_>) {
             Span::styled(" commands ", Style::default().fg(Color::DarkGray)),
         ])
     };
+    let border_style = if data.focused {
+        Style::default().fg(Color::White)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
     let input_para = Paragraph::new(data.input)
         .style(Style::default().fg(Color::White))
         .block(
@@ -190,8 +196,9 @@ pub fn draw_input_bar(f: &mut Frame, area: Rect, data: &InputBarData<'_>) {
                 .title(input_title)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))),
-        );
+                .border_style(border_style),
+        )
+        .wrap(Wrap { trim: false });
     f.render_widget(input_para, area);
 }
 
@@ -323,11 +330,7 @@ pub fn draw_approval_popup(f: &mut Frame, desc: &str, input_area: Rect) {
     let px = 2;
     let py = input_area.y.saturating_sub(ph + 1);
     let pa = Rect::new(px, py, pw, ph);
-    let safe_desc = if desc.len() > 220 {
-        format!("{}…", &desc[..220])
-    } else {
-        desc.to_string()
-    };
+    let safe_desc = truncate_str(desc, 220);
     let popup_text = Text::from(vec![
         Line::from(Span::styled(
             "Sandbox approval needed",
@@ -505,7 +508,7 @@ pub fn draw_right_pane(
         right_text.lines.push(Line::from(Span::styled(
             "Thinking (live):",
             Style::default()
-                .fg(Color::Rgb(0xd0, 0xa0, 0xff))
+                .fg(Color::LightCyan) // ANSI16: LightCyan, 256-color: 14, TrueColor: #00e5e5
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         )));
         line_idx += 1;
@@ -517,7 +520,7 @@ pub fn draw_right_pane(
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
-                    .fg(Color::Rgb(0xd0, 0xa0, 0xff))
+                    .fg(Color::LightCyan)
                     .add_modifier(Modifier::ITALIC)
             };
             right_text
@@ -642,7 +645,7 @@ fn render_scrollable_pane(
         if scroll_flash_timer > 0 {
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(title_color).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::White)
         }
     } else {
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
@@ -666,7 +669,8 @@ fn render_scrollable_pane(
                 .title(title_line)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(focus_style),
+                .border_style(focus_style)
+                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
         )
         .wrap(Wrap { trim: false })
         .scroll((*scroll, 0));

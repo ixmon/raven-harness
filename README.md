@@ -120,7 +120,15 @@ The cache lives in the per-session `context.db`. This is one of the most effecti
 - **Conversation** (left) – committed history + current turn output
 - **Trace** (right) – model reasoning, tool calls, and results
 
-Both panes autoscroll by default when new content arrives. Tab switches focus; arrow keys and PageUp/PageDown scroll the focused pane. A visual flash indicates when you hit the scroll boundary.
+Both panes autoscroll by default when new content arrives. **Tab** cycles focus through three targets: Conversation → Trace → Input (Shift+Tab reverses). Arrow keys and PageUp/PageDown scroll the focused pane; a visual flash indicates scroll boundaries. The focused element gets a white border; unfocused elements use a dim gray border.
+
+### Multiline Input
+
+Press **Ctrl+J** to insert a newline in the input box. The input area grows dynamically (up to 6 content lines). Standard cursor navigation works: Left/Right to move, Home/End to jump, Delete/Backspace at cursor position.
+
+### Adaptive Color Palette
+
+The TUI auto-detects terminal color depth (truecolor, 256-color, 16-color) and downsamples all colors accordingly. GNU `screen` is detected via `$STY` and forced to 16-color mode with ITALIC stripped (screen renders italic as reverse video). Override with `RAVEN_COLOR_DEPTH=24|256|16|0`.
 
 ### Search (`/search` or Ctrl-F)
 
@@ -128,7 +136,7 @@ Search within either pane with `/search <query>`. Matches are highlighted and yo
 
 ### Input History
 
-Press Ctrl+Up / Ctrl+Down to recall previous prompts, shell-style.
+Press **Ctrl+Up / Ctrl+Down** to recall previous prompts. When the Input pane is focused, plain **Up/Down** also recalls history.
 
 ### Clipboard
 
@@ -191,6 +199,7 @@ src/
 ├── input_dispatch.rs    # Slash command dispatch + navigation helpers
 ├── settings_modal.rs    # Settings modal state machine + key handling
 ├── search.rs            # In-pane search (match finding, scroll-to)
+├── palette.rs           # Adaptive color depth (truecolor/256/16) with screen quirk handling
 ├── agent.rs             # Agent (conversation, tool loop, context management)
 ├── llm.rs               # OpenAI-compatible HTTP client + SSE streaming
 ├── session.rs           # Persistent session (meta.json, full_log, context.db)
@@ -215,4 +224,4 @@ src/
 cargo test
 ```
 
-17 tests covering: patch logic, line-range parsing, workspace containment, context budget bounds, keystore encrypt/decrypt round-trip, SSE stream parsing, tool call delta accumulation, UTF-8 safe truncation, and search matching.
+28 tests covering: patch logic, line-range parsing, workspace containment, context budget bounds, keystore encrypt/decrypt round-trip, SSE stream parsing, tool call delta accumulation, UTF-8 safe truncation, search matching, and 16-color palette mapping.
