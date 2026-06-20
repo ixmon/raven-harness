@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 mod agent;
 mod config;
+mod desktop;
 mod input_dispatch;
 mod keystore;
 mod llm;

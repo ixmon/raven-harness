@@ -20,6 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::agent::Agent;
 use crate::config::Config;
+use crate::desktop::{load_raven_art, DesktopState, WorkspacePane};
 use crate::input_dispatch::{
     apply_settings_actions, default_slash_commands, dispatch_slash_command, SlashContext,
     SlashDispatch,
@@ -140,6 +141,10 @@ struct App {
     // Cached status-bar labels to avoid flicker when agent lock is contended (glm.md)
     cached_mode_label: String,
     cached_goal_text: String,
+
+    // Multi-desktop: workspace ↔ splash (left/right arrow slide)
+    desktop: DesktopState,
+    raven_art: String,
 }
 
 impl App {
@@ -202,7 +207,39 @@ impl App {
             search_mode: false,
             cached_mode_label: String::new(),
             cached_goal_text: "(no goal set)".into(),
+            desktop: DesktopState::new(),
+            raven_art: load_raven_art(),
         }
+    }
+
+    fn try_slide_to_splash(&mut self) -> bool {
+        if !self.desktop.can_slide_to_splash() {
+            return false;
+        }
+        if !matches!(self.focused_pane, Pane::Left | Pane::Right) {
+            return false;
+        }
+        let pane = match self.focused_pane {
+            Pane::Left => WorkspacePane::Left,
+            Pane::Right => WorkspacePane::Right,
+            Pane::Input => return false,
+        };
+        self.desktop.start_slide_to_splash(pane);
+        self.needs_redraw = true;
+        true
+    }
+
+    fn try_slide_to_workspace(&mut self) -> bool {
+        if !self.desktop.can_slide_to_workspace() {
+            return false;
+        }
+        self.focused_pane = match self.desktop.workspace_pane {
+            WorkspacePane::Left => Pane::Left,
+            WorkspacePane::Right => Pane::Right,
+        };
+        self.desktop.start_slide_to_workspace();
+        self.needs_redraw = true;
+        true
     }
 }
 
@@ -539,8 +576,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         app.cached_goal_text = goal_text.clone();
 
         // Draw only when needed (basic perf improvement per glm.md)
-        if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 {
+        if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 || app.desktop.is_animating() {
            app.needs_redraw = false;
+            let workspace_display = config.workspace.display().to_string();
             // Draw - split into status bar + content area + context gauge + input bar
             terminal.draw(|f| {
             let size = f.area();
@@ -567,7 +605,11 @@ async fn run_app<B: ratatui::backend::Backend>(
             let input_area = vertical[3];
 
             // ═══════════════════ STATUS BAR ═══════════════════
-            let search_label = app.search.status_label();
+            let search_label = if app.desktop.showing_splash() {
+                "→ workspace".to_string()
+            } else {
+                app.search.status_label()
+            };
             crate::tui_render::draw_status_bar(f, status_area, &crate::tui_render::StatusBarData {
                 display_model: &app.display_model,
                 ctx_used_tokens: app.ctx_used_tokens,
@@ -577,18 +619,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 search_label: &search_label,
             });
 
-            // ═══════════════════ CONTENT PANES ═══════════════════
-            let panes = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                .split(content_area);
-
-            let left_area = panes[0];
-            let right_area = panes[1];
-           app.last_left_area = left_area;
-           app.last_right_area = right_area;
-
-            // Search highlight: only highlight on the pane that owns the search.
+            // ═══════════════════ CONTENT: workspace ↔ splash (slide) ═══════════════════
             let left_highlight = if app.search.active
                 && app.search.pane == crate::tui_render::Pane::Left
                 && !app.search.match_lines.is_empty()
@@ -606,36 +637,40 @@ async fn run_app<B: ratatui::backend::Backend>(
                 None
             };
 
-            // Call extracted (split rendering)
-            // When Input pane is focused, neither content pane gets the focus highlight
             let left_focused = app.focused_pane == Pane::Left;
             let right_focused = app.focused_pane == Pane::Right;
-            crate::tui_render::draw_left_pane(
-                f,
-                &app.left_committed,
-                &app.current_response,
-                left_area,
-                &mut app.last_left_area,
-                &mut app.last_left_line_count,
-                app.left_follow_output,
-                &mut app.left_scroll,
-                if left_focused { crate::tui_render::Pane::Left } else { crate::tui_render::Pane::Right }, // hack: Left=focused, Right=unfocused
-                app.scroll_flash_timer,
-                left_highlight,
-            );
 
-            crate::tui_render::draw_right_pane(
+            crate::tui_render::draw_content_desktop(
                 f,
-                &app.trace_lines,
-                &app.current_thinking,
-                right_area,
+                content_area,
+                &app.desktop,
+                &crate::tui_render::WorkspaceDrawData {
+                    left_committed: &app.left_committed,
+                    current_response: &app.current_response,
+                    trace_lines: &app.trace_lines,
+                    current_thinking: &app.current_thinking,
+                    left_scroll: app.left_scroll,
+                    right_scroll: app.right_scroll,
+                    left_focused,
+                    right_focused,
+                    scroll_flash_timer: app.scroll_flash_timer,
+                    left_highlight,
+                    right_highlight,
+                },
+                &crate::tui_render::SplashData {
+                    raven_art: &app.raven_art,
+                    base_url: &config.base_url,
+                    model: &app.display_model,
+                    workspace: &workspace_display,
+                },
+                &mut app.last_left_area,
                 &mut app.last_right_area,
+                &mut app.last_left_line_count,
                 &mut app.last_right_line_count,
-                app.right_follow_output,
+                &mut app.left_scroll,
                 &mut app.right_scroll,
-                if right_focused { crate::tui_render::Pane::Right } else { crate::tui_render::Pane::Left }, // hack: Right=focused, Left=unfocused
-                app.scroll_flash_timer,
-                right_highlight,
+                app.left_follow_output,
+                app.right_follow_output,
             );
 
             // ═══════════════════ CONTEXT GAUGE ═══════════════════
@@ -681,6 +716,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             // Decrement scroll flash timer
             if app.scroll_flash_timer > 0 {
               app.scroll_flash_timer = app.scroll_flash_timer.saturating_sub(1);
+            }
+
+            if app.desktop.tick() {
+                app.needs_redraw = true;
             }
         })?;
         }
@@ -918,7 +957,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
 
                             // Cursor movement during processing
+                            KeyCode::Left if !app.desktop.is_animating() && app.try_slide_to_splash() => {}
                             KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
+                            KeyCode::Right if !app.desktop.is_animating() && app.try_slide_to_workspace() => {}
                             KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
                             KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
                             KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }
@@ -1441,8 +1482,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
 
-                    // --- Cursor navigation (always available) ---
+                    // --- Desktop slide (pane focus) or cursor navigation (input) ---
+                    KeyCode::Left
+                        if !app.mode_menu_active
+                            && !app.settings.active
+                            && app.pending_approval.is_none()
+                            && !app.desktop.is_animating()
+                            && app.try_slide_to_splash() => {}
                     KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
+                    KeyCode::Right
+                        if !app.mode_menu_active
+                            && !app.settings.active
+                            && app.pending_approval.is_none()
+                            && !app.desktop.is_animating()
+                            && app.try_slide_to_workspace() => {}
                     KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
                     KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
                     KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }

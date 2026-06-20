@@ -1,10 +1,10 @@
-# Raven Hotel - Agent Harness
+# Raven Harness - agentic TUI for coding
 
-Raven Harness exists because I wanted a simple, capable way for a model to do real agentic coding work locally — without being forced to use a commercial product whose internals and data practices I don't control.
+I created this program because I wanted a simple, capable way for a model to do real agentic coding work locally — without being forced to use a commercial product whose internals and data practices I don't control, or using a complex agentic system that might also have unpredictable behaviors across unknown mystery meat AI.
 
 At the same time, I wanted the same harness to work smoothly with frontier cloud models when a task calls for maximum capability. This gives genuine flexibility: use fast, private, low-cost local inference (via llama.cpp or similar) for everyday work, and reach for the most powerful models only when you actually need them — all through one consistent interface and toolset.
 
-Privacy and security are first-class concerns. Your code never has to leave your machine unless you explicitly decide to use a remote endpoint. API keys are encrypted at rest with AES-256-GCM (Argon2id key derivation). The TUI includes a full execution approval system (`/mode`) with four sandbox levels (Babysitter always-ask through Thunderdome yolo) so you stay in control of writes and shell commands. File operations enforce workspace containment — the agent cannot read or write outside the project directory.
+Privacy and security are important. Your code never has to leave your machine unless you explicitly decide to use a remote endpoint. API keys are encrypted at rest with AES-256-GCM (Argon2id key derivation) the default password is "raven". The TUI includes a full execution approval system (`/mode`) with four sandbox levels (Babysitter always-ask through Thunderdome yolo) so you stay in control of writes and shell commands. File operations enforce workspace containment — the agent cannot read or write outside the project directory.
 
 A significant part of making this practical (especially when using paid APIs) is aggressive, intelligent context management. Features like persistent sessions with goal tracking, repo-aware discovery with importance ranking, mtime-matched file summaries, and dynamic context budgeting are not just nice-to-haves — they let the agent stay coherent over long tasks while dramatically reducing token spend.
 
@@ -115,12 +115,24 @@ To avoid repeatedly dumping large source files into context, the agent has two d
 
 The cache lives in the per-session `context.db`. This is one of the most effective ways small local models stay coherent across long coding sessions.
 
-### Dual-Pane Interface
+### Splash Screen & Workspaces
+
+The TUI opens on a **splash screen** by default — ASCII raven art, keybindings, and session info (endpoint, model, workspace). Press **→** (right arrow) to slide into the main workspace; press **←** (left arrow) from the Conversation or Trace pane to slide back.
+
+The transition is a short horizontal slide animation (a “multiple desktops” feel). The status bar shows `→ workspace` while you are on the splash screen. The input bar stays available on both desktops so you can type a prompt without leaving splash first.
+
+Raven art is loaded from `/tmp/raven1.txt` when present, otherwise from the bundled `assets/raven.txt`.
+
+### Dual-Pane Workspace
+
+Once you enter the workspace (right arrow from splash):
 
 - **Conversation** (left) – committed history + current turn output
 - **Trace** (right) – model reasoning, tool calls, and results
 
-Both panes autoscroll by default when new content arrives. **Tab** cycles focus through three targets: Conversation → Trace → Input (Shift+Tab reverses). Arrow keys and PageUp/PageDown scroll the focused pane; a visual flash indicates scroll boundaries. The focused element gets a white border; unfocused elements use a dim gray border.
+Both panes autoscroll by default when new content arrives. **Tab** cycles focus through three targets: Conversation → Trace → Input (Shift+Tab reverses). **Up/Down** and PageUp/PageDown scroll the focused pane; a visual flash indicates scroll boundaries. The focused element gets a white border; unfocused elements use a dim gray border.
+
+**← / →** on the Conversation or Trace panes switch desktops (splash ↔ workspace). When Input is focused, left/right move the cursor in the text box instead.
 
 ### Multiline Input
 
@@ -130,9 +142,9 @@ Press **Ctrl+J** to insert a newline in the input box. The input area grows dyna
 
 The TUI auto-detects terminal color depth (truecolor, 256-color, 16-color) and downsamples all colors accordingly. GNU `screen` is detected via `$STY` and forced to 16-color mode with ITALIC stripped (screen renders italic as reverse video). Override with `RAVEN_COLOR_DEPTH=24|256|16|0`.
 
-### Search (`/search` or Ctrl-F)
+### Search (`/search`)
 
-Search within either pane with `/search <query>`. Matches are highlighted and you can jump between them with `n`/`N` (or Ctrl-N/Ctrl-P). The search targets whichever pane has focus.
+Search within either pane with `/search <query>`. Matches are highlighted and the view scrolls to the first hit. The search targets whichever pane has focus when you run the command.
 
 ### Input History
 
@@ -189,13 +201,27 @@ Type `/` then use Up/Down to browse, Tab to complete.
 | `--prompt "..."` | | Non-interactive one-shot mode |
 | | `RAVEN_VAULT_PASSWORD` | Unlock encrypted keystore without interactive prompt |
 
+## Keybindings (quick reference)
+
+| Key | Context | Action |
+|-----|---------|--------|
+| **→** | Splash | Slide to workspace (Conversation + Trace) |
+| **←** | Conversation or Trace | Slide to splash |
+| **Tab** / **Shift+Tab** | Workspace | Cycle focus: Conv → Trace → Input |
+| **↑↓** / **PgUp/PgDn** | Conv or Trace focused | Scroll that pane |
+| **Ctrl+↑↓** | Any | Recall input history |
+| **Ctrl+J** | Input | Insert newline |
+| **Ctrl+C** | Any | Quit |
+| **Esc** | Splash / slash menu | Dismiss or reset focus |
+
 ## Architecture
 
 ```
 src/
 ├── main.rs              # CLI parsing, keystore init, vault unlock
 ├── tui_app.rs           # Main event loop, App struct, agent orchestration
-├── tui_render.rs        # All rendering (status bar, panes, overlays, input bar)
+├── tui_render.rs        # Rendering (status bar, panes, splash, slide compositing)
+├── desktop.rs           # Splash ↔ workspace state + slide animation
 ├── input_dispatch.rs    # Slash command dispatch + navigation helpers
 ├── settings_modal.rs    # Settings modal state machine + key handling
 ├── search.rs            # In-pane search (match finding, scroll-to)
@@ -210,10 +236,14 @@ src/
     ├── fs.rs            # File ops (read/write/patch/grep/list) with containment
     ├── exec.rs          # Shell execution with timeout + kill_on_drop
     └── web.rs           # web_search + browse
+
+assets/
+└── raven.txt            # Bundled ASCII raven for splash screen
 ```
 
 - The agent instance (conversation history + session) survives across turns via `Arc<Mutex<Agent>>`
 - Streaming tool-use continuation is a real loop (handles multiple rounds of tool calls)
+- Splash and workspace are separate “desktops” composited with off-screen buffers during slide transitions
 - All truncation is UTF-8 safe
 - The draw loop uses a `needs_redraw` flag to skip idle frames
 - Status bar caches values on agent lock contention to prevent flicker
@@ -224,4 +254,4 @@ src/
 cargo test
 ```
 
-28 tests covering: patch logic, line-range parsing, workspace containment, context budget bounds, keystore encrypt/decrypt round-trip, SSE stream parsing, tool call delta accumulation, UTF-8 safe truncation, search matching, and 16-color palette mapping.
+29 tests covering: patch logic, line-range parsing, workspace containment, context budget bounds, keystore encrypt/decrypt round-trip, SSE stream parsing, tool call delta accumulation, UTF-8 safe truncation, search matching, desktop slide transitions, and 16-color palette mapping.
