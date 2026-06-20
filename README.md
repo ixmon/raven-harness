@@ -12,6 +12,18 @@ Finally, the harness itself is deliberately simple and open. It should be someth
 
 A focused ratatui-based terminal UI for agentic coding against local (or remote) OpenAI-compatible servers (llama.cpp, OpenRouter, etc.).
 
+<p align="center">
+  <img src="assets/screenshots/splash.png" alt="Splash screen with raven art, keybindings, and session info" width="800">
+  <br>
+  <em>Splash screen — session info, keybindings, and ASCII raven</em>
+</p>
+
+<p align="center">
+  <img src="assets/screenshots/workspace.png" alt="Workspace with conversation and trace panes during an agent turn" width="800">
+  <br>
+  <em>Workspace — dual-pane view with conversation (left) and model trace (right)</em>
+</p>
+
 ## Quick start
 
 ```bash
