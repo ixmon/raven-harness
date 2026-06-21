@@ -301,6 +301,11 @@ Keybindings:
   Y / N        Approve or deny sandbox actions
   Esc          Stop agent (while processing) or cancel menus
 
+While agent is running:
+  Enter        Queue interject (applies before next tool round)
+  Ctrl+Enter   Send interject now (stops current inference)
+  Shift+Enter  Newline in input
+
 Tip: type / then use ↑↓ to browse, Tab to complete.";
 
 /// Apply settings-side-effect actions to the App UI fields.

@@ -456,7 +456,7 @@ impl Agent {
     // Session-aware helpers (new context management)
     // ─────────────────────────────────────────────────────────────────
 
-    fn on_new_user_input(&mut self, user_input: &str) {
+    pub fn on_new_user_input(&mut self, user_input: &str) {
         // Record the request for the injection block
         if let Some(s) = &mut self.session {
             let _ = s.set_last_user_request(user_input);

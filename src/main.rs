@@ -1,6 +1,6 @@
 //! Raven TUI — Simple agentic coding assistant backed by llama.cpp (or other OpenAI-compatible endpoints).
 //!
-//! Talks to spark.home.arpa:8080 by default (Qwen model).
+//! Talks to localhost:8080 by default (llama.cpp / Qwen model).
 //! Provides the agent with practical tools: filesystem ops, shell exec, web search, and page browsing.
 
 use anyhow::Result;
@@ -25,7 +25,7 @@ mod tui_render;
 #[command(name = "raven-tui", about = "Agentic coding TUI powered by local LLMs + tools")]
 struct Args {
     /// OpenAI-compatible base URL (llama.cpp server, etc.)
-    #[arg(long, env = "LLM_BASE_URL", default_value = "http://spark.home.arpa:8080/v1")]
+    #[arg(long, env = "LLM_BASE_URL", default_value = "http://127.0.0.1:8080/v1")]
     base_url: String,
 
     /// Model name to use (whatever your llama.cpp server exposes)

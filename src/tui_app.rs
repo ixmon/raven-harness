@@ -14,6 +14,7 @@ use ratatui::{
 };
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -241,6 +242,18 @@ impl App {
         self.needs_redraw = true;
         true
     }
+
+    fn route_left_to_desktop(&self) -> bool {
+        matches!(self.focused_pane, Pane::Left | Pane::Right)
+            && self.desktop.can_slide_to_splash()
+            && !self.desktop.is_animating()
+    }
+
+    fn route_right_to_desktop(&self) -> bool {
+        self.desktop.can_slide_to_workspace()
+            && !self.desktop.is_animating()
+            && !matches!(self.focused_pane, Pane::Input)
+    }
 }
 
 fn render_pane(pane: Pane) -> crate::tui_render::Pane {
@@ -357,6 +370,11 @@ impl App {
         self.cursor_pos = 0;
     }
 
+    /// Keep cursor_pos within input bounds (guards against stale clears).
+    fn clamp_cursor(&mut self) {
+        self.cursor_pos = self.cursor_pos.min(self.input.len());
+    }
+
     /// Cycle focus forward: Left → Right → Input → Left
     fn cycle_focus_forward(&mut self) {
         self.focused_pane = match self.focused_pane {
@@ -373,6 +391,182 @@ impl App {
             Pane::Input => Pane::Right,
             Pane::Right => Pane::Left,
         };
+    }
+
+    fn pane_max_scroll(&self, pane: Pane) -> u16 {
+        let (line_count, content_h) = match pane {
+            Pane::Left => (
+                self.last_left_line_count,
+                self.last_left_area.height.saturating_sub(2),
+            ),
+            Pane::Right => (
+                self.last_right_line_count,
+                self.last_right_area.height.saturating_sub(2),
+            ),
+            Pane::Input => (0, 0),
+        };
+        line_count.saturating_sub(content_h)
+    }
+
+    /// Scroll the focused conversation/trace pane by `delta` lines (negative = up).
+    fn scroll_focused_line(&mut self, delta: i16) {
+        if self.desktop.showing_splash() || self.mode_menu_active {
+            return;
+        }
+        let pane = self.focused_pane;
+        if !matches!(pane, Pane::Left | Pane::Right) {
+            return;
+        }
+        self.scroll_pane_line(pane, delta);
+    }
+
+    /// Scroll the focused pane by `delta` pages (PgUp/PgDn).
+    fn scroll_focused_page(&mut self, delta: i16, page_lines: u16) {
+        if self.desktop.showing_splash() || self.mode_menu_active {
+            return;
+        }
+        let pane = self.focused_pane;
+        if !matches!(pane, Pane::Left | Pane::Right) {
+            return;
+        }
+        self.scroll_pane_page(pane, delta, page_lines);
+    }
+
+    fn scroll_pane_line(&mut self, pane: Pane, delta: i16) {
+        let max_scroll = self.pane_max_scroll(pane);
+        match pane {
+            Pane::Left => {
+                if delta < 0 {
+                    self.left_follow_output = false;
+                }
+                let old_scroll = self.left_scroll;
+                if delta < 0 {
+                    self.left_scroll = self.left_scroll.saturating_sub(1);
+                } else {
+                    self.left_follow_output = false;
+                    self.left_scroll = self.left_scroll.saturating_add(1);
+                }
+                if old_scroll == self.left_scroll
+                    && ((delta < 0 && old_scroll == 0) || (delta > 0 && old_scroll >= max_scroll))
+                {
+                    self.scroll_flash_timer = 10;
+                }
+            }
+            Pane::Right => {
+                if delta < 0 {
+                    self.right_follow_output = false;
+                }
+                let old_scroll = self.right_scroll;
+                if delta < 0 {
+                    self.right_scroll = self.right_scroll.saturating_sub(1);
+                } else {
+                    self.right_follow_output = false;
+                    self.right_scroll = self.right_scroll.saturating_add(1);
+                }
+                if old_scroll == self.right_scroll
+                    && ((delta < 0 && old_scroll == 0) || (delta > 0 && old_scroll >= max_scroll))
+                {
+                    self.scroll_flash_timer = 10;
+                }
+            }
+            Pane::Input => return,
+        }
+        self.needs_redraw = true;
+    }
+
+    fn scroll_after_interject_ui(&mut self) {
+        self.left_follow_output = true;
+        self.left_scroll = 10_000;
+        self.right_follow_output = true;
+        self.right_scroll = 10_000;
+        self.needs_redraw = true;
+    }
+
+    /// Queue an interject to apply before the next tool round (Enter while processing).
+    fn submit_queued_interject(&mut self, text: String, queued: &Arc<Mutex<Option<String>>>) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = queued.lock() {
+            *slot = Some(text.clone());
+        }
+        self.left_committed
+            .push(format!("You (interject, queued): {}", text));
+        self.trace_lines
+            .push("📌 Interject queued — will apply before next tool round".to_string());
+        self.clear_input();
+        self.history_index = None;
+        self.scroll_after_interject_ui();
+    }
+
+    /// Stop inference and inject immediately (Ctrl+Enter while processing).
+    fn submit_instant_interject(
+        &mut self,
+        text: String,
+        queued: &Arc<Mutex<Option<String>>>,
+        instant: &Arc<Mutex<Option<String>>>,
+        stop: &Arc<AtomicBool>,
+    ) {
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = queued.lock() {
+            *slot = None;
+        }
+        if let Ok(mut slot) = instant.lock() {
+            *slot = Some(text.clone());
+        }
+        stop.store(true, Ordering::SeqCst);
+        if let Some(tx) = self.approval_responder.take() {
+            let _ = tx.send(false);
+        }
+        self.pending_approval = None;
+        self.left_committed
+            .push(format!("You (interject, now): {}", text));
+        self.trace_lines
+            .push("⚡ Interject sent — stopping current inference".to_string());
+        self.clear_input();
+        self.history_index = None;
+        self.scroll_after_interject_ui();
+    }
+
+    fn scroll_pane_page(&mut self, pane: Pane, delta: i16, page_lines: u16) {
+        let page = page_lines;
+        let max_scroll = self.pane_max_scroll(pane);
+        match pane {
+            Pane::Left => {
+                self.left_follow_output = false;
+                let old_scroll = self.left_scroll;
+                if delta < 0 {
+                    self.left_scroll = self.left_scroll.saturating_sub(page);
+                } else {
+                    self.left_scroll = self.left_scroll.saturating_add(page);
+                }
+                if old_scroll == self.left_scroll
+                    && ((delta < 0 && old_scroll == 0) || (delta > 0 && old_scroll >= max_scroll))
+                {
+                    self.scroll_flash_timer = 10;
+                }
+            }
+            Pane::Right => {
+                self.right_follow_output = false;
+                let old_scroll = self.right_scroll;
+                if delta < 0 {
+                    self.right_scroll = self.right_scroll.saturating_sub(page);
+                } else {
+                    self.right_scroll = self.right_scroll.saturating_add(page);
+                }
+                if old_scroll == self.right_scroll
+                    && ((delta < 0 && old_scroll == 0) || (delta > 0 && old_scroll >= max_scroll))
+                {
+                    self.scroll_flash_timer = 10;
+                }
+            }
+            Pane::Input => return,
+        }
+        self.needs_redraw = true;
     }
 }
 
@@ -451,13 +645,13 @@ impl App {
                     }
                 }
                 self.mode_menu_active = false;
-                self.input.clear();
+                self.clear_input();
                 self.selected_mode_idx = 0;
                 self.needs_redraw = true;
             }
             KeyCode::Esc => {
                 self.mode_menu_active = false;
-                self.input.clear();
+                self.clear_input();
                 self.selected_mode_idx = 0;
                 self.needs_redraw = true;
             }
@@ -535,6 +729,8 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Stop signal: UI sets this to true (Escape while processing), agent task checks it
     // at clean stopping points (before each LLM call, before each tool execution).
     let stop_signal = Arc::new(AtomicBool::new(false));
+    let queued_interject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let instant_interject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Spawn a dedicated thread for keyboard input (responsive even during LLM streaming).
     // Uses blocking_send() to bridge the sync thread → async tokio channel.
@@ -707,6 +903,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             );
 
             // Cursor in input — compute position from cursor_pos, handling multiline
+            app.clamp_cursor();
             let text_before_cursor = &app.input[..app.cursor_pos];
             let cursor_line = text_before_cursor.matches('\n').count() as u16;
             let last_newline = text_before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
@@ -729,7 +926,7 @@ async fn run_app<B: ratatui::backend::Backend>(
            app.pending_approval = Some(desc.clone());
            app.approval_responder = Some(tx);
            app.needs_redraw = true; // force a redraw so popup shows
-           app.input.clear(); // don't leave garbage in the input field
+           app.clear_input();
            app.trace_lines.push(format!("🔒 Approval requested for: {}", desc));
            app.left_committed.push(format!("🔒 Approval requested for: {}", desc));
            app.left_follow_output = true;
@@ -754,7 +951,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     while let Ok((desc, tx)) = approval_req_rx.try_recv() {
                        app.pending_approval = Some(desc.clone());
                        app.approval_responder = Some(tx);
-                       app.input.clear();
+                       app.clear_input();
                       app.trace_lines.push(format!("🔒 Approval requested for: {}", desc));
                        app.left_committed.push(format!("🔒 Approval requested for: {}", desc));
                       app.left_follow_output = true;
@@ -887,7 +1084,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                app.pending_approval = Some(desc);
                                app.approval_responder = Some(tx);
                                app.needs_redraw = true;
-                               app.input.clear();
+                               app.clear_input();
                             }
                             // Force a redraw so the dialog appears immediately
                           app.left_follow_output = true;
@@ -895,6 +1092,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         UiUpdate::ContextUsage { used_tokens } => {
                           app.ctx_used_tokens = used_tokens;
+                        }
+                        UiUpdate::InterjectRestart => {
+                          app.current_response.clear();
+                          app.current_thinking.clear();
+                          app.needs_redraw = true;
+                          app.left_follow_output = true;
+                          app.left_scroll = 10_000;
+                          app.right_follow_output = true;
+                          app.right_scroll = 10_000;
                         }
                     }
                 }
@@ -944,22 +1150,52 @@ async fn run_app<B: ratatui::backend::Backend>(
                               app.right_scroll = 10_000;
                             }
 
-                            KeyCode::PageUp if app.focused_pane == Pane::Right => { app.right_follow_output = false; let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_sub(8); if old_scroll == app.right_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                            KeyCode::PageUp if app.focused_pane == Pane::Left => { app.left_follow_output = false; let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_sub(8); if old_scroll == app.left_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                            KeyCode::PageDown if app.focused_pane == Pane::Right => { let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_add(8); let right_max = app.last_right_line_count.saturating_sub(app.last_right_area.height.saturating_sub(2)); if old_scroll == app.right_scroll && old_scroll >= right_max { app.scroll_flash_timer = 10; } }
-                            KeyCode::PageDown if app.focused_pane == Pane::Left => { let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_add(8); let left_max = app.last_left_line_count.saturating_sub(app.last_left_area.height.saturating_sub(2)); if old_scroll == app.left_scroll && old_scroll >= left_max { app.scroll_flash_timer = 10; } }
-                            KeyCode::Up if app.focused_pane == Pane::Right => { app.right_follow_output = false; let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_sub(1); if old_scroll == app.right_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                            KeyCode::Up if app.focused_pane == Pane::Left => { app.left_follow_output = false; let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_sub(1); if old_scroll == app.left_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                            KeyCode::Down if app.focused_pane == Pane::Right => { let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_add(1); let right_max = app.last_right_line_count.saturating_sub(app.last_right_area.height.saturating_sub(2)); if old_scroll == app.right_scroll && old_scroll >= right_max { app.scroll_flash_timer = 10; } }
-                            KeyCode::Down if app.focused_pane == Pane::Left => { let old_scroll = app.left_scroll; app.left_scroll = app.left_scroll.saturating_add(1); let left_max = app.last_left_line_count.saturating_sub(app.last_left_area.height.saturating_sub(2)); if old_scroll == app.left_scroll && old_scroll >= left_max { app.scroll_flash_timer = 10; } }
+                            KeyCode::PageUp if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                                app.scroll_focused_page(-1, 8);
+                            }
+                            KeyCode::PageDown if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                                app.scroll_focused_page(1, 8);
+                            }
+                            KeyCode::Up if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                                app.scroll_focused_line(-1);
+                            }
+                            KeyCode::Down if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                                app.scroll_focused_line(1);
+                            }
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                 return Ok(());
                             }
 
+                            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                app.insert_char('\n');
+                                app.needs_redraw = true;
+                            }
+                            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
+                                || key.modifiers.contains(KeyModifiers::ALT) =>
+                            {
+                                app.insert_char('\n');
+                                app.needs_redraw = true;
+                            }
+                            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                let text = app.input.clone();
+                                app.submit_instant_interject(
+                                    text,
+                                    &queued_interject,
+                                    &instant_interject,
+                                    &stop_signal,
+                                );
+                            }
+                            KeyCode::Enter if !app.input.trim().is_empty()
+                                && !app.input.starts_with('/') =>
+                            {
+                                let text = app.input.clone();
+                                app.submit_queued_interject(text, &queued_interject);
+                            }
+
                             // Cursor movement during processing
-                            KeyCode::Left if !app.desktop.is_animating() && app.try_slide_to_splash() => {}
+                            KeyCode::Left if app.route_left_to_desktop() && app.try_slide_to_splash() => {}
                             KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
-                            KeyCode::Right if !app.desktop.is_animating() && app.try_slide_to_workspace() => {}
+                            KeyCode::Right if app.route_right_to_desktop() && app.try_slide_to_workspace() => {}
                             KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
                             KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
                             KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }
@@ -996,14 +1232,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
                 match key.code {
                     // --- Slash command menu navigation (takes precedence when active) ---
-                    KeyCode::Up if app.input.starts_with('/') => {
+                    KeyCode::Up if app.focused_pane == Pane::Input && app.input.starts_with('/') => {
                         let filtered = get_filtered_commands(&app.slash_commands, &app.input);
                         if !filtered.is_empty() {
                            app.slash_selected = app.slash_selected.saturating_sub(1);
                         }
                        app.needs_redraw = true;
                     }
-                    KeyCode::Down if app.input.starts_with('/') => {
+                    KeyCode::Down if app.focused_pane == Pane::Input && app.input.starts_with('/') => {
                         let filtered = get_filtered_commands(&app.slash_commands, &app.input);
                         if !filtered.is_empty() {
                            app.slash_selected = (app.slash_selected + 1).min(filtered.len().saturating_sub(1));
@@ -1141,7 +1377,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                            app.clear_input();
                            app.slash_selected = 0;
-                          app.is_processing = true;
+                           app.is_processing = true;
                            app.tool_calls_this_turn = 0;
                            app.turn_rounds = 0;
 
@@ -1154,7 +1390,15 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                             let approval_req_tx2 = approval_req_tx.clone();
                             let stop = stop_signal.clone();
+                            let queued = queued_interject.clone();
+                            let instant = instant_interject.clone();
                             stop.store(false, Ordering::SeqCst); // reset for new turn
+                            if let Ok(mut slot) = queued.lock() {
+                                *slot = None;
+                            }
+                            if let Ok(mut slot) = instant.lock() {
+                                *slot = None;
+                            }
                             tokio::spawn(async move {
                                 let mut agent = agent_clone.lock().await;
 
@@ -1219,22 +1463,45 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
 
-                                        // Check if we broke out due to stop signal
-                                        if stop.load(Ordering::SeqCst) {
-                                            // Save any partial text we got
-                                            if !round_text.trim().is_empty() {
-                                                agent.push_assistant_text(&round_text);
+                                        match handle_stop_signal(
+                                            &stop,
+                                            &instant,
+                                            &mut agent,
+                                            &tx2,
+                                            &round_text,
+                                        )
+                                        .await
+                                        {
+                                            StopAction::RestartStream(s) => {
+                                                current_stream = s;
+                                                continue;
                                             }
-                                            let _ = tx2.send(UiUpdate::Done {
-                                                final_text: round_text,
-                                            }).await;
-                                            return;
+                                            StopAction::Halt { partial } => {
+                                                let _ = tx2
+                                                    .send(UiUpdate::Done { final_text: partial })
+                                                    .await;
+                                                return;
+                                            }
+                                            StopAction::Abort => return,
+                                            StopAction::Continue => {}
                                         }
 
                                         // Record assistant text in the conversation history
                                         if !round_text.trim().is_empty() {
                                             agent.push_assistant_text(&round_text);
-                                            final_text = round_text;
+                                            final_text = round_text.clone();
+                                        }
+
+                                        if let Some(s) = try_apply_queued_interject(
+                                            &queued,
+                                            &mut agent,
+                                            &tx2,
+                                            &mut tool_calls,
+                                        )
+                                        .await
+                                        {
+                                            current_stream = s;
+                                            continue;
                                         }
 
                                         // No tool calls → model stopped on its own.
@@ -1263,12 +1530,29 @@ async fn run_app<B: ratatui::backend::Backend>(
                                         }
                                         tools_used_this_turn += tool_calls.len();
 
-                                        // Check stop signal before executing any tools
-                                        if stop.load(Ordering::SeqCst) {
-                                            let _ = tx2.send(UiUpdate::Done {
-                                                final_text: final_text.clone(),
-                                            }).await;
-                                            return;
+                                        match handle_stop_signal(
+                                            &stop,
+                                            &instant,
+                                            &mut agent,
+                                            &tx2,
+                                            "",
+                                        )
+                                        .await
+                                        {
+                                            StopAction::RestartStream(s) => {
+                                                current_stream = s;
+                                                continue;
+                                            }
+                                            StopAction::Halt { .. } => {
+                                                let _ = tx2
+                                                    .send(UiUpdate::Done {
+                                                        final_text: final_text.clone(),
+                                                    })
+                                                    .await;
+                                                return;
+                                            }
+                                            StopAction::Abort => return,
+                                            StopAction::Continue => {}
                                         }
 
                                         // Execute tool calls (with possible approval dialog) and report to UI
@@ -1319,7 +1603,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                         let v: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
                                                         let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
                                                         // truncate long commands for the dialog
-                                                        let short = truncate(cmd, 120);
+                                                        let short = truncate(cmd, 72);
                                                         format!("exec: {}", short)
                                                     }
                                                     "update_goal" => {
@@ -1379,6 +1663,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             }
                                         }
 
+                                        if let Some(s) = try_apply_queued_interject(
+                                            &queued,
+                                            &mut agent,
+                                            &tx2,
+                                            &mut tool_calls,
+                                        )
+                                        .await
+                                        {
+                                            current_stream = s;
+                                            continue;
+                                        }
+
                                         let records = agent
                                             .execute_and_record_tool_calls(&to_execute)
                                             .await;
@@ -1395,12 +1691,41 @@ async fn run_app<B: ratatui::backend::Backend>(
                                             used_tokens: agent.estimated_context_tokens(),
                                         }).await;
 
-                                        // Check stop signal before starting next inference
-                                        if stop.load(Ordering::SeqCst) {
-                                            let _ = tx2.send(UiUpdate::Done {
-                                                final_text: final_text.clone(),
-                                            }).await;
-                                            return;
+                                        if let Some(s) = try_apply_queued_interject(
+                                            &queued,
+                                            &mut agent,
+                                            &tx2,
+                                            &mut Vec::new(),
+                                        )
+                                        .await
+                                        {
+                                            current_stream = s;
+                                            continue;
+                                        }
+
+                                        match handle_stop_signal(
+                                            &stop,
+                                            &instant,
+                                            &mut agent,
+                                            &tx2,
+                                            "",
+                                        )
+                                        .await
+                                        {
+                                            StopAction::RestartStream(s) => {
+                                                current_stream = s;
+                                                continue;
+                                            }
+                                            StopAction::Halt { .. } => {
+                                                let _ = tx2
+                                                    .send(UiUpdate::Done {
+                                                        final_text: final_text.clone(),
+                                                    })
+                                                    .await;
+                                                return;
+                                            }
+                                            StopAction::Abort => return,
+                                            StopAction::Continue => {}
                                         }
 
                                         // Continue with another streaming inference
@@ -1488,14 +1813,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                         if !app.mode_menu_active
                             && !app.settings.active
                             && app.pending_approval.is_none()
-                            && !app.desktop.is_animating()
+                            && app.route_left_to_desktop()
                             && app.try_slide_to_splash() => {}
                     KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
                     KeyCode::Right
                         if !app.mode_menu_active
                             && !app.settings.active
                             && app.pending_approval.is_none()
-                            && !app.desktop.is_animating()
+                            && app.route_right_to_desktop()
                             && app.try_slide_to_workspace() => {}
                     KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
                     KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
@@ -1531,19 +1856,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
 
-                    // When Right pane focused: scroll right pane
-                    KeyCode::Up if !app.mode_menu_active && app.focused_pane == Pane::Right => { app.right_follow_output = false; let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_sub(1); if old_scroll == app.right_scroll && old_scroll == 0 { app.scroll_flash_timer = 10; } }
-                    KeyCode::Down if !app.mode_menu_active && app.focused_pane == Pane::Right => { let old_scroll = app.right_scroll; app.right_scroll = app.right_scroll.saturating_add(1); let right_max = app.last_right_line_count.saturating_sub(app.last_right_area.height.saturating_sub(2)); if old_scroll == app.right_scroll && old_scroll >= right_max { app.scroll_flash_timer = 10; } }
+                    // Scroll focused pane (conversation or trace)
+                    KeyCode::Up if !app.mode_menu_active => {
+                        app.scroll_focused_line(-1);
+                    }
+                    KeyCode::Down if !app.mode_menu_active => {
+                        app.scroll_focused_line(1);
+                    }
 
-                    // When Left pane focused: scroll left pane
-                    KeyCode::Up if !app.mode_menu_active => { app.left_follow_output = false; app.left_scroll = app.left_scroll.saturating_sub(1); }
-                    KeyCode::Down if !app.mode_menu_active => { app.left_scroll = app.left_scroll.saturating_add(1); }
-
-                    // --- PageUp/PageDown: Shift for right pane, default for left ---
-                    KeyCode::PageUp if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => { app.right_follow_output = false; app.right_scroll = app.right_scroll.saturating_sub(12); }
-                    KeyCode::PageUp if !app.mode_menu_active => { app.left_follow_output = false; app.left_scroll = app.left_scroll.saturating_sub(12); }
-                    KeyCode::PageDown if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => { app.right_scroll = app.right_scroll.saturating_add(12); }
-                    KeyCode::PageDown if !app.mode_menu_active => { app.left_scroll = app.left_scroll.saturating_add(12); }
+                    // PageUp/PageDown: Shift scrolls trace pane, default scrolls conversation
+                    KeyCode::PageUp if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        app.scroll_pane_page(Pane::Right, -1, 12);
+                    }
+                    KeyCode::PageUp if !app.mode_menu_active => {
+                        app.scroll_pane_page(Pane::Left, -1, 12);
+                    }
+                    KeyCode::PageDown if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        app.scroll_pane_page(Pane::Right, 1, 12);
+                    }
+                    KeyCode::PageDown if !app.mode_menu_active => {
+                        app.scroll_pane_page(Pane::Left, 1, 12);
+                    }
 
                     // --- Text editing (always active, chars go to input from any pane) ---
                     KeyCode::Char(c) if !app.mode_menu_active && app.pending_approval.is_none() => {
@@ -1553,6 +1886,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.needs_redraw = true;
                     }
                     KeyCode::Backspace if !app.mode_menu_active && app.pending_approval.is_none() => {
+                        app.clamp_cursor();
                         app.delete_char_before();
                         app.history_index = None;
                         clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
@@ -1569,6 +1903,84 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
+enum StopAction {
+    Continue,
+    RestartStream(mpsc::Receiver<StreamChunk>),
+    Halt { partial: String },
+    Abort,
+}
+
+/// Apply a queued interject (Policy A: supersede pending tool calls).
+async fn try_apply_queued_interject(
+    queued: &Arc<Mutex<Option<String>>>,
+    agent: &mut Agent,
+    tx: &mpsc::Sender<UiUpdate>,
+    pending_tool_calls: &mut Vec<ToolCall>,
+) -> Option<mpsc::Receiver<StreamChunk>> {
+    let msg = queued.lock().ok()?.take()?;
+    if !pending_tool_calls.is_empty() {
+        let n = pending_tool_calls.len();
+        pending_tool_calls.clear();
+        let _ = tx
+            .send(UiUpdate::ToolResult {
+                name: "system".into(),
+                summary: format!(
+                    "Interject applied — {} pending tool call(s) superseded",
+                    n
+                ),
+            })
+            .await;
+    }
+    agent.on_new_user_input(&msg);
+    let _ = tx.send(UiUpdate::InterjectRestart).await;
+    match agent.continue_turn_streaming().await {
+        Ok(stream) => Some(stream),
+        Err(e) => {
+            let _ = tx.send(UiUpdate::Error(e.to_string())).await;
+            None
+        }
+    }
+}
+
+async fn handle_stop_signal(
+    stop: &Arc<AtomicBool>,
+    instant: &Arc<Mutex<Option<String>>>,
+    agent: &mut Agent,
+    tx: &mpsc::Sender<UiUpdate>,
+    round_text: &str,
+) -> StopAction {
+    if !stop.load(Ordering::SeqCst) {
+        return StopAction::Continue;
+    }
+
+    let interject = instant
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .filter(|m| !m.trim().is_empty());
+
+    if !round_text.trim().is_empty() {
+        agent.push_assistant_text(round_text);
+    }
+
+    if let Some(msg) = interject {
+        agent.on_new_user_input(&msg);
+        let _ = tx.send(UiUpdate::InterjectRestart).await;
+        stop.store(false, Ordering::SeqCst);
+        match agent.continue_turn_streaming().await {
+            Ok(stream) => StopAction::RestartStream(stream),
+            Err(e) => {
+                let _ = tx.send(UiUpdate::Error(e.to_string())).await;
+                StopAction::Abort
+            }
+        }
+    } else {
+        StopAction::Halt {
+            partial: round_text.to_string(),
+        }
+    }
+}
+
 enum UiUpdate {
     Token(String),
     Thinking(String),
@@ -1579,6 +1991,7 @@ enum UiUpdate {
     Error(String),
     ApprovalRequested,  // wake the UI so it can display the dialog from the approval channel
     ContextUsage { used_tokens: u32 }, // pushed from agent task after tool rounds
+    InterjectRestart,
 }
 
 

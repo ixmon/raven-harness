@@ -10,7 +10,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, LineGauge, Paragraph, Widget, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, LineGauge, Paragraph, Widget, Wrap},
     Frame,
 };
 
@@ -163,12 +163,17 @@ pub fn draw_input_bar(f: &mut Frame, area: Rect, data: &InputBarData<'_>) {
             ),
             Span::styled("Processing", Style::default().fg(Color::Cyan)),
             Span::styled(
-                "  Esc",
+                " Enter",
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" queue  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "Ctrl+Enter",
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" to STOP  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Ctrl-C", Style::default().fg(Color::Red)),
-            Span::styled(" quit ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" now  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" stop", Style::default().fg(Color::DarkGray)),
         ])
     } else {
         Line::from(vec![
@@ -328,44 +333,57 @@ pub fn draw_mode_menu(
     f.render_widget(menu_block, menu_area);
 }
 
-pub fn draw_approval_popup(f: &mut Frame, desc: &str, input_area: Rect) {
-    let pw = 60u16;
-    let ph = 9u16;
-    let px = 2;
-    let py = input_area.y.saturating_sub(ph + 1);
-    let pa = Rect::new(px, py, pw, ph);
-    let safe_desc = truncate_str(desc, 220);
-    let popup_text = Text::from(vec![
-        Line::from(Span::styled(
-            "Sandbox approval needed",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(safe_desc, Style::default().fg(Color::White))),
-        Line::from(""),
+pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: Rect) {
+    let modal_w = screen.width.saturating_sub(4).clamp(44, 64);
+    // Inner text width: borders (2) + default paragraph padding (2).
+    let inner_w = modal_w.saturating_sub(4) as usize;
+    let available_h = input_area.y.saturating_sub(screen.y + 1).max(7);
+    // Header + detail + spacer + Y/N + top/bottom borders.
+    let max_desc_lines = ((available_h as usize).saturating_sub(5)).clamp(1, 4);
+    let (kind, detail) = desc.split_once(": ").unwrap_or(("action", desc));
+    let detail_lines = wrap_approval_lines(detail, inner_w, max_desc_lines);
+
+    let body_lines = 1 + detail_lines.len() + 1 + 1;
+    let modal_h = (body_lines as u16 + 2).clamp(7, available_h);
+
+    let modal_x = screen.x + (screen.width.saturating_sub(modal_w)) / 2;
+    let modal_y = input_area
+        .y
+        .saturating_sub(modal_h + 1)
+        .max(screen.y + 1);
+    let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
+
+    let detail_style = Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa));
+    let mut popup_lines = vec![
         Line::from(vec![
-            Span::styled(
-                "[Y]",
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("es  ", Style::default().fg(Color::Gray)),
-            Span::styled(
-                "[N]",
-                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("o (Esc)", Style::default().fg(Color::Gray)),
+            Span::styled(kind, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(" — sandbox approval needed", Style::default().fg(Color::DarkGray)),
         ]),
-    ]);
-    let popup = Paragraph::new(popup_text)
-        .style(Style::default().fg(Color::Yellow))
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .title("Action Approval")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        );
-    f.render_widget(popup, pa);
+    ];
+    for line in detail_lines {
+        popup_lines.push(Line::from(Span::styled(line, detail_style)));
+    }
+    popup_lines.push(Line::from(""));
+    popup_lines.push(Line::from(vec![
+        Span::styled("[Y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        Span::styled("es  ", Style::default().fg(Color::Gray)),
+        Span::styled("[N]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        Span::styled("o (Esc)", Style::default().fg(Color::Gray)),
+    ]));
+
+    let popup = Paragraph::new(Text::from(popup_lines)).block(
+        Block::default()
+            .title(Span::styled(
+                " Action Approval ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ))
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Yellow))
+            .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
+    );
+    f.render_widget(Clear, modal_area);
+    f.render_widget(popup, modal_area);
 }
 
 pub fn draw_left_pane(
@@ -563,7 +581,7 @@ pub fn draw_overlays(
     selected_mode_idx: usize,
 ) {
     if let Some(desc) = pending_approval {
-        draw_approval_popup(f, desc, input_area);
+        draw_approval_popup(f, desc, screen, input_area);
     }
     if input.starts_with('/') && !input.is_empty() {
         draw_slash_menu(f, input_area, slash_commands, input, slash_selected);
@@ -640,10 +658,12 @@ fn render_scrollable_pane(
     let line_count = text.lines.len() as u16;
     *last_line_count = line_count;
     let content_height = area.height.saturating_sub(2);
+    let max_scroll = line_count.saturating_sub(content_height);
     if follow_output {
-        *scroll = line_count.saturating_sub(content_height);
+        *scroll = max_scroll;
+    } else {
+        *scroll = (*scroll).min(max_scroll);
     }
-    *scroll = (*scroll).min(line_count.saturating_sub(1));
 
     let focus_style = if focused {
         if scroll_flash_timer > 0 {
@@ -701,6 +721,119 @@ fn truncate_str(s: &str, max: usize) -> String {
         .find(|&i| s.is_char_boundary(i))
         .unwrap_or(0);
     format!("{}…", &s[..end])
+}
+
+fn char_count(s: &str) -> usize {
+    s.chars().count()
+}
+
+fn push_chars<'a>(dst: &mut String, src: &'a str, max_chars: usize) -> &'a str {
+    if max_chars == 0 {
+        return src;
+    }
+    let mut end = 0usize;
+    for (n, (i, ch)) in src.char_indices().enumerate() {
+        if n >= max_chars {
+            break;
+        }
+        end = i + ch.len_utf8();
+    }
+    if end == 0 && !src.is_empty() {
+        let ch = src.chars().next().unwrap();
+        end = ch.len_utf8();
+    }
+    dst.push_str(&src[..end]);
+    &src[end..]
+}
+
+/// Wrap approval detail text to fit inside the popup without spilling past its bounds.
+fn wrap_approval_lines(s: &str, width: usize, max_lines: usize) -> Vec<String> {
+    let width = width.max(10);
+    let max_lines = max_lines.max(1);
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut truncated = false;
+
+    'words: for segment in s.split_whitespace() {
+        let mut seg = segment;
+        while !seg.is_empty() {
+            if lines.len() >= max_lines {
+                truncated = true;
+                break 'words;
+            }
+
+            let avail = width.saturating_sub(char_count(&current) + usize::from(!current.is_empty()));
+            if avail == 0 {
+                lines.push(std::mem::take(&mut current));
+                continue;
+            }
+
+            if char_count(seg) <= avail {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(seg);
+                seg = "";
+            } else if current.is_empty() {
+                let mut chunk = String::new();
+                seg = push_chars(&mut chunk, seg, avail);
+                current = chunk;
+                if !seg.is_empty() {
+                    lines.push(std::mem::take(&mut current));
+                }
+            } else {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+    }
+
+    if !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    } else if !current.is_empty() {
+        truncated = true;
+    }
+
+    if lines.is_empty() {
+        lines.push(truncate_str(s, width));
+    } else if truncated {
+        let last = lines.last_mut().unwrap();
+        if !last.ends_with('…') {
+            let mut shortened: String = last.chars().take(width.saturating_sub(1)).collect();
+            shortened.push('…');
+            *last = shortened;
+        }
+    }
+
+    lines
+}
+
+#[cfg(test)]
+mod approval_popup_tests {
+    use super::{char_count, wrap_approval_lines};
+
+    #[test]
+    fn wrap_short_stays_single_line() {
+        let lines = wrap_approval_lines("cargo test", 40, 4);
+        assert_eq!(lines, vec!["cargo test"]);
+    }
+
+    #[test]
+    fn wrap_breaks_long_unbroken_token() {
+        let lines = wrap_approval_lines("a".repeat(30).as_str(), 12, 4);
+        assert!(lines.len() > 1);
+        assert!(lines.iter().all(|l| char_count(l) <= 12));
+    }
+
+    #[test]
+    fn wrap_caps_line_count_with_ellipsis() {
+        let text = (0..20)
+            .map(|i| format!("word{i}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let lines = wrap_approval_lines(&text, 16, 3);
+        assert_eq!(lines.len(), 3);
+        assert!(lines.last().unwrap().ends_with('…'));
+    }
 }
 
 // ─── Splash / multi-desktop ───────────────────────────────────────────────────

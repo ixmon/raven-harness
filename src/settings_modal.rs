@@ -35,6 +35,7 @@ pub struct SettingsModal {
     pub mode: SettingsMode,
     /// Shared buffer for the active wizard field (add or edit).
     pub edit_buf: String,
+    pub edit_cursor: usize,
     pub add_step: usize,
     pub new_label: String,
     pub new_url: String,
@@ -56,6 +57,7 @@ impl SettingsModal {
             active_endpoint_idx: 0,
             mode: SettingsMode::List,
             edit_buf: String::new(),
+            edit_cursor: 0,
             add_step: 0,
             new_label: String::new(),
             new_url: String::new(),
@@ -79,6 +81,7 @@ impl SettingsModal {
 
     fn clear_wizard(&mut self) {
         self.edit_buf.clear();
+        self.edit_cursor = 0;
         self.add_step = 0;
         self.edit_step = 0;
         self.new_label.clear();
@@ -103,6 +106,7 @@ impl SettingsModal {
         self.mode = SettingsMode::Adding;
         self.add_step = 0;
         self.edit_buf.clear();
+        self.edit_cursor = 0;
         self.new_label.clear();
         self.new_url.clear();
         self.new_model.clear();
@@ -110,14 +114,12 @@ impl SettingsModal {
     }
 
     fn start_edit(&mut self) {
-        if self.selected == 0 {
-            return; // CLI default is not persisted — handled in key handler
-        }
         let ep = self.endpoints[self.selected].clone();
         self.mode = SettingsMode::Editing;
         self.editing_idx = Some(self.selected);
         self.edit_step = 0;
         self.edit_buf = ep.label.clone();
+        self.edit_cursor = self.edit_buf.len();
         self.new_label = ep.label;
         self.new_url = ep.base_url;
         self.new_model = ep.model;
@@ -125,21 +127,72 @@ impl SettingsModal {
         self.edit_keep_key = ep.api_key.is_some();
     }
 
+    fn clamp_edit_cursor(&mut self) {
+        self.edit_cursor = self.edit_cursor.min(self.edit_buf.len());
+    }
+
+    fn insert_edit_char(&mut self, c: char) {
+        self.clamp_edit_cursor();
+        self.edit_buf.insert(self.edit_cursor, c);
+        self.edit_cursor += c.len_utf8();
+    }
+
+    fn delete_edit_before(&mut self) {
+        self.clamp_edit_cursor();
+        if self.edit_cursor == 0 {
+            return;
+        }
+        let prev = self.edit_buf[..self.edit_cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        self.edit_buf.drain(prev..self.edit_cursor);
+        self.edit_cursor = prev;
+    }
+
+    fn move_edit_cursor_left(&mut self) {
+        self.clamp_edit_cursor();
+        if self.edit_cursor == 0 {
+            return;
+        }
+        self.edit_cursor = self.edit_buf[..self.edit_cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+    }
+
+    fn move_edit_cursor_right(&mut self) {
+        self.clamp_edit_cursor();
+        if self.edit_cursor >= self.edit_buf.len() {
+            return;
+        }
+        self.edit_cursor += self.edit_buf[self.edit_cursor..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(0);
+    }
+
     fn advance_add_field(&mut self) {
         match self.add_step {
             0 => {
                 self.new_label = self.edit_buf.clone();
-                self.edit_buf = "https://openrouter.ai/api/v1".to_string();
+                self.edit_buf = "http://127.0.0.1:8080/v1".to_string();
+                self.edit_cursor = self.edit_buf.len();
                 self.add_step = 1;
             }
             1 => {
                 self.new_url = self.edit_buf.clone();
                 self.edit_buf.clear();
+                self.edit_cursor = 0;
                 self.add_step = 2;
             }
             2 => {
                 self.new_model = self.edit_buf.clone();
                 self.edit_buf.clear();
+                self.edit_cursor = 0;
                 self.add_step = 3;
             }
             _ => {}
@@ -151,16 +204,19 @@ impl SettingsModal {
             0 => {
                 self.new_label = self.edit_buf.clone();
                 self.edit_buf = self.new_url.clone();
+                self.edit_cursor = self.edit_buf.len();
                 self.edit_step = 1;
             }
             1 => {
                 self.new_url = self.edit_buf.clone();
                 self.edit_buf = self.new_model.clone();
+                self.edit_cursor = self.edit_buf.len();
                 self.edit_step = 2;
             }
             2 => {
                 self.new_model = self.edit_buf.clone();
                 self.edit_buf.clear();
+                self.edit_cursor = 0;
                 self.edit_step = 3;
             }
             _ => {}
@@ -404,10 +460,16 @@ pub async fn handle_settings_key(
         SettingsMode::Adding | SettingsMode::Editing => {
             match key.code {
                 KeyCode::Char(c) => {
-                    settings.edit_buf.push(c);
+                    settings.insert_edit_char(c);
                 }
                 KeyCode::Backspace => {
-                    settings.edit_buf.pop();
+                    settings.delete_edit_before();
+                }
+                KeyCode::Left => {
+                    settings.move_edit_cursor_left();
+                }
+                KeyCode::Right => {
+                    settings.move_edit_cursor_right();
                 }
                 KeyCode::Enter => {
                     if settings.mode == SettingsMode::Adding {
@@ -455,13 +517,7 @@ pub async fn handle_settings_key(
                 settings.start_add();
             }
             KeyCode::Char('e') | KeyCode::Char('E') => {
-                if settings.selected == 0 {
-                    actions.push(SettingsAction::Notify(
-                        "CLI default endpoint is session-only — switch to a saved endpoint to edit persistently.".into(),
-                    ));
-                } else {
-                    settings.start_edit();
-                }
+                settings.start_edit();
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
                 if settings.selected > 0 && settings.selected != settings.active_endpoint_idx {
@@ -537,37 +593,59 @@ async fn finish_edit(
         return actions;
     };
 
-    let keystore_idx = list_idx.saturating_sub(1);
-    let key_update = if settings.new_key.is_empty() {
-        None
+    if list_idx == 0 {
+        let prev = &settings.endpoints[0];
+        let api_key = if settings.new_key.is_empty() {
+            prev.api_key.clone()
+        } else {
+            Some(settings.new_key.clone())
+        };
+        settings.endpoints[0] = InferenceEndpoint {
+            label: settings.new_label.clone(),
+            base_url: settings.new_url.clone(),
+            model: settings.new_model.clone(),
+            api_key,
+        };
+        actions.push(SettingsAction::Notify(format!(
+            "Updated session endpoint: {} (not saved to keystore — use Add to persist)",
+            settings.new_label
+        )));
+        if list_idx == settings.active_endpoint_idx {
+            actions.extend(switch_to_endpoint(settings, config, agent, 0).await);
+        }
     } else {
-        if !keystore.is_unlocked() {
-            actions.push(SettingsAction::Notify(
-                "Setting vault password (first API key). Using 'raven' as default.".into(),
-            ));
-            let _ = keystore.init_password("raven");
-        }
-        Some(settings.new_key.as_str())
-    };
-
-    match keystore.update_endpoint(
-        keystore_idx,
-        &settings.new_label,
-        &settings.new_url,
-        &settings.new_model,
-        key_update,
-    ) {
-        Ok(()) => {
-            actions.push(SettingsAction::Notify(format!(
-                "Updated endpoint: {}",
-                settings.new_label
-            )));
-            settings.rebuild_endpoints(config, keystore);
-            if list_idx == settings.active_endpoint_idx {
-                actions.extend(switch_to_endpoint(settings, config, agent, list_idx).await);
+        let keystore_idx = list_idx - 1;
+        let key_update = if settings.new_key.is_empty() {
+            None
+        } else {
+            if !keystore.is_unlocked() {
+                actions.push(SettingsAction::Notify(
+                    "Setting vault password (first API key). Using 'raven' as default.".into(),
+                ));
+                let _ = keystore.init_password("raven");
             }
+            Some(settings.new_key.as_str())
+        };
+
+        match keystore.update_endpoint(
+            keystore_idx,
+            &settings.new_label,
+            &settings.new_url,
+            &settings.new_model,
+            key_update,
+        ) {
+            Ok(()) => {
+                actions.push(SettingsAction::Notify(format!(
+                    "Updated endpoint: {}",
+                    settings.new_label
+                )));
+                settings.rebuild_endpoints(config, keystore);
+                if list_idx == settings.active_endpoint_idx {
+                    actions.extend(switch_to_endpoint(settings, config, agent, list_idx).await);
+                }
+            }
+            Err(e) => actions.push(SettingsAction::Notify(format!("Failed to update endpoint: {}", e))),
         }
-        Err(e) => actions.push(SettingsAction::Notify(format!("Failed to update endpoint: {}", e))),
     }
 
     settings.mode = SettingsMode::List;
