@@ -24,6 +24,7 @@ pub struct SlashContext<'a> {
     pub current_response: &'a str,
     pub current_thinking: &'a str,
     pub input: &'a mut String,
+    pub cursor_pos: &'a mut usize,
     pub slash_commands: &'a [SlashCommand],
     pub slash_selected: &'a mut usize,
     pub mode_menu_active: &'a mut bool,
@@ -42,6 +43,11 @@ pub struct SlashContext<'a> {
     pub config: &'a Config,
     pub saved_endpoints: &'a [crate::config::InferenceEndpoint],
     pub agent: &'a Arc<Mutex<Agent>>,
+}
+
+fn clear_slash_input(ctx: &mut SlashContext<'_>) {
+    ctx.input.clear();
+    *ctx.cursor_pos = 0;
 }
 
 pub fn filtered_slash_commands<'a>(commands: &'a [SlashCommand], input: &str) -> Vec<&'a SlashCommand> {
@@ -79,7 +85,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
         "help" | "?" => {
             ctx.left_committed.push(HELP_TEXT.to_string());
             scroll_left(ctx.left_committed);
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
@@ -90,13 +96,13 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             ctx.left_committed.clear();
             ctx.left_committed.push("Conversation cleared.".to_string());
             scroll_left(ctx.left_committed);
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
         "clear-trace" => {
             ctx.trace_lines.clear();
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
@@ -108,7 +114,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             ctx.left_committed
                 .push("Conversation reset (persistent session kept).".to_string());
             scroll_left(ctx.left_committed);
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
@@ -128,7 +134,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             );
             ctx.left_committed.push(status);
             scroll_left(ctx.left_committed);
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
@@ -145,7 +151,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                     };
                 }
             }
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             ctx.left_committed.push(
                 "Use ↑/↓ to select execution mode, Enter to confirm, Esc to cancel.".to_string(),
@@ -155,7 +161,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
         }
         "settings" => {
             ctx.settings.open(ctx.config, ctx.saved_endpoints);
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
@@ -170,7 +176,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                 ctx.search.active = true;
                 ctx.search.query.clear();
                 ctx.search.match_lines.clear();
-                ctx.input.clear();
+                clear_slash_input(ctx);
             } else {
                 ctx.search.active = true;
                 ctx.search.query = query;
@@ -191,7 +197,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                     ctx.search.pane
                 ));
                 scroll_left(ctx.left_committed);
-                ctx.input.clear();
+                clear_slash_input(ctx);
             }
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
@@ -203,7 +209,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                 prompt
             ));
             scroll_left(ctx.left_committed);
-            ctx.input.clear();
+            clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
@@ -337,5 +343,78 @@ pub fn apply_settings_actions(
                 settings.active_endpoint_idx = idx;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::Agent;
+    use crate::config::{Config, ContextBudget};
+    use crate::settings_modal::SettingsModal;
+    use crate::tui_render::Pane;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    #[test]
+    fn slash_commands_reset_cursor_after_clearing_input() {
+        let config = Config {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            model: "test".to_string(),
+            api_key: None,
+            workspace: PathBuf::from("/tmp"),
+            temperature: 0.2,
+            max_tokens: 4096,
+            max_rounds: 10,
+            prebuilt_session: None,
+            context_budget: ContextBudget::from_context_tokens(8192, 10),
+        };
+        let agent = Arc::new(Mutex::new(Agent::new(config.clone())));
+        let mut input = "/status".to_string();
+        let mut cursor_pos = 45;
+        let mut left = Vec::new();
+        let mut trace = Vec::new();
+        let slash_commands = default_slash_commands();
+        let mut slash_selected = 0;
+        let mut mode_menu_active = false;
+        let mut selected_mode_idx = 0;
+        let mut settings = SettingsModal::inactive();
+        let mut search = Default::default();
+        let mut left_scroll = 0;
+        let mut right_scroll = 0;
+        let mut left_follow_output = true;
+        let mut right_follow_output = true;
+
+        let mut ctx = SlashContext {
+            left_committed: &mut left,
+            trace_lines: &mut trace,
+            current_response: "",
+            current_thinking: "",
+            input: &mut input,
+            cursor_pos: &mut cursor_pos,
+            slash_commands: &slash_commands,
+            slash_selected: &mut slash_selected,
+            mode_menu_active: &mut mode_menu_active,
+            selected_mode_idx: &mut selected_mode_idx,
+            settings: &mut settings,
+            search: &mut search,
+            focused_pane: Pane::Left,
+            left_scroll: &mut left_scroll,
+            right_scroll: &mut right_scroll,
+            left_follow_output: &mut left_follow_output,
+            right_follow_output: &mut right_follow_output,
+            last_left_line_count: 0,
+            last_right_line_count: 0,
+            last_left_area_h: 24,
+            last_right_area_h: 24,
+            config: &config,
+            saved_endpoints: &[],
+            agent: &agent,
+        };
+        let result = dispatch_slash_command("/status", &mut ctx);
+        assert!(matches!(result, SlashDispatch::Handled));
+        assert!(input.is_empty());
+        assert_eq!(cursor_pos, 0);
     }
 }

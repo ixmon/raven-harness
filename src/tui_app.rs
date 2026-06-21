@@ -337,6 +337,7 @@ async fn apply_settings_key(
 impl App {
     /// Insert a character at the current cursor position.
     fn insert_char(&mut self, c: char) {
+        self.clamp_cursor();
         self.input.insert(self.cursor_pos, c);
         self.cursor_pos += c.len_utf8();
     }
@@ -344,6 +345,7 @@ impl App {
 
     /// Delete the character before the cursor (Backspace).
     fn delete_char_before(&mut self) {
+        self.clamp_cursor();
         if self.cursor_pos == 0 {
             return;
         }
@@ -359,6 +361,7 @@ impl App {
 
     /// Delete the character at the cursor (Delete key).
     fn delete_char_at(&mut self) {
+        self.clamp_cursor();
         if self.cursor_pos >= self.input.len() {
             return;
         }
@@ -373,6 +376,7 @@ impl App {
 
     /// Move cursor one character to the left.
     fn move_cursor_left(&mut self) {
+        self.clamp_cursor();
         if self.cursor_pos == 0 {
             return;
         }
@@ -385,6 +389,7 @@ impl App {
 
     /// Move cursor one character to the right.
     fn move_cursor_right(&mut self) {
+        self.clamp_cursor();
         if self.cursor_pos >= self.input.len() {
             return;
         }
@@ -1382,6 +1387,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 current_response: &app.current_response,
                                 current_thinking: &app.current_thinking,
                                 input: &mut app.input,
+                                cursor_pos: &mut app.cursor_pos,
                                 slash_commands: &app.slash_commands,
                                 slash_selected: &mut app.slash_selected,
                                 mode_menu_active: &mut app.mode_menu_active,
@@ -1953,7 +1959,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.needs_redraw = true;
                     }
                     KeyCode::Backspace if !app.mode_menu_active && app.pending_approval.is_none() => {
-                        app.clamp_cursor();
                         app.delete_char_before();
                         app.history_index = None;
                         clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
