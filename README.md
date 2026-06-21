@@ -24,17 +24,31 @@ A focused ratatui-based terminal UI for agentic coding against local (or remote)
   <em>Workspace — dual-pane view with conversation (left) and model trace (right)</em>
 </p>
 
-## Install
+## Install & pre-built binaries
 
-Install the latest release binary into `~/.raven-hotel/bin/` (Windows: `%LOCALAPPDATA%\raven-hotel\bin\`):
+GitHub Actions builds release binaries when a `v*` tag is pushed. Install scripts download the **latest** release into `~/.raven-hotel/bin/` (Windows: `%LOCALAPPDATA%\raven-hotel\bin\`) and write `~/.raven-hotel/install.json`.
+
+**Install picker (detects your OS):** [ixmon.github.io/raven-harness/install.html](https://ixmon.github.io/raven-harness/install.html) — shows the right one-liner with a copy button. (GitHub README is static Markdown and cannot run JavaScript.)
+
+### Quick install
+
+<details open>
+<summary><b>Linux / macOS</b> — recommended</summary>
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.sh | bash
 ```
 
+</details>
+
+<details>
+<summary><b>Windows</b> (PowerShell)</summary>
+
 ```powershell
-irm https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.ps1 | iex
 ```
+
+</details>
 
 **PATH setup (hybrid):**
 
@@ -42,31 +56,31 @@ irm https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/insta
 - **Piped one-liner** (`curl | bash` / `irm | iex`) — prints PATH instructions only; no dotfile or registry edits.
 - **Opt out** — set `RAVEN_INSTALL_NO_PATH=1` to skip PATH changes (instructions are still printed).
 
-Install metadata is written to `~/.raven-hotel/install.json` (version, target triple, install time).
+### Manual download
 
-## Pre-built binaries
-
-GitHub Actions builds release binaries when a `v*` tag is pushed, this Readme points to LATEST
-
-| Platform | Download (always latest) |
-|----------|--------------------------|
-| **All releases** | [github.com/ixmon/raven-harness/releases/latest](https://github.com/ixmon/raven-harness/releases/latest) |
-| Linux x86_64 | [raven-tui-x86_64-unknown-linux-gnu.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-unknown-linux-gnu.tar.gz) |
-| Linux ARM64 | [raven-tui-aarch64-unknown-linux-gnu.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-unknown-linux-gnu.tar.gz) |
-| macOS x86_64 (Intel) | [raven-tui-x86_64-apple-darwin.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-apple-darwin.tar.gz) |
-| macOS ARM64 (Apple Silicon) | [raven-tui-aarch64-apple-darwin.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-apple-darwin.tar.gz) |
-| Windows x86_64 | [raven-tui-x86_64-pc-windows-msvc.zip](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-pc-windows-msvc.zip) |
+| Platform | Install script | Archive (always latest) |
+|----------|----------------|-------------------------|
+| **All releases** | [install picker](https://ixmon.github.io/raven-harness/install.html) | [releases/latest](https://github.com/ixmon/raven-harness/releases/latest) |
+| Linux x86_64 | `install.sh` (auto-detects arch) | [tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux ARM64 | `install.sh` | [tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-unknown-linux-gnu.tar.gz) |
+| macOS x86_64 (Intel) | `install.sh` | [tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-apple-darwin.tar.gz) |
+| macOS ARM64 (Apple Silicon) | `install.sh` | [tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-apple-darwin.tar.gz) |
+| Windows x86_64 | `install.ps1` | [zip](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-pc-windows-msvc.zip) |
 
 The **releases/latest** page and **releases/latest/download/…** URLs redirect to the newest tagged release automatically. Each release also keeps versioned archives (e.g. `raven-tui-v0.1.1-…`) for pinning.
 
 Linux builds are compiled with `--no-default-features` (no clipboard — avoids X11/Wayland deps). macOS and Windows builds include clipboard support.
 
+<details>
+<summary>Manual extract example (Linux x86_64)</summary>
+
 ```bash
-# Example: Linux x86_64
 curl -LO https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-unknown-linux-gnu.tar.gz
 tar xzf raven-tui-x86_64-unknown-linux-gnu.tar.gz
-./raven-tui-x86_64-unknown-linux-gnu/raven-tui
+cd raven-tui-*/ && ./raven-tui   # extracted folder name includes the release tag
 ```
+
+</details>
 
 ## Quick start (from source)
 

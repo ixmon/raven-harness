@@ -1,7 +1,7 @@
 # Install raven-tui from the latest GitHub release into %LOCALAPPDATA%\raven-hotel\bin\
 #
 # One-liner:
-#   irm https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.ps1 | iex
 #
 # Opt-out of PATH setup:
 #   $env:RAVEN_INSTALL_NO_PATH = "1"; irm ... | iex

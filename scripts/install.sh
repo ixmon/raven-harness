@@ -2,7 +2,7 @@
 # Install raven-tui from the latest GitHub release into ~/.raven-hotel/bin/
 #
 # One-liner:
-#   curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.sh | bash
 #
 # Opt-out of PATH setup (interactive prompt or instructions):
 #   RAVEN_INSTALL_NO_PATH=1 curl -fsSL ... | bash

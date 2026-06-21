@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Install Raven Harness</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f1117;
+      --panel: #171b24;
+      --border: #2a3142;
+      --text: #e8ecf4;
+      --muted: #9aa3b8;
+      --accent: #7eb6ff;
+      --ok: #7dcea0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: radial-gradient(1200px 600px at 50% -10%, #1a2233 0%, var(--bg) 55%);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    main {
+      max-width: 760px;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 3rem;
+    }
+    h1 { font-size: 1.75rem; margin: 0 0 0.35rem; }
+    .sub { color: var(--muted); margin: 0 0 1.75rem; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1.25rem;
+      margin-bottom: 1rem;
+    }
+    .detected {
+      display: inline-block;
+      font-size: 0.8rem;
+      color: var(--ok);
+      border: 1px solid color-mix(in srgb, var(--ok) 45%, var(--border));
+      border-radius: 999px;
+      padding: 0.15rem 0.6rem;
+      margin-bottom: 0.75rem;
+    }
+    pre {
+      margin: 0;
+      padding: 0.9rem 1rem;
+      background: #0b0d12;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow-x: auto;
+      font-size: 0.92rem;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .row { display: flex; gap: 0.6rem; flex-wrap: wrap; margin-top: 0.85rem; }
+    button, a.btn {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: #222836;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 0.45rem 0.85rem;
+      font-size: 0.9rem;
+      cursor: pointer;
+      text-decoration: none;
+    }
+    button:hover, a.btn:hover { border-color: var(--accent); }
+    button.copied { border-color: var(--ok); color: var(--ok); }
+    h2 { font-size: 1rem; margin: 0 0 0.75rem; color: var(--muted); font-weight: 600; }
+    details {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 0.65rem 0.9rem;
+      margin-bottom: 0.65rem;
+      background: #12151d;
+    }
+    summary { cursor: pointer; font-weight: 600; }
+    details pre { margin-top: 0.75rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
+    th, td { text-align: left; padding: 0.55rem 0.35rem; border-bottom: 1px solid var(--border); }
+    th { color: var(--muted); font-weight: 600; }
+    a { color: var(--accent); }
+    .note { color: var(--muted); font-size: 0.9rem; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Install Raven Harness</h1>
+    <p class="sub">Latest release binary · installs to <code>~/.raven-hotel/bin</code> (Windows: <code>%LOCALAPPDATA%\raven-hotel\bin</code>)</p>
+
+    <section class="card" id="primary">
+      <div class="detected" id="detected-label" hidden>Detected for your system</div>
+      <h2 id="primary-title">Install command</h2>
+      <pre id="primary-command"></pre>
+      <div class="row">
+        <button type="button" id="copy-btn">Copy command</button>
+        <a class="btn" href="https://github.com/ixmon/raven-harness/releases/latest">All releases</a>
+        <a class="btn" href="https://github.com/ixmon/raven-harness">GitHub repo</a>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Other platforms</h2>
+      <div id="alternatives"></div>
+    </section>
+
+    <section class="card">
+      <h2>Manual download</h2>
+      <table>
+        <thead>
+          <tr><th>Platform</th><th>Archive</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Linux x86_64</td><td><a href="https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-unknown-linux-gnu.tar.gz">tar.gz</a></td></tr>
+          <tr><td>Linux ARM64</td><td><a href="https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-unknown-linux-gnu.tar.gz">tar.gz</a></td></tr>
+          <tr><td>macOS Intel</td><td><a href="https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-apple-darwin.tar.gz">tar.gz</a></td></tr>
+          <tr><td>macOS Apple Silicon</td><td><a href="https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-apple-darwin.tar.gz">tar.gz</a></td></tr>
+          <tr><td>Windows x86_64</td><td><a href="https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-pc-windows-msvc.zip">zip</a></td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <p class="note">
+      Piped one-liners (<code>curl | bash</code> / <code>irm | iex</code>) print PATH instructions only.
+      Interactive installs can prompt to update your shell rc or Windows user PATH.
+      Set <code>RAVEN_INSTALL_NO_PATH=1</code> to skip PATH changes.
+    </p>
+  </main>
+
+  <script>
+    const INSTALL_SH = "curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.sh | bash";
+    const INSTALL_PS1 = "irm https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.ps1 | iex";
+
+    const PLATFORMS = {
+      linux:   { label: "Linux / macOS", command: INSTALL_SH },
+      macos:   { label: "Linux / macOS", command: INSTALL_SH },
+      windows: { label: "Windows",       command: INSTALL_PS1 },
+      unknown: { label: "Linux / macOS (default)", command: INSTALL_SH },
+    };
+
+    function detectPlatform() {
+      const ua = navigator.userAgent || "";
+      const platform = (navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || "";
+
+      if (/Win/i.test(platform) || /Windows/i.test(ua)) return "windows";
+      if (/Mac/i.test(platform) || /Macintosh|Mac OS X/i.test(ua)) return "macos";
+      if (/Linux/i.test(platform) || /Android/i.test(ua) || /X11/i.test(ua)) return "linux";
+      return "unknown";
+    }
+
+    function render() {
+      const detected = detectPlatform();
+      const primary = PLATFORMS[detected];
+      const label = document.getElementById("detected-label");
+      const title = document.getElementById("primary-title");
+      const command = document.getElementById("primary-command");
+      const alternatives = document.getElementById("alternatives");
+
+      label.hidden = false;
+      label.textContent = "Detected: " + primary.label;
+      title.textContent = primary.label + " — recommended";
+      command.textContent = primary.command;
+
+      const others = [];
+      if (detected !== "windows") {
+        others.push({ id: "windows", ...PLATFORMS.windows });
+      }
+      if (detected === "windows") {
+        others.push({ id: "unix", label: "Linux / macOS", command: INSTALL_SH });
+      }
+
+      alternatives.innerHTML = others.map((p) => `
+        <details>
+          <summary>${p.label}</summary>
+          <pre data-command="${encodeURIComponent(p.command)}">${p.command}</pre>
+        </details>
+      `).join("");
+
+      document.getElementById("copy-btn").addEventListener("click", async () => {
+        const btn = document.getElementById("copy-btn");
+        try {
+          await navigator.clipboard.writeText(primary.command);
+          btn.textContent = "Copied!";
+          btn.classList.add("copied");
+          setTimeout(() => {
+            btn.textContent = "Copy command";
+            btn.classList.remove("copied");
+          }, 1600);
+        } catch {
+          btn.textContent = "Copy failed — select manually";
+        }
+      });
+    }
+
+    render();
+  </script>
+</body>
+</html>
