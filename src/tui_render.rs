@@ -865,6 +865,8 @@ mod approval_popup_tests {
 
 // ─── Splash / multi-desktop ───────────────────────────────────────────────────
 
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub struct SplashData<'a> {
     pub raven_art: &'a str,
     pub base_url: &'a str,
@@ -1001,6 +1003,7 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
     let block = Block::default()
         .title(Line::from(vec![
             Span::styled("  Raven Hotel", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  v{VERSION}"), Style::default().fg(Color::DarkGray)),
             Span::styled("  —  Agent Harness", Style::default().fg(Color::DarkGray)),
         ]))
         .borders(Borders::ALL)
