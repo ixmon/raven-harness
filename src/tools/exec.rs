@@ -24,11 +24,26 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
     let ws = workspace.to_path_buf();
 
     // Use tokio::process + explicit kill for proper child cleanup on timeout (glm.md priority)
+    #[cfg(unix)]
     let child = match TokioCommand::new("/bin/bash")
         .arg("-c")
         .arg(&cmd)
         .current_dir(&ws)
         .env("NO_COLOR", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return format!("(exec spawn error: {})", e),
+    };
+
+    #[cfg(windows)]
+    let child = match TokioCommand::new("cmd")
+        .arg("/C")
+        .arg(&cmd)
+        .current_dir(&ws)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

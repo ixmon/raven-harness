@@ -115,6 +115,7 @@ fn detect() -> ColorDepth {
 
 /// Run `tput colors` and parse the integer. Returns None if unavailable or
 /// unparseable. We shell out (short-lived) only once at startup.
+#[cfg(unix)]
 fn tput_colors() -> Option<u32> {
     let out = std::process::Command::new("tput")
         .arg("colors")
@@ -125,6 +126,11 @@ fn tput_colors() -> Option<u32> {
     }
     let s = String::from_utf8_lossy(&out.stdout);
     s.trim().parse::<u32>().ok()
+}
+
+#[cfg(windows)]
+fn tput_colors() -> Option<u32> {
+    None // Windows Terminal supports truecolor natively
 }
 
 /// Resolve a ratatui `Color` against the current terminal depth. Named colors

@@ -23,19 +23,18 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
-            features: ""
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             use_cross: true
-            features: ""
           - target: x86_64-apple-darwin
             os: macos-13
             use_cross: false
-            features: ""
           - target: aarch64-apple-darwin
             os: macos-latest
             use_cross: false
-            features: ""
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            use_cross: false
 
     steps:
       - name: Checkout
@@ -50,7 +49,8 @@ jobs:
         if: matrix.use_cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Build release binary
+      - name: Build release binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           if [ "${{ matrix.use_cross }}" = "true" ]; then
             CARGO=cross
@@ -58,36 +58,33 @@ jobs:
             CARGO=cargo
           fi
 
-          FEATURE_FLAGS=""
-          if [ -n "${{ matrix.features }}" ]; then
-            FEATURE_FLAGS="--features ${{ matrix.features }}"
+          # Disable clipboard on Linux (requires X11/Wayland libs at runtime)
+          if [[ "${{ matrix.target }}" == *linux* ]]; then
+            FEATURE_FLAGS="--no-default-features"
           else
-            # Disable clipboard on Linux (requires X11/Wayland libs at runtime)
-            # Enable on macOS where it works natively
-            if [[ "${{ matrix.target }}" == *linux* ]]; then
-              FEATURE_FLAGS="--no-default-features"
-            fi
+            FEATURE_FLAGS=""
           fi
 
           $CARGO build --release --target ${{ matrix.target }} $FEATURE_FLAGS
 
-      - name: Strip binary
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
-          if [[ "${{ matrix.target }}" == *linux* ]] && [ "${{ matrix.use_cross }}" = "true" ]; then
-            # cross-compiled: use the appropriate strip
-            if [[ "${{ matrix.target }}" == aarch64* ]]; then
-              docker run --rm -v "$(pwd):/workspace" -w /workspace \
-                ghcr.io/cross-rs/${{ matrix.target }}:main \
-                aarch64-linux-gnu-strip "$BIN" || true
-            else
-              strip "$BIN" || true
-            fi
+          if [[ "${{ matrix.target }}" == aarch64*linux* ]] && [ "${{ matrix.use_cross }}" = "true" ]; then
+            docker run --rm -v "$(pwd):/workspace" -w /workspace \
+              ghcr.io/cross-rs/${{ matrix.target }}:main \
+              aarch64-linux-gnu-strip "$BIN" || true
           else
             strip "$BIN" || true
           fi
 
-      - name: Package
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           ARCHIVE="${{ env.BINARY_NAME }}-${TAG}-${{ matrix.target }}"
@@ -95,14 +92,21 @@ jobs:
           cp "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}" "$ARCHIVE/"
           cp README.md "$ARCHIVE/" 2>/dev/null || true
           cp LICENSE* "$ARCHIVE/" 2>/dev/null || true
+          tar czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
+          echo "ASSET=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
 
-          if [[ "${{ matrix.target }}" == *linux* ]]; then
-            tar czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
-            echo "ASSET=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
-          else
-            tar czf "${ARCHIVE}.tar.gz" "$ARCHIVE"
-            echo "ASSET=${ARCHIVE}.tar.gz" >> "$GITHUB_ENV"
-          fi
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $Tag = "${{ github.ref_name }}"
+          $Archive = "${{ env.BINARY_NAME }}-${Tag}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $Archive | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}.exe" "$Archive/"
+          Copy-Item "README.md" "$Archive/" -ErrorAction SilentlyContinue
+          Copy-Item "LICENSE*" "$Archive/" -ErrorAction SilentlyContinue
+          Compress-Archive -Path "$Archive" -DestinationPath "${Archive}.zip"
+          echo "ASSET=${Archive}.zip" >> $env:GITHUB_ENV
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
