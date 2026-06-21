@@ -692,7 +692,6 @@ impl Agent {
     }
 
     /// Read-only access to the current config (for UI to display active endpoint).
-    #[allow(dead_code)]
     pub fn current_config(&self) -> &Config {
         &self.config
     }

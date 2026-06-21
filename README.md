@@ -26,7 +26,7 @@ A focused ratatui-based terminal UI for agentic coding against local (or remote)
 
 ## Pre-built binaries
 
-GitHub Actions builds release binaries when a `v*` tag is pushed. You do **not** need to update README links after each release.
+GitHub Actions builds release binaries when a `v*` tag is pushed, this Readme points to LATEST
 
 | Platform | Download (always latest) |
 |----------|--------------------------|

@@ -121,6 +121,7 @@ struct App {
     // Display state (updated on endpoint switch)
     display_model: String,
     display_budget: crate::config::ContextBudget,
+    balance_label: String,
 
     // Settings modal (extracted module)
     settings: SettingsModal,
@@ -197,6 +198,11 @@ impl App {
             slash_selected: 0,
             display_model: config.model.clone(),
             display_budget: config.context_budget.clone(),
+            balance_label: if crate::llm::is_metered_endpoint(&config.base_url) {
+                "$…".to_string()
+            } else {
+                "$∞".to_string()
+            },
             settings: SettingsModal::inactive(),
             last_left_line_count: 0,
             last_right_line_count: 0,
@@ -264,14 +270,45 @@ fn render_pane(pane: Pane) -> crate::tui_render::Pane {
 }
 
 
+/// Idle fallback interval for OpenRouter balance polling (no OpenRouter guidance on cadence).
+const BALANCE_IDLE_REFRESH_SECS: u64 = 600;
+
+fn schedule_balance_refresh(agent: &Arc<tokio::sync::Mutex<Agent>>, tx: &mpsc::Sender<String>) {
+    let agent2 = agent.clone();
+    let btx = tx.clone();
+    tokio::spawn(async move {
+        refresh_balance_label(&agent2, &btx).await;
+    });
+}
+
+async fn refresh_balance_label(
+    agent: &Arc<tokio::sync::Mutex<Agent>>,
+    tx: &mpsc::Sender<String>,
+) {
+    let (base_url, api_key) = {
+        let ag = agent.lock().await;
+        let cfg = ag.current_config();
+        (cfg.base_url.clone(), cfg.api_key.clone())
+    };
+    let label = crate::llm::balance_label_for(&base_url, api_key.as_deref()).await;
+    let _ = tx.send(label).await;
+}
+
 async fn apply_settings_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
     config: &Config,
     keystore: &mut crate::keystore::Keystore,
     agent: &Arc<tokio::sync::Mutex<Agent>>,
+    balance_tx: &mpsc::Sender<String>,
 ) {
     let result = handle_settings_key(&mut app.settings, key, config, keystore, agent).await;
+    let endpoint_switched = result.actions.iter().any(|a| {
+        matches!(
+            a,
+            crate::settings_modal::SettingsAction::DisplayUpdate { .. }
+        )
+    });
     apply_settings_actions(
         result.actions,
         &mut app.left_committed,
@@ -280,6 +317,16 @@ async fn apply_settings_key(
         &mut app.display_budget,
         &mut app.settings,
     );
+    if endpoint_switched {
+        if let Ok(ag) = agent.try_lock() {
+            app.balance_label = if crate::llm::is_metered_endpoint(&ag.current_config().base_url) {
+                "$…".to_string()
+            } else {
+                "$∞".to_string()
+            };
+        }
+        schedule_balance_refresh(agent, balance_tx);
+    }
     app.left_follow_output = true;
     app.left_scroll = 10_000;
     app.right_follow_output = true;
@@ -732,6 +779,18 @@ async fn run_app<B: ratatui::backend::Backend>(
     let queued_interject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let instant_interject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
+    let (balance_tx, mut balance_rx) = mpsc::channel::<String>(4);
+    {
+        let agent_bal = agent.clone();
+        let btx = balance_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                refresh_balance_label(&agent_bal, &btx).await;
+                tokio::time::sleep(Duration::from_secs(BALANCE_IDLE_REFRESH_SECS)).await;
+            }
+        });
+    }
+
     // Spawn a dedicated thread for keyboard input (responsive even during LLM streaming).
     // Uses blocking_send() to bridge the sync thread → async tokio channel.
     let _input_handle = std::thread::spawn(move || {
@@ -747,6 +806,11 @@ async fn run_app<B: ratatui::backend::Backend>(
     });
 
     loop {
+        while let Ok(label) = balance_rx.try_recv() {
+            app.balance_label = label;
+            app.needs_redraw = true;
+        }
+
         // Advance spinner
         if app.is_processing {
            app.spinner_tick = app.spinner_tick.wrapping_add(1);
@@ -808,6 +872,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             };
             crate::tui_render::draw_status_bar(f, status_area, &crate::tui_render::StatusBarData {
                 display_model: &app.display_model,
+                balance_label: &app.balance_label,
                 ctx_used_tokens: app.ctx_used_tokens,
                 budget: &app.display_budget,
                 mode_label: &mode_label,
@@ -1058,6 +1123,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                           app.needs_redraw = true;
                           app.is_processing = false;
+                          schedule_balance_refresh(&agent, &balance_tx);
                         }
                         UiUpdate::Error(e) => {
                             let msg = format!("⚠ ERROR: {}", e);
@@ -1077,6 +1143,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             }
                           app.needs_redraw = true;
                           app.is_processing = false;
+                          schedule_balance_refresh(&agent, &balance_tx);
                         }
                         UiUpdate::ApprovalRequested => {
                             // Poll the approval channel here to set pending immediately
@@ -1114,7 +1181,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
 
                         if app.settings.active {
-                            apply_settings_key(&mut app, key, &config, &mut keystore, &agent).await;
+                            apply_settings_key(&mut app, key, &config, &mut keystore, &agent, &balance_tx).await;
                             continue;
                         }
 
@@ -1227,7 +1294,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     continue;
                 }
                 if app.settings.active {
-                    apply_settings_key(&mut app, key, &config, &mut keystore, &agent).await;
+                    apply_settings_key(&mut app, key, &config, &mut keystore, &agent, &balance_tx).await;
                     continue;
                 }
                 match key.code {

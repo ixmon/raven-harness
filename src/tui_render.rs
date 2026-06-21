@@ -23,6 +23,7 @@ pub enum Pane {
 
 pub struct StatusBarData<'a> {
     pub display_model: &'a str,
+    pub balance_label: &'a str,
     pub ctx_used_tokens: u32,
     pub budget: &'a crate::config::ContextBudget,
     pub mode_label: &'a str,
@@ -37,6 +38,11 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
         Span::styled(
             data.display_model,
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ", Style::default()),
+        Span::styled(
+            data.balance_label,
+            balance_label_style(data.balance_label),
         ),
         Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
         Span::styled("ctx:", Style::default().fg(Color::DarkGray)),
@@ -84,6 +90,27 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn balance_label_style(label: &str) -> Style {
+    if label == "$∞" {
+        Style::default()
+            .fg(Color::Rgb(0x80, 0xd0, 0x80))
+            .add_modifier(Modifier::BOLD)
+    } else if label == "$—" {
+        Style::default().fg(Color::DarkGray)
+    } else if let Some(amount) = label.strip_prefix('$').and_then(|s| s.parse::<f64>().ok()) {
+        let color = if amount < 1.0 {
+            Color::Rgb(0xff, 0x60, 0x60)
+        } else if amount < 5.0 {
+            Color::Rgb(0xff, 0xc0, 0x40)
+        } else {
+            Color::Rgb(0x80, 0xd0, 0x80)
+        };
+        Style::default().fg(color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Rgb(0x80, 0xd0, 0x80))
+    }
 }
 
 pub struct ContextGaugeData {

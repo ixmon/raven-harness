@@ -430,8 +430,95 @@ pub async fn probe_context_size(base_url: &str, model: &str, api_key: Option<&st
 }
 
 /// Detect whether a base URL points to OpenRouter.
-fn is_openrouter(base_url: &str) -> bool {
+pub fn is_openrouter(base_url: &str) -> bool {
     base_url.contains("openrouter.ai")
+}
+
+/// Whether this endpoint has a metered (paid) balance we can query.
+pub fn is_metered_endpoint(base_url: &str) -> bool {
+    is_openrouter(base_url)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenRouterBalance(f64);
+
+/// Status-bar label for credits: `$∞` for local/unmetered, `$12.34` for OpenRouter.
+pub async fn balance_label_for(base_url: &str, api_key: Option<&str>) -> String {
+    if !is_metered_endpoint(base_url) {
+        return "$∞".to_string();
+    }
+    let Some(key) = api_key.filter(|k| !k.is_empty()) else {
+        return "$—".to_string();
+    };
+    match fetch_openrouter_balance(key).await {
+        Some(OpenRouterBalance(d)) => format!("${:.2}", d.max(0.0)),
+        None => "$—".to_string(),
+    }
+}
+
+/// Query remaining OpenRouter credits for the authenticated account/key.
+pub async fn fetch_openrouter_balance(api_key: &str) -> Option<OpenRouterBalance> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .ok()?;
+
+    // Account wallet balance (total purchased − used). Works with inference API keys.
+    if let Some(balance) = fetch_openrouter_credits(&client, api_key).await {
+        return Some(balance);
+    }
+
+    // Fallback: per-key spending cap when configured.
+    fetch_openrouter_key_limit(&client, api_key).await
+}
+
+async fn openrouter_get(
+    client: &Client,
+    path: &str,
+    api_key: &str,
+) -> Option<serde_json::Value> {
+    let resp = client
+        .get(format!("https://openrouter.ai/api/v1{path}"))
+        .bearer_auth(api_key)
+        .header("HTTP-Referer", "https://github.com/ixmon/raven-harness")
+        .header("X-Title", "Raven Hotel TUI")
+        .send()
+        .await
+        .ok()?;
+
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    resp.json().await.ok()
+}
+
+async fn fetch_openrouter_credits(client: &Client, api_key: &str) -> Option<OpenRouterBalance> {
+    let body = openrouter_get(client, "/credits", api_key).await?;
+    parse_openrouter_credits_balance(&body)
+}
+
+async fn fetch_openrouter_key_limit(client: &Client, api_key: &str) -> Option<OpenRouterBalance> {
+    let body = openrouter_get(client, "/key", api_key).await?;
+    parse_openrouter_key_limit(&body)
+}
+
+/// `GET /credits` → `total_credits - total_usage` (account wallet).
+fn parse_openrouter_credits_balance(body: &serde_json::Value) -> Option<OpenRouterBalance> {
+    let data = body.get("data")?;
+    let total = data.get("total_credits")?.as_f64()?;
+    let used = data.get("total_usage")?.as_f64()?;
+    Some(OpenRouterBalance((total - used).max(0.0)))
+}
+
+/// `GET /key` → `limit_remaining` when a per-key cap is configured.
+/// `null` means no per-key cap (not unlimited account balance).
+fn parse_openrouter_key_limit(body: &serde_json::Value) -> Option<OpenRouterBalance> {
+    let remaining = body.get("data")?.get("limit_remaining")?;
+    if remaining.is_null() {
+        return None;
+    }
+    remaining.as_f64().map(OpenRouterBalance)
 }
 
 /// Accumulate streaming tool-call fragments keyed by index.
@@ -608,5 +695,46 @@ mod tests {
             parse_sse_data_payload(payload),
             SseParseResult::Thinking("hmm".into())
         );
+    }
+
+    #[test]
+    fn parses_openrouter_credits_balance() {
+        let body = serde_json::json!({
+            "data": { "total_credits": 10.0, "total_usage": 2.5 }
+        });
+        assert_eq!(
+            parse_openrouter_credits_balance(&body),
+            Some(OpenRouterBalance(7.5))
+        );
+    }
+
+    #[test]
+    fn parse_openrouter_credits_zero_balance() {
+        let body = serde_json::json!({
+            "data": { "total_credits": 0.0, "total_usage": 0.0 }
+        });
+        assert_eq!(
+            parse_openrouter_credits_balance(&body),
+            Some(OpenRouterBalance(0.0))
+        );
+    }
+
+    #[test]
+    fn parse_openrouter_key_limit_remaining() {
+        let body = serde_json::json!({
+            "data": { "limit_remaining": 12.5, "usage": 3.25 }
+        });
+        assert_eq!(
+            parse_openrouter_key_limit(&body),
+            Some(OpenRouterBalance(12.5))
+        );
+    }
+
+    #[test]
+    fn parse_openrouter_key_limit_null_is_not_unlimited() {
+        let body = serde_json::json!({
+            "data": { "limit_remaining": null }
+        });
+        assert_eq!(parse_openrouter_key_limit(&body), None);
     }
 }
