@@ -81,7 +81,8 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&workspace)?;
 
     // Resolve API key: --api-key > LLM_API_KEY > OPENROUTER_API_KEY
-    let api_key = args.api_key
+    let mut api_key = args
+        .api_key
         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
 
     // === Context budget: probe server or use override ===
@@ -178,16 +179,23 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Decrypt saved endpoints into runtime form
-    let saved_endpoints = ks.decrypt_all_endpoints().unwrap_or_default();
+    let mut base_url = args.base_url.clone();
+    let mut model = args.model.clone();
+    if let Ok(Some(launch)) = ks.launch_endpoint() {
+        base_url = launch.base_url;
+        model = launch.model;
+        if launch.api_key.is_some() {
+            api_key = launch.api_key;
+        }
+    }
 
     if let Some(prompt) = args.prompt {
         // Non-interactive single shot — still benefits from session (meta is updated on disk)
         // Set the request on the bootstrapped sess before moving it into config.
         let _ = sess.set_last_user_request(&prompt);
         let c = config::Config {
-            base_url: args.base_url,
-            model: args.model,
+            base_url,
+            model,
             api_key,
             workspace: workspace.clone(),
             temperature: args.temperature,
@@ -210,8 +218,8 @@ async fn main() -> Result<()> {
 
     // Interactive TUI path
     let c = config::Config {
-        base_url: args.base_url,
-        model: args.model,
+        base_url,
+        model,
         api_key,
         workspace: workspace.clone(),
         temperature: args.temperature,
@@ -223,7 +231,7 @@ async fn main() -> Result<()> {
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.
     // Trust prompt + any eprintln above already happened on the normal terminal.
-    tui_app::run(c, saved_endpoints, ks).await
+    tui_app::run(c, ks).await
 }
 
 /// Get home directory (simple fallback).

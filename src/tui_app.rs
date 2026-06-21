@@ -788,7 +788,6 @@ impl App {
 
 pub async fn run(
     config: Config,
-    saved_endpoints: Vec<crate::config::InferenceEndpoint>,
     keystore: crate::keystore::Keystore,
 ) -> Result<()> {
     // Setup terminal cleanly.
@@ -811,7 +810,7 @@ pub async fn run(
     // One extra clear via the terminal API (belt + suspenders)
     terminal.clear()?;
 
-    let res = run_app(&mut terminal, config, saved_endpoints, keystore).await;
+    let res = run_app(&mut terminal, config, keystore).await;
 
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
@@ -832,7 +831,6 @@ pub async fn run(
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     config: Config,
-    saved_endpoints: Vec<crate::config::InferenceEndpoint>,
     mut keystore: crate::keystore::Keystore,
 ) -> Result<()> {
     // Wrap agent in Arc<Mutex> so it persists across spawned turn tasks.
@@ -1509,7 +1507,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 last_left_area_h: app.last_left_area.height,
                                 last_right_area_h: app.last_right_area.height,
                                 config: &config,
-                                saved_endpoints: &saved_endpoints,
+                                keystore: &keystore,
                                 agent: &agent,
                             };
                             match dispatch_slash_command(&prompt, &mut slash_ctx) {

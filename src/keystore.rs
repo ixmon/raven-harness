@@ -40,12 +40,26 @@ pub struct StoredEndpoint {
     pub has_key: bool,
 }
 
+/// Launch-time defaults (settings list index 0). Persisted in endpoints.json.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub struct LaunchDefaults {
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    pub encrypted_key: Option<String>,
+    #[serde(default)]
+    pub has_key: bool,
+}
+
 /// The full on-disk file.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KeystoreFile {
     /// Base64-encoded 16-byte salt for Argon2id.
     pub salt: String,
     pub endpoints: Vec<StoredEndpoint>,
+    /// Overrides CLI/env defaults on next launch when present.
+    #[serde(default)]
+    pub launch: Option<LaunchDefaults>,
 }
 
 /// Runtime key vault — holds the derived AES key in memory after unlock.
@@ -70,6 +84,7 @@ impl Keystore {
             KeystoreFile {
                 salt: base64::engine::general_purpose::STANDARD.encode(salt),
                 endpoints: vec![],
+                launch: None,
             }
         };
 
@@ -250,6 +265,63 @@ impl Keystore {
         Ok(())
     }
 
+    /// Launch defaults for the session endpoint (settings index 0).
+    pub fn launch_endpoint(&self) -> Result<Option<crate::config::InferenceEndpoint>> {
+        let Some(launch) = &self.file.launch else {
+            return Ok(None);
+        };
+        let api_key = if let Some(ref enc) = launch.encrypted_key {
+            if self.derived_key.is_some() {
+                Some(self.decrypt_key(enc)?)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        Ok(Some(crate::config::InferenceEndpoint {
+            label: launch.label.clone(),
+            base_url: launch.base_url.clone(),
+            model: launch.model.clone(),
+            api_key,
+        }))
+    }
+
+    /// Persist launch defaults (settings edit on index 0).
+    pub fn set_launch_defaults(
+        &mut self,
+        label: &str,
+        base_url: &str,
+        model: &str,
+        api_key: Option<&str>,
+    ) -> Result<()> {
+        let key_update = match api_key {
+            None => KeyUpdate::Keep,
+            Some("") => KeyUpdate::Remove,
+            Some(key) => KeyUpdate::Replace(self.encrypt_key(key)?),
+        };
+
+        let mut launch = self.file.launch.take().unwrap_or_default();
+        launch.label = label.to_string();
+        launch.base_url = base_url.to_string();
+        launch.model = model.to_string();
+
+        match key_update {
+            KeyUpdate::Keep => {}
+            KeyUpdate::Remove => {
+                launch.encrypted_key = None;
+                launch.has_key = false;
+            }
+            KeyUpdate::Replace(encrypted) => {
+                launch.encrypted_key = Some(encrypted);
+                launch.has_key = true;
+            }
+        }
+
+        self.file.launch = Some(launch);
+        self.save()
+    }
+
     /// Update a stored endpoint in place. `api_key`: `None` keeps the existing key,
     /// `Some("")` removes it, `Some("key")` replaces it.
     pub fn update_endpoint(
@@ -374,6 +446,44 @@ mod tests {
         let mut ks3 = Keystore::load_or_create(&path).expect("reload2");
         let wrong = ks3.unlock("wrong-password");
         assert!(wrong.is_err(), "wrong password must be rejected");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn keystore_update_endpoint_persists() {
+        let path = unique_test_path();
+        cleanup(&path);
+
+        let mut ks = Keystore::load_or_create(&path).unwrap();
+        ks.init_password("pw").unwrap();
+        ks.add_endpoint("ep1", "http://one/v1", "model-a", None).unwrap();
+
+        ks.update_endpoint(0, "ep1-renamed", "http://two/v1", "model-b", None)
+            .unwrap();
+
+        let ks2 = Keystore::load_or_create(&path).unwrap();
+        assert_eq!(ks2.file.endpoints[0].label, "ep1-renamed");
+        assert_eq!(ks2.file.endpoints[0].base_url, "http://two/v1");
+        assert_eq!(ks2.file.endpoints[0].model, "model-b");
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn keystore_launch_defaults_persist() {
+        let path = unique_test_path();
+        cleanup(&path);
+
+        let mut ks = Keystore::load_or_create(&path).unwrap();
+        ks.set_launch_defaults("local", "http://127.0.0.1:9090/v1", "qwen", None)
+            .unwrap();
+
+        let ks2 = Keystore::load_or_create(&path).unwrap();
+        let launch = ks2.launch_endpoint().unwrap().expect("launch");
+        assert_eq!(launch.label, "local");
+        assert_eq!(launch.base_url, "http://127.0.0.1:9090/v1");
+        assert_eq!(launch.model, "qwen");
 
         cleanup(&path);
     }

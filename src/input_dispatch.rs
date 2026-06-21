@@ -2,6 +2,7 @@
 
 use crate::agent::Agent;
 use crate::config::Config;
+use crate::keystore::Keystore;
 use crate::search::{run_search, SearchState};
 use crate::settings_modal::SettingsModal;
 use crate::tui_render::Pane;
@@ -41,7 +42,7 @@ pub struct SlashContext<'a> {
     pub last_left_area_h: u16,
     pub last_right_area_h: u16,
     pub config: &'a Config,
-    pub saved_endpoints: &'a [crate::config::InferenceEndpoint],
+    pub keystore: &'a Keystore,
     pub agent: &'a Arc<Mutex<Agent>>,
 }
 
@@ -160,7 +161,12 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             SlashDispatch::Handled
         }
         "settings" => {
-            ctx.settings.open(ctx.config, ctx.saved_endpoints);
+            let fallback = if let Ok(ag) = ctx.agent.try_lock() {
+                ag.current_config().clone()
+            } else {
+                ctx.config.clone()
+            };
+            ctx.settings.open(ctx.keystore, &fallback);
             clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
@@ -372,6 +378,11 @@ mod tests {
             context_budget: ContextBudget::from_context_tokens(8192, 10),
         };
         let agent = Arc::new(Mutex::new(Agent::new(config.clone())));
+        let ks_path = std::env::temp_dir().join(format!(
+            "raven_slash_test_{}.json",
+            std::process::id()
+        ));
+        let ks = Keystore::load_or_create(&ks_path).expect("keystore");
         let mut input = "/status".to_string();
         let mut cursor_pos = 45;
         let mut left = Vec::new();
@@ -410,7 +421,7 @@ mod tests {
             last_left_area_h: 24,
             last_right_area_h: 24,
             config: &config,
-            saved_endpoints: &[],
+            keystore: &ks,
             agent: &agent,
         };
         let result = dispatch_slash_command("/status", &mut ctx);

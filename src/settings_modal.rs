@@ -70,9 +70,18 @@ impl SettingsModal {
         }
     }
 
-    pub fn open(&mut self, config: &Config, saved: &[InferenceEndpoint]) {
-        self.endpoints = vec![InferenceEndpoint::from_config(config)];
-        self.endpoints.extend(saved.iter().cloned());
+    /// First list entry: persisted launch defaults, or the agent's current config.
+    pub fn session_list_head(keystore: &Keystore, fallback: &Config) -> InferenceEndpoint {
+        keystore
+            .launch_endpoint()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| InferenceEndpoint::from_config(fallback))
+    }
+
+    pub fn open(&mut self, keystore: &Keystore, fallback_config: &Config) {
+        let session_endpoint = Self::session_list_head(keystore, fallback_config);
+        self.rebuild_endpoints(&session_endpoint, keystore);
         self.selected = self.active_endpoint_idx;
         self.mode = SettingsMode::List;
         self.editing_idx = None;
@@ -93,8 +102,8 @@ impl SettingsModal {
         self.edit_keep_key = false;
     }
 
-    fn rebuild_endpoints(&mut self, config: &Config, keystore: &Keystore) {
-        self.endpoints = vec![InferenceEndpoint::from_config(config)];
+    fn rebuild_endpoints(&mut self, session_endpoint: &InferenceEndpoint, keystore: &Keystore) {
+        self.endpoints = vec![session_endpoint.clone()];
         if let Ok(eps) = keystore.decrypt_all_endpoints() {
             self.endpoints.extend(eps);
         }
@@ -567,7 +576,13 @@ pub async fn handle_settings_key(
                 if settings.selected > 0 && settings.selected != settings.active_endpoint_idx {
                     let keystore_idx = settings.selected - 1;
                     let _ = keystore.remove_endpoint(keystore_idx);
-                    settings.rebuild_endpoints(config, keystore);
+                    let fallback = if let Ok(ag) = agent.try_lock() {
+                        ag.current_config().clone()
+                    } else {
+                        config.clone()
+                    };
+                    let session_endpoint = SettingsModal::session_list_head(keystore, &fallback);
+                    settings.rebuild_endpoints(&session_endpoint, keystore);
                     if settings.active_endpoint_idx > settings.selected {
                         settings.active_endpoint_idx -= 1;
                     }
@@ -617,7 +632,8 @@ fn finish_add(
         Err(e) => actions.push(SettingsAction::Notify(format!("Failed to save endpoint: {}", e))),
     }
 
-    settings.rebuild_endpoints(config, keystore);
+    let session_endpoint = SettingsModal::session_list_head(keystore, config);
+    settings.rebuild_endpoints(&session_endpoint, keystore);
     settings.mode = SettingsMode::List;
     settings.clear_wizard();
     actions
@@ -639,23 +655,51 @@ async fn finish_edit(
 
     if list_idx == 0 {
         let prev = &settings.endpoints[0];
+        let key_update = if settings.new_key.is_empty() {
+            None
+        } else {
+            if !keystore.is_unlocked() {
+                actions.push(SettingsAction::Notify(
+                    "Setting vault password (first API key). Using 'raven' as default.".into(),
+                ));
+                let _ = keystore.init_password("raven");
+            }
+            Some(settings.new_key.as_str())
+        };
+
+        let saved = keystore.set_launch_defaults(
+            &settings.new_label,
+            &settings.new_url,
+            &settings.new_model,
+            key_update,
+        );
         let api_key = if settings.new_key.is_empty() {
             prev.api_key.clone()
         } else {
             Some(settings.new_key.clone())
         };
-        settings.endpoints[0] = InferenceEndpoint {
+        let updated = InferenceEndpoint {
             label: settings.new_label.clone(),
             base_url: settings.new_url.clone(),
             model: settings.new_model.clone(),
             api_key,
         };
-        actions.push(SettingsAction::Notify(format!(
-            "Updated session endpoint: {} (not saved to keystore — use Add to persist)",
-            settings.new_label
-        )));
-        if list_idx == settings.active_endpoint_idx {
-            actions.extend(switch_to_endpoint(settings, config, agent, 0).await);
+
+        match saved {
+            Ok(()) => {
+                actions.push(SettingsAction::Notify(format!(
+                    "Updated launch endpoint: {} (saved to endpoints.json)",
+                    settings.new_label
+                )));
+                settings.rebuild_endpoints(&updated, keystore);
+                if list_idx == settings.active_endpoint_idx {
+                    actions.extend(switch_to_endpoint(settings, config, agent, 0).await);
+                }
+            }
+            Err(e) => actions.push(SettingsAction::Notify(format!(
+                "Failed to save launch endpoint: {}",
+                e
+            ))),
         }
     } else {
         let keystore_idx = list_idx - 1;
@@ -683,7 +727,9 @@ async fn finish_edit(
                     "Updated endpoint: {}",
                     settings.new_label
                 )));
-                settings.rebuild_endpoints(config, keystore);
+                let session_endpoint =
+                    SettingsModal::session_list_head(keystore, config);
+                settings.rebuild_endpoints(&session_endpoint, keystore);
                 if list_idx == settings.active_endpoint_idx {
                     actions.extend(switch_to_endpoint(settings, config, agent, list_idx).await);
                 }
