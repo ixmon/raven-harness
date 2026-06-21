@@ -24,6 +24,26 @@ A focused ratatui-based terminal UI for agentic coding against local (or remote)
   <em>Workspace — dual-pane view with conversation (left) and model trace (right)</em>
 </p>
 
+## Install
+
+Install the latest release binary into `~/.raven-hotel/bin/` (Windows: `%LOCALAPPDATA%\raven-hotel\bin\`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/install.sh | bash
+```
+
+```powershell
+irm https://raw.githubusercontent.com/ixmon/raven-harness/main/tui/scripts/install.ps1 | iex
+```
+
+**PATH setup (hybrid):**
+
+- **Interactive terminal** — the script asks before appending to your shell rc (bash/zsh/fish) or Windows user `PATH`.
+- **Piped one-liner** (`curl | bash` / `irm | iex`) — prints PATH instructions only; no dotfile or registry edits.
+- **Opt out** — set `RAVEN_INSTALL_NO_PATH=1` to skip PATH changes (instructions are still printed).
+
+Install metadata is written to `~/.raven-hotel/install.json` (version, target triple, install time).
+
 ## Pre-built binaries
 
 GitHub Actions builds release binaries when a `v*` tag is pushed, this Readme points to LATEST
@@ -236,6 +256,8 @@ Type `/` then use Up/Down to browse, Tab to complete.
 | `--max-tokens` | | Max output tokens |
 | `--prompt "..."` | | Non-interactive one-shot mode |
 | | `RAVEN_VAULT_PASSWORD` | Unlock encrypted keystore without interactive prompt |
+| | `RAVEN_INSTALL_NO_PATH` | Install script: skip PATH / shell-rc modification |
+| | `RAVEN_INSTALL_DIR` | Install script: override binary directory (default `~/.raven-hotel/bin`) |
 
 ## Keybindings (quick reference)
 
