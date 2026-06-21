@@ -24,7 +24,31 @@ A focused ratatui-based terminal UI for agentic coding against local (or remote)
   <em>Workspace — dual-pane view with conversation (left) and model trace (right)</em>
 </p>
 
-## Quick start
+## Pre-built binaries
+
+GitHub Actions builds release binaries when a `v*` tag is pushed. You do **not** need to update README links after each release.
+
+| Platform | Download (always latest) |
+|----------|--------------------------|
+| **All releases** | [github.com/ixmon/raven-harness/releases/latest](https://github.com/ixmon/raven-harness/releases/latest) |
+| Linux x86_64 | [raven-tui-x86_64-unknown-linux-gnu.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-unknown-linux-gnu.tar.gz) |
+| Linux ARM64 | [raven-tui-aarch64-unknown-linux-gnu.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-unknown-linux-gnu.tar.gz) |
+| macOS x86_64 (Intel) | [raven-tui-x86_64-apple-darwin.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-apple-darwin.tar.gz) |
+| macOS ARM64 (Apple Silicon) | [raven-tui-aarch64-apple-darwin.tar.gz](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-aarch64-apple-darwin.tar.gz) |
+| Windows x86_64 | [raven-tui-x86_64-pc-windows-msvc.zip](https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-pc-windows-msvc.zip) |
+
+The **releases/latest** page and **releases/latest/download/…** URLs redirect to the newest tagged release automatically. Each release also keeps versioned archives (e.g. `raven-tui-v0.1.1-…`) for pinning.
+
+Linux builds are compiled with `--no-default-features` (no clipboard — avoids X11/Wayland deps). macOS and Windows builds include clipboard support.
+
+```bash
+# Example: Linux x86_64
+curl -LO https://github.com/ixmon/raven-harness/releases/latest/download/raven-tui-x86_64-unknown-linux-gnu.tar.gz
+tar xzf raven-tui-x86_64-unknown-linux-gnu.tar.gz
+./raven-tui-x86_64-unknown-linux-gnu/raven-tui
+```
+
+## Quick start (from source)
 
 ```bash
 cd tui

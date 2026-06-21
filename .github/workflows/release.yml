@@ -127,10 +127,23 @@ jobs:
       - name: List artifacts
         run: find artifacts -type f | sort
 
+      # Duplicate assets without the version tag so README links can use
+      # /releases/latest/download/<stable-name> and never need updating.
+      - name: Add stable download aliases
+        run: |
+          mkdir -p release-assets
+          find artifacts -type f -exec cp {} release-assets/ \;
+          for f in release-assets/raven-tui-v*; do
+            [ -f "$f" ] || continue
+            stable=$(basename "$f" | sed -E 's/raven-tui-v[^-]+-/raven-tui-/')
+            cp "$f" "release-assets/${stable}"
+          done
+          find release-assets -type f | sort
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/**/*
+          files: release-assets/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
