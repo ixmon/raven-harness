@@ -981,8 +981,9 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Normal input handling when idle — read from the input channel
-        match tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await {
-            Ok(Some(Event::Key(key))) => {
+        if let Ok(Some(Event::Key(key))) =
+            tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await
+        {
                 if app.handle_approval_key(key) {
                     continue;
                 }
@@ -1564,8 +1565,6 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                     _ => {}
                 }
-            }
-            _ => {} // Timeout, non-key event, or channel closed
         }
     }
 }

@@ -46,13 +46,9 @@ impl ContextBudget {
         let tool_budget = context_bytes * 0.60;
         let rounds = (desired_rounds as f64).max(1.0);
 
-        let tool_result_bytes = ((tool_budget / rounds) as usize)
-            .max(500)    // floor: always allow *some* output
-            .min(50_000); // cap: even 1M-token contexts shouldn't dump 200KB per result
+        let tool_result_bytes = ((tool_budget / rounds) as usize).clamp(500, 50_000);
 
-        let read_line_limit = (tool_result_bytes / 45) // ~45 bytes per line of code
-            .max(20)
-            .min(1_000);
+        let read_line_limit = (tool_result_bytes / 45).clamp(20, 1_000);
 
         Self {
             context_tokens: n_ctx,

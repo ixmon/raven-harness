@@ -116,7 +116,7 @@ impl Agent {
         let mut last_assistant_text = String::new();
         let tools_schema = tools::all_tools();
 
-        for round in 0..self.config.max_rounds.max(1).min(MAX_TOOL_ROUNDS) {
+        for round in 0..self.config.max_rounds.clamp(1, MAX_TOOL_ROUNDS) {
             let messages = self.build_messages_for_model();
             let req = ChatRequest {
                 messages,
@@ -165,7 +165,7 @@ impl Agent {
 
                 // Invalidate file summaries for any write/patch (so read_summary sees fresh mtime next time)
                 if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(raw_args) {
-                    self.maybe_invalidate_summary(&tool_name, &args_val);
+                    self.maybe_invalidate_summary(tool_name, &args_val);
                 }
 
                 // Intercept session meta + summary cache tools
@@ -624,7 +624,7 @@ impl Agent {
             }
             // Also refresh the rolling recent-turns summary occasionally
             // (lightweight; the prune path does heavier compression).
-            if self.conversation.len() % 4 == 0 {
+            if self.conversation.len().is_multiple_of(4) {
                 let last_few: Vec<_> = self.conversation.iter().rev().take(4).cloned().collect();
                 if !last_few.is_empty() {
                     let sm = self.summarize_messages(&last_few).await;

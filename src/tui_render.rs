@@ -1,5 +1,7 @@
 //! Extracted TUI rendering helpers (glm.md refactor).
 
+#![allow(clippy::too_many_arguments)]
+
 use crate::desktop::{ActiveDesktop, DesktopState, SlideDirection};
 use crate::input_dispatch::SlashCommand;
 use crate::settings_modal::{draw_settings_modal, SettingsModal};

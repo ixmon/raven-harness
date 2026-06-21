@@ -44,7 +44,7 @@ const RAVEN_HOME: &str = ".raven-hotel";
 const SESSIONS_SUBDIR: &str = "sessions";
 
 /// Limits for safe discovery (tunable).
-const MAX_FILE_SIZE_FOR_INDEX: u64 = 1 * 1024 * 1024; // 1 MiB
+const MAX_FILE_SIZE_FOR_INDEX: u64 = 1024 * 1024; // 1 MiB
 const MAX_DIR_ENTRIES: usize = 350;                    // if a dir has more immediate children, don't descend
 const MAX_DEPTH: usize = 7;
 const MAX_INDEXED_FILES: usize = 2000;
@@ -247,7 +247,7 @@ impl Session {
             for t in &m.achievement_tests {
                 block.push_str(&format!("- {}\n", t));
             }
-            block.push_str("\n");
+            block.push('\n');
         }
 
         if !m.pitfalls.is_empty() {
@@ -255,7 +255,7 @@ impl Session {
             for p in &m.pitfalls {
                 block.push_str(&format!("- {}\n", p));
             }
-            block.push_str("\n");
+            block.push('\n');
         }
 
         if !m.discoveries.is_empty() {
@@ -263,7 +263,7 @@ impl Session {
             for d in m.discoveries.iter().rev().take(8) {
                 block.push_str(&format!("- {}\n", d));
             }
-            block.push_str("\n");
+            block.push('\n');
         }
 
         if let Some(req) = &m.last_user_request {
@@ -276,14 +276,14 @@ impl Session {
         block.push_str("### Repo Structure & Importance (cached, safe discovery)\n");
         if !rc.tree_text.is_empty() {
             block.push_str(&rc.tree_text);
-            block.push_str("\n");
+            block.push('\n');
         }
         if !rc.important_paths.is_empty() {
             block.push_str("High-signal files (recently modified, READMEs, manifests, core sources):\n");
             for p in &rc.important_paths {
                 block.push_str(&format!("  • {}\n", p));
             }
-            block.push_str("\n");
+            block.push('\n');
         }
         if let Some(lang) = &rc.language_hint {
             block.push_str(&format!("Language / stack hint: {}\n", lang));
