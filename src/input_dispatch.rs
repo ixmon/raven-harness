@@ -120,16 +120,37 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             SlashDispatch::Handled
         }
         "status" => {
-            let mode_label = if let Ok(ag) = ctx.agent.try_lock() {
-                ag.current_exec_mode().label().to_string()
-            } else {
-                "unknown".to_string()
-            };
+            let (endpoint_label, model, base_url, workspace, mode_label) =
+                if let Ok(ag) = ctx.agent.try_lock() {
+                    let cfg = ag.current_config();
+                    let label = ctx
+                        .settings
+                        .endpoints
+                        .get(ctx.settings.active_endpoint_idx)
+                        .map(|e| e.label.clone())
+                        .unwrap_or_else(|| "session".to_string());
+                    (
+                        label,
+                        cfg.model.clone(),
+                        cfg.base_url.clone(),
+                        cfg.workspace.display().to_string(),
+                        ag.current_exec_mode().label().to_string(),
+                    )
+                } else {
+                    (
+                        "unknown".to_string(),
+                        ctx.config.model.clone(),
+                        ctx.config.base_url.clone(),
+                        ctx.config.workspace.display().to_string(),
+                        "unknown".to_string(),
+                    )
+                };
             let status = format!(
-                "Session status\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Exec Mode: {}\n  History:   {} entries",
-                ctx.config.model,
-                ctx.config.base_url,
-                ctx.config.workspace.display(),
+                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Exec Mode: {}\n  History:   {} entries",
+                endpoint_label,
+                model,
+                base_url,
+                workspace,
                 mode_label,
                 ctx.left_committed.len()
             );
