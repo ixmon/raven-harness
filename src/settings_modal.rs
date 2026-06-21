@@ -13,6 +13,7 @@ use ratatui::{
 
 use crate::agent::Agent;
 use crate::config::{Config, ContextBudget, InferenceEndpoint};
+use crate::key_edit::{map_key_to_edit, EditAction};
 use crate::keystore::Keystore;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -175,6 +176,50 @@ impl SettingsModal {
             .unwrap_or(0);
     }
 
+    fn move_edit_cursor_home(&mut self) {
+        self.edit_cursor = 0;
+    }
+
+    fn move_edit_cursor_end(&mut self) {
+        self.edit_cursor = self.edit_buf.len();
+    }
+
+    fn insert_edit_str(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.clamp_edit_cursor();
+        self.edit_buf.insert_str(self.edit_cursor, s);
+        self.edit_cursor += s.len();
+    }
+
+    pub fn apply_edit_action(&mut self, action: EditAction) {
+        match action {
+            EditAction::Insert(c) => self.insert_edit_char(c),
+            EditAction::InsertStr(s) => self.insert_edit_str(&s),
+            EditAction::Backspace => self.delete_edit_before(),
+            EditAction::Delete => self.delete_edit_at(),
+            EditAction::Left => self.move_edit_cursor_left(),
+            EditAction::Right => self.move_edit_cursor_right(),
+            EditAction::Home => self.move_edit_cursor_home(),
+            EditAction::End => self.move_edit_cursor_end(),
+        }
+    }
+
+    fn delete_edit_at(&mut self) {
+        self.clamp_edit_cursor();
+        if self.edit_cursor >= self.edit_buf.len() {
+            return;
+        }
+        let next = self.edit_cursor
+            + self.edit_buf[self.edit_cursor..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(0);
+        self.edit_buf.drain(self.edit_cursor..next);
+    }
+
     fn advance_add_field(&mut self) {
         match self.add_step {
             0 => {
@@ -265,10 +310,11 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
                 &[&settings.new_label, &settings.new_url, &settings.new_model, &settings.new_key],
                 settings.add_step,
                 &settings.edit_buf,
+                settings.edit_cursor,
             );
             modal_lines.lines.push(Line::from(""));
             modal_lines.lines.push(Line::from(Span::styled(
-                "  Enter to confirm field • Esc to cancel",
+                "  ←→ move  •  Backspace edit  •  Ctrl+V / Shift+Insert paste  •  Enter next  •  Esc cancel",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -293,10 +339,11 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
                 &[&settings.new_label, &settings.new_url, &settings.new_model, &key_display],
                 settings.edit_step,
                 &settings.edit_buf,
+                settings.edit_cursor,
             );
             modal_lines.lines.push(Line::from(""));
             modal_lines.lines.push(Line::from(Span::styled(
-                "  Enter to confirm field • Esc to cancel",
+                "  ←→ move  •  Backspace edit  •  Ctrl+V / Shift+Insert paste  •  Enter next  •  Esc cancel",
                 Style::default().fg(Color::DarkGray),
             )));
         }
@@ -399,6 +446,7 @@ fn render_wizard_fields(
     values: &[&str],
     current_step: usize,
     edit_buf: &str,
+    edit_cursor: usize,
 ) {
     for (i, (field, val)) in fields.iter().zip(values.iter()).enumerate() {
         let is_current = i == current_step;
@@ -425,16 +473,20 @@ fn render_wizard_fields(
         };
 
         if is_current {
+            let cursor = edit_cursor.min(display_val.len());
+            let before = display_val[..cursor].to_string();
+            let after = display_val[cursor..].to_string();
             modal_lines.lines.push(Line::from(vec![
                 Span::styled(format!("  {} ", marker), label_style),
                 Span::styled(format!("{}: ", field), label_style),
-                Span::styled(display_val, Style::default().fg(Color::White)),
+                Span::styled(before, Style::default().fg(Color::White)),
                 Span::styled(
                     "_",
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::SLOW_BLINK),
                 ),
+                Span::styled(after, Style::default().fg(Color::White)),
             ]));
         } else {
             modal_lines.lines.push(Line::from(vec![
@@ -458,19 +510,10 @@ pub async fn handle_settings_key(
 
     match settings.mode {
         SettingsMode::Adding | SettingsMode::Editing => {
-            match key.code {
-                KeyCode::Char(c) => {
-                    settings.insert_edit_char(c);
-                }
-                KeyCode::Backspace => {
-                    settings.delete_edit_before();
-                }
-                KeyCode::Left => {
-                    settings.move_edit_cursor_left();
-                }
-                KeyCode::Right => {
-                    settings.move_edit_cursor_right();
-                }
+            if let Some(action) = map_key_to_edit(&key) {
+                settings.apply_edit_action(action);
+            } else {
+                match key.code {
                 KeyCode::Enter => {
                     if settings.mode == SettingsMode::Adding {
                         if settings.add_step < 3 {
@@ -491,6 +534,7 @@ pub async fn handle_settings_key(
                     settings.clear_wizard();
                 }
                 _ => {}
+                }
             }
         }
         SettingsMode::List => match key.code {

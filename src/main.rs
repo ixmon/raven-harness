@@ -11,6 +11,7 @@ mod agent;
 mod config;
 mod desktop;
 mod input_dispatch;
+mod key_edit;
 mod keystore;
 mod llm;
 mod palette;

@@ -26,6 +26,7 @@ use crate::input_dispatch::{
     apply_settings_actions, default_slash_commands, dispatch_slash_command, SlashContext,
     SlashDispatch,
 };
+use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
 use crate::llm::{StreamChunk, ToolCall};
 use crate::search::SearchState;
 use crate::settings_modal::{handle_settings_key, SettingsModal};
@@ -65,6 +66,19 @@ fn try_copy_to_clipboard(text: &str) {
     if let Ok(mut clipboard) = Clipboard::new() {
         let _ = clipboard.set_text(text.to_string());
     }
+}
+
+#[cfg(feature = "clipboard")]
+fn try_read_clipboard() -> Option<String> {
+    Clipboard::new()
+        .ok()
+        .and_then(|mut clipboard| clipboard.get_text().ok())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(not(feature = "clipboard"))]
+fn try_read_clipboard() -> Option<String> {
+    None
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -340,6 +354,65 @@ impl App {
         self.clamp_cursor();
         self.input.insert(self.cursor_pos, c);
         self.cursor_pos += c.len_utf8();
+    }
+
+    fn insert_str_at_cursor(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.clamp_cursor();
+        self.input.insert_str(self.cursor_pos, s);
+        self.cursor_pos += s.len();
+    }
+
+    fn apply_edit_action(&mut self, action: EditAction) {
+        match action {
+            EditAction::Insert(c) => self.insert_char(c),
+            EditAction::InsertStr(s) => self.insert_str_at_cursor(&s),
+            EditAction::Backspace => self.delete_char_before(),
+            EditAction::Delete => self.delete_char_at(),
+            EditAction::Left => self.move_cursor_left(),
+            EditAction::Right => self.move_cursor_right(),
+            EditAction::Home => self.move_cursor_home(),
+            EditAction::End => self.move_cursor_end(),
+        }
+    }
+
+    fn paste_into_settings(&mut self, text: &str) {
+        if !self.settings.active {
+            return;
+        }
+        if matches!(
+            self.settings.mode,
+            crate::settings_modal::SettingsMode::Adding | crate::settings_modal::SettingsMode::Editing
+        ) {
+            self.settings.apply_edit_action(EditAction::InsertStr(text.to_string()));
+            self.needs_redraw = true;
+        }
+    }
+
+    fn paste_into_input(&mut self, text: &str) {
+        let sanitized: String = text
+            .chars()
+            .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+            .collect();
+        if sanitized.is_empty() {
+            return;
+        }
+        self.insert_str_at_cursor(&sanitized);
+        self.history_index = None;
+        clamp_slash_selection(&self.slash_commands, &self.input, &mut self.slash_selected);
+        self.needs_redraw = true;
+    }
+
+    fn handle_clipboard_paste_key(&mut self) {
+        if let Some(text) = try_read_clipboard() {
+            if self.settings.active {
+                self.paste_into_settings(&text);
+            } else {
+                self.paste_into_input(&text);
+            }
+        }
     }
 
 
@@ -728,6 +801,7 @@ pub async fn run(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste,
         crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -743,6 +817,7 @@ pub async fn run(
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(
         terminal.backend_mut().inner_mut(),
+        crossterm::event::DisableBracketedPaste,
         crossterm::terminal::LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture
     )?;
@@ -1179,9 +1254,22 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                 // Allow the user to scroll AND type-ahead while processing
                 Some(ev) = input_rx.recv() => {
-                    if let Event::Key(key) = ev {
+                    match ev {
+                    Event::Paste(text) => {
+                        if app.settings.active {
+                            app.paste_into_settings(&text);
+                        } else {
+                            app.paste_into_input(&text);
+                        }
+                    }
+                    Event::Key(key) => {
                         // Highest priority: approval dialog
                         if app.handle_approval_key(key) {
+                            continue;
+                        }
+
+                        if is_paste_key(&key) {
+                            app.handle_clipboard_paste_key();
                             continue;
                         }
 
@@ -1264,20 +1352,24 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 app.submit_queued_interject(text, &queued_interject);
                             }
 
-                            // Cursor movement during processing
+                            // Cursor movement during processing (desktop slide takes precedence)
                             KeyCode::Left if app.route_left_to_desktop() && app.try_slide_to_splash() => {}
-                            KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
                             KeyCode::Right if app.route_right_to_desktop() && app.try_slide_to_workspace() => {}
-                            KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
-                            KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
-                            KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }
-
-                            // Type-ahead: insert at cursor position
-                            KeyCode::Char(c) => { app.insert_char(c); app.history_index = None; clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected); app.needs_redraw = true; }
-                            KeyCode::Backspace => { app.delete_char_before(); app.history_index = None; clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected); app.needs_redraw = true; }
-                            KeyCode::Delete => { app.delete_char_at(); app.needs_redraw = true; }
-                            _ => {}
+                            _ => {
+                                if let Some(action) = map_key_to_edit(&key) {
+                                    app.apply_edit_action(action);
+                                    app.history_index = None;
+                                    clamp_slash_selection(
+                                        &app.slash_commands,
+                                        &app.input,
+                                        &mut app.slash_selected,
+                                    );
+                                    app.needs_redraw = true;
+                                }
+                            }
                         }
+                    }
+                    _ => {}
                     }
                 }
 
@@ -1289,13 +1381,26 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Normal input handling when idle — read from the input channel
-        if let Ok(Some(Event::Key(key))) =
-            tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await
-        {
+        let input_ev = tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await;
+        if let Ok(Some(ev)) = input_ev {
+                match ev {
+                Event::Paste(text) => {
+                    if app.settings.active {
+                        app.paste_into_settings(&text);
+                    } else {
+                        app.paste_into_input(&text);
+                    }
+                    continue;
+                }
+                Event::Key(key) => {
                 if app.handle_approval_key(key) {
                     continue;
                 }
                 if app.handle_mode_menu_key(key, &agent).await {
+                    continue;
+                }
+                if is_paste_key(&key) {
+                    app.handle_clipboard_paste_key();
                     continue;
                 }
                 if app.settings.active {
@@ -1884,20 +1989,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                     // --- Desktop slide (pane focus) or cursor navigation (input) ---
                     KeyCode::Left
                         if !app.mode_menu_active
-                            && !app.settings.active
                             && app.pending_approval.is_none()
                             && app.route_left_to_desktop()
                             && app.try_slide_to_splash() => {}
-                    KeyCode::Left => { app.move_cursor_left(); app.needs_redraw = true; }
                     KeyCode::Right
                         if !app.mode_menu_active
-                            && !app.settings.active
                             && app.pending_approval.is_none()
                             && app.route_right_to_desktop()
                             && app.try_slide_to_workspace() => {}
-                    KeyCode::Right => { app.move_cursor_right(); app.needs_redraw = true; }
-                    KeyCode::Home => { app.move_cursor_home(); app.needs_redraw = true; }
-                    KeyCode::End => { app.move_cursor_end(); app.needs_redraw = true; }
 
                     // --- Context-sensitive Up/Down ---
                     // When Input focused: history recall
@@ -1952,24 +2051,26 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
 
                     // --- Text editing (always active, chars go to input from any pane) ---
-                    KeyCode::Char(c) if !app.mode_menu_active && app.pending_approval.is_none() => {
-                        app.insert_char(c);
-                        app.history_index = None;
-                        clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                        app.needs_redraw = true;
-                    }
-                    KeyCode::Backspace if !app.mode_menu_active && app.pending_approval.is_none() => {
-                        app.delete_char_before();
-                        app.history_index = None;
-                        clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                        app.needs_redraw = true;
-                    }
-                    KeyCode::Delete if !app.mode_menu_active && app.pending_approval.is_none() => {
-                        app.delete_char_at();
-                        app.needs_redraw = true;
+                    _ if !app.mode_menu_active
+                        && app.pending_approval.is_none()
+                        && map_key_to_edit(&key).is_some() =>
+                    {
+                        if let Some(action) = map_key_to_edit(&key) {
+                            app.apply_edit_action(action);
+                            app.history_index = None;
+                            clamp_slash_selection(
+                                &app.slash_commands,
+                                &app.input,
+                                &mut app.slash_selected,
+                            );
+                            app.needs_redraw = true;
+                        }
                     }
 
                     _ => {}
+                }
+                }
+                _ => {}
                 }
         }
     }

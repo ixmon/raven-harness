@@ -303,7 +303,8 @@ Keybindings:
   ↑/↓          Scroll the focused pane (PgUp/PgDn for faster scroll)
   Ctrl+↑/↓     Recall previous prompts
   Ctrl+F       Open search bar (n/N or Ctrl-N/P for next/prev match)
-  Ctrl+V       Paste from clipboard
+  Shift+Insert / Ctrl+V   Paste (also terminal bracketed paste)
+  Shift+select, Ctrl+Insert  Copy via terminal selection (SSH-friendly)
   Y / N        Approve or deny sandbox actions
   Esc          Stop agent (while processing) or cancel menus
 

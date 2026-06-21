@@ -1067,6 +1067,24 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
             Span::styled("  slash commands", hint),
         ]),
         Line::from(""),
+        Line::from(Span::styled("Copy / paste", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("Shift+drag", key),
+            Span::styled("  terminal selection  •  ", hint),
+            Span::styled("Ctrl+Insert", key),
+            Span::styled("  copy", hint),
+        ]),
+        Line::from(vec![
+            Span::styled("Shift+Insert", key),
+            Span::styled("  paste  •  ", hint),
+            Span::styled("Ctrl+V", key),
+            Span::styled("  paste (when clipboard works)", hint),
+        ]),
+        Line::from(Span::styled(
+            "SSH/screen vary by emulator — bracketed paste and Ctrl+V are tried automatically",
+            hint,
+        )),
+        Line::from(""),
         Line::from(Span::styled("Session", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
         Line::from(vec![
             Span::styled("endpoint: ", hint),
