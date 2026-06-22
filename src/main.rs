@@ -85,27 +85,6 @@ async fn main() -> Result<()> {
         .api_key
         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
 
-    // === Context budget: probe server or use override ===
-    let context_budget = if let Some(n_ctx) = args.context_size {
-        let mut b = config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds);
-        b.source = config::ContextSource::CliOverride;
-        b
-    } else {
-        match llm::probe_context_size(&args.base_url, &args.model, api_key.as_deref()).await {
-            Some(n_ctx) => config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds),
-            None => config::ContextBudget::default_fallback(),
-        }
-    };
-
-    eprintln!(
-        "context: {} tokens ({}) → budget: {} bytes/result, {} lines/read, {} rounds",
-        context_budget.context_tokens,
-        context_budget.source,
-        context_budget.tool_result_bytes,
-        context_budget.read_line_limit,
-        args.max_rounds,
-    );
-
     // === New session / context management ( ~/.raven-hotel/ ) ===
     // One persistent session per workspace. Supports goal tracking, repo cache,
     // safe discovery, and a compact injection block for the model.
@@ -188,6 +167,43 @@ async fn main() -> Result<()> {
             api_key = launch.api_key;
         }
     }
+
+    // === Context budget: probe the active endpoint (after launch override) ===
+    let context_budget = if let Some(n_ctx) = args.context_size {
+        let mut b = config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds);
+        b.source = config::ContextSource::CliOverride;
+        b
+    } else {
+        match llm::probe_server(&base_url, &model, api_key.as_deref()).await {
+            Some(probe) => {
+                if probe.model_id != model {
+                    eprintln!(
+                        "model: auto-detected {} (configured: {})",
+                        probe.model_id, model
+                    );
+                    model = probe.model_id;
+                }
+                config::ContextBudget::from_context_tokens(probe.context_tokens, args.max_rounds)
+            }
+            None => {
+                eprintln!(
+                    "warning: could not probe {}/models for model {:?}; using 8192 token default",
+                    base_url.trim_end_matches('/'),
+                    model
+                );
+                config::ContextBudget::default_fallback()
+            }
+        }
+    };
+
+    eprintln!(
+        "context: {} tokens ({}) → budget: {} bytes/result, {} lines/read, {} rounds",
+        context_budget.context_tokens,
+        context_budget.source,
+        context_budget.tool_result_bytes,
+        context_budget.read_line_limit,
+        args.max_rounds,
+    );
 
     if let Some(prompt) = args.prompt {
         // Non-interactive single shot — still benefits from session (meta is updated on disk)

@@ -380,16 +380,125 @@ fn parse_tool_calls(value: Option<&serde_json::Value>) -> Vec<ToolCall> {
     out
 }
 
-/// Probe the server's context window size via the standard `/v1/models` endpoint.
+/// How a model id was chosen during `/v1/models` probing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeMatch {
+    Exact,
+    Alias,
+    CaseInsensitive,
+    /// Server exposes exactly one model.
+    SingleModel,
+    /// Multiple models; picked the first entry with a known context size.
+    FirstWithContext,
+}
+
+/// Result of probing an OpenAI-compatible server's `/v1/models` endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerProbeResult {
+    pub model_id: String,
+    pub context_tokens: u32,
+    pub matched_by: ProbeMatch,
+}
+
+fn model_aliases<'a>(m: &'a serde_json::Value) -> Vec<&'a str> {
+    m.get("aliases")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
+}
+
+/// Extract context window from a single model entry (llama.cpp or OpenRouter shape).
+pub(crate) fn extract_context_tokens(m: &serde_json::Value) -> Option<u32> {
+    if let Some(n) = m.get("context_length").and_then(|v| v.as_u64()) {
+        return Some(n as u32);
+    }
+    if let Some(n) = m
+        .get("meta")
+        .and_then(|meta| meta.get("n_ctx"))
+        .and_then(|v| v.as_u64())
+    {
+        return Some(n as u32);
+    }
+    None
+}
+
+fn probe_result_from_entry(m: &serde_json::Value, matched_by: ProbeMatch) -> Option<ServerProbeResult> {
+    let id = m.get("id").and_then(|v| v.as_str())?.to_string();
+    let context_tokens = extract_context_tokens(m)?;
+    Some(ServerProbeResult {
+        model_id: id,
+        context_tokens,
+        matched_by,
+    })
+}
+
+/// Resolve model id + context from a `/v1/models` JSON body.
+///
+/// Matching order when `model_hint` is non-empty:
+///   1. exact `id`
+///   2. `aliases`
+///   3. case-insensitive `id`
+///
+/// When no hint matches (or hint is empty):
+///   4. sole model in `data`
+///   5. first model with a known context size
+pub fn resolve_server_probe(body: &serde_json::Value, model_hint: &str) -> Option<ServerProbeResult> {
+    let data = body.get("data")?.as_array()?;
+    if data.is_empty() {
+        return None;
+    }
+
+    let hint = model_hint.trim();
+
+    if !hint.is_empty() {
+        for m in data {
+            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id == hint {
+                if let Some(r) = probe_result_from_entry(m, ProbeMatch::Exact) {
+                    return Some(r);
+                }
+            }
+            if model_aliases(m).contains(&hint) {
+                if let Some(r) = probe_result_from_entry(m, ProbeMatch::Alias) {
+                    return Some(r);
+                }
+            }
+        }
+
+        let hint_lower = hint.to_lowercase();
+        for m in data {
+            let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.to_lowercase() == hint_lower {
+                if let Some(r) = probe_result_from_entry(m, ProbeMatch::CaseInsensitive) {
+                    return Some(r);
+                }
+            }
+        }
+    }
+
+    if data.len() == 1 {
+        return probe_result_from_entry(&data[0], ProbeMatch::SingleModel);
+    }
+
+    for m in data {
+        if let Some(r) = probe_result_from_entry(m, ProbeMatch::FirstWithContext) {
+            return Some(r);
+        }
+    }
+
+    None
+}
+
+/// Probe model id and context window via `/v1/models`.
 ///
 /// Works with:
 ///   - **llama.cpp**: `data[].meta.n_ctx`
 ///   - **OpenRouter**: `data[].context_length`
-///   - **Any server** that puts context size in either of those fields
-///
-/// Returns `None` on any failure (timeout, parse error, model not found, etc.)
-/// so the caller can fall back to a CLI override or default.
-pub async fn probe_context_size(base_url: &str, model: &str, api_key: Option<&str>) -> Option<u32> {
+pub async fn probe_server(
+    base_url: &str,
+    model_hint: &str,
+    api_key: Option<&str>,
+) -> Option<ServerProbeResult> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = Client::builder()
         .timeout(Duration::from_secs(5))
@@ -397,36 +506,16 @@ pub async fn probe_context_size(base_url: &str, model: &str, api_key: Option<&st
         .ok()?;
 
     let mut req = client.get(&url);
-    if let Some(key) = api_key {
+    if let Some(key) = api_key.filter(|k| !k.is_empty()) {
         req = req.bearer_auth(key);
     }
 
     let resp = req.send().await.ok()?;
-    let body: serde_json::Value = resp.json().await.ok()?;
-
-    // Search the data array for the requested model
-    for m in body.get("data")?.as_array()? {
-        let id = m.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        // Match by exact id or by alias
-        let aliases: Vec<&str> = m.get("aliases")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
-            .unwrap_or_default();
-        if id != model && !aliases.contains(&model) {
-            continue;
-        }
-
-        // OpenRouter / generic: context_length at top level
-        if let Some(n) = m.get("context_length").and_then(|v| v.as_u64()) {
-            return Some(n as u32);
-        }
-        // llama.cpp: meta.n_ctx
-        if let Some(n) = m.get("meta").and_then(|meta| meta.get("n_ctx")).and_then(|v| v.as_u64()) {
-            return Some(n as u32);
-        }
+    if !resp.status().is_success() {
+        return None;
     }
-
-    None
+    let body: serde_json::Value = resp.json().await.ok()?;
+    resolve_server_probe(&body, model_hint)
 }
 
 /// Detect whether a base URL points to OpenRouter.
@@ -736,5 +825,108 @@ mod tests {
             "data": { "limit_remaining": null }
         });
         assert_eq!(parse_openrouter_key_limit(&body), None);
+    }
+
+    #[test]
+    fn resolve_probe_llama_cpp_exact_match() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "Qwen3-Coder-Next",
+                "meta": { "n_ctx": 65536 }
+            }]
+        });
+        let r = resolve_server_probe(&body, "Qwen3-Coder-Next").unwrap();
+        assert_eq!(r.model_id, "Qwen3-Coder-Next");
+        assert_eq!(r.context_tokens, 65536);
+        assert_eq!(r.matched_by, ProbeMatch::Exact);
+    }
+
+    #[test]
+    fn resolve_probe_single_model_without_hint() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "Qwen3-Coder-Next",
+                "meta": { "n_ctx": 65536 }
+            }]
+        });
+        let r = resolve_server_probe(&body, "").unwrap();
+        assert_eq!(r.model_id, "Qwen3-Coder-Next");
+        assert_eq!(r.context_tokens, 65536);
+        assert_eq!(r.matched_by, ProbeMatch::SingleModel);
+    }
+
+    #[test]
+    fn resolve_probe_falls_back_when_configured_name_wrong() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "Qwen3-Coder-Next",
+                "meta": { "n_ctx": 65536 }
+            }]
+        });
+        // Stale CLI default — should still discover the lone server model.
+        let r = resolve_server_probe(&body, "qwen2.5-coder").unwrap();
+        assert_eq!(r.model_id, "Qwen3-Coder-Next");
+        assert_eq!(r.context_tokens, 65536);
+        assert_eq!(r.matched_by, ProbeMatch::SingleModel);
+    }
+
+    #[test]
+    fn resolve_probe_case_insensitive() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "Qwen3-Coder-Next",
+                "meta": { "n_ctx": 32768 }
+            }]
+        });
+        let r = resolve_server_probe(&body, "qwen3-coder-next").unwrap();
+        assert_eq!(r.matched_by, ProbeMatch::CaseInsensitive);
+        assert_eq!(r.context_tokens, 32768);
+    }
+
+    #[test]
+    fn resolve_probe_openrouter_context_length() {
+        let body = serde_json::json!({
+            "data": [{
+                "id": "anthropic/claude-sonnet-4",
+                "context_length": 200000
+            }]
+        });
+        let r = resolve_server_probe(&body, "anthropic/claude-sonnet-4").unwrap();
+        assert_eq!(r.context_tokens, 200000);
+    }
+
+    #[test]
+    fn resolve_probe_llama_cpp_hybrid_models_and_data() {
+        // llama.cpp returns both an Ollama-style `models` list and OpenAI-style `data`.
+        let body = serde_json::json!({
+            "models": [{
+                "name": "qwen3-coder-next",
+                "model": "qwen3-coder-next",
+                "type": "model",
+                "capabilities": ["completion"]
+            }],
+            "object": "list",
+            "data": [{
+                "id": "qwen3-coder-next",
+                "aliases": ["qwen3-coder-next"],
+                "object": "model",
+                "owned_by": "llamacpp",
+                "meta": {
+                    "n_ctx": 65536,
+                    "n_ctx_train": 262144
+                }
+            }]
+        });
+
+        let exact = resolve_server_probe(&body, "qwen3-coder-next").unwrap();
+        assert_eq!(exact.model_id, "qwen3-coder-next");
+        assert_eq!(exact.context_tokens, 65536);
+        assert_eq!(exact.matched_by, ProbeMatch::Exact);
+
+        // Stale default still resolves via single-model fallback.
+        let fallback = resolve_server_probe(&body, "qwen2.5-coder").unwrap();
+        assert_eq!(fallback.model_id, "qwen3-coder-next");
+        assert_eq!(fallback.context_tokens, 65536);
+        assert_eq!(fallback.matched_by, ProbeMatch::SingleModel);
     }
 }

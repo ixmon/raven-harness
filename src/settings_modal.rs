@@ -525,11 +525,67 @@ pub async fn handle_settings_key(
                 match key.code {
                 KeyCode::Enter => {
                     if settings.mode == SettingsMode::Adding {
-                        if settings.add_step < 3 {
+                        if settings.add_step == 1 {
+                            let url = settings.edit_buf.clone();
+                            settings.new_url = url.clone();
+                            settings.add_step = 2;
+                            match crate::llm::probe_server(&url, "", None).await {
+                                Some(probe) => {
+                                    let model_id = probe.model_id.clone();
+                                    settings.new_model = model_id.clone();
+                                    settings.edit_buf = model_id.clone();
+                                    settings.edit_cursor = settings.edit_buf.len();
+                                    actions.push(SettingsAction::Trace(format!(
+                                        "   ↳ detected: {} ({} tokens)",
+                                        model_id, probe.context_tokens
+                                    )));
+                                }
+                                None => {
+                                    settings.edit_buf.clear();
+                                    settings.edit_cursor = 0;
+                                    actions.push(SettingsAction::Trace(
+                                        "   ↳ could not probe /v1/models — enter model manually"
+                                            .into(),
+                                    ));
+                                }
+                            }
+                        } else if settings.add_step < 3 {
                             settings.advance_add_field();
                         } else {
                             settings.new_key = settings.edit_buf.clone();
                             actions.extend(finish_add(settings, config, keystore));
+                        }
+                    } else if settings.mode == SettingsMode::Editing && settings.edit_step == 1 {
+                        let url = settings.edit_buf.clone();
+                        settings.new_url = url.clone();
+                        let api_key = if settings.new_key.is_empty() {
+                            settings
+                                .endpoints
+                                .get(settings.editing_idx.unwrap_or(0))
+                                .and_then(|ep| ep.api_key.as_deref())
+                        } else {
+                            Some(settings.new_key.as_str())
+                        };
+                        settings.edit_step = 2;
+                        let hint = settings.new_model.as_str();
+                        match crate::llm::probe_server(&url, hint, api_key).await {
+                            Some(probe) => {
+                                let model_id = probe.model_id.clone();
+                                settings.new_model = model_id.clone();
+                                settings.edit_buf = model_id.clone();
+                                settings.edit_cursor = settings.edit_buf.len();
+                                actions.push(SettingsAction::Trace(format!(
+                                    "   ↳ detected: {} ({} tokens)",
+                                    model_id, probe.context_tokens
+                                )));
+                            }
+                            None => {
+                                settings.edit_buf = settings.new_model.clone();
+                                settings.edit_cursor = settings.edit_buf.len();
+                                actions.push(SettingsAction::Trace(
+                                    "   ↳ could not probe /v1/models — edit model manually".into(),
+                                ));
+                            }
                         }
                     } else if settings.edit_step < 3 {
                         settings.advance_edit_field();
@@ -757,36 +813,43 @@ async fn switch_to_endpoint(
         ep.label, ep.base_url
     )));
 
-    let budget = match crate::llm::probe_context_size(&ep.base_url, &ep.model, ep.api_key.as_deref())
-        .await
+    let mut active = ep.clone();
+    let budget = match crate::llm::probe_server(&ep.base_url, &ep.model, ep.api_key.as_deref()).await
     {
-        Some(n_ctx) => {
+        Some(probe) => {
+            active.model = probe.model_id.clone();
+            if probe.model_id != ep.model {
+                actions.push(SettingsAction::Trace(format!(
+                    "   ↳ model: {} (configured: {})",
+                    probe.model_id, ep.model
+                )));
+            }
             actions.push(SettingsAction::Trace(format!(
                 "   ↳ context: {} tokens (probed)",
-                n_ctx
+                probe.context_tokens
             )));
-            ContextBudget::from_context_tokens(n_ctx, config.max_rounds)
+            ContextBudget::from_context_tokens(probe.context_tokens, config.max_rounds)
         }
         None => {
             actions.push(SettingsAction::Trace(
-                "   ↳ context probe failed, using default 8192".into(),
+                "   ↳ probe failed, using default 8192".into(),
             ));
             ContextBudget::default_fallback()
         }
     };
 
     if let Ok(mut ag) = agent.try_lock() {
-        ag.switch_endpoint(ep, budget.clone());
+        ag.switch_endpoint(&active, budget.clone());
     }
 
     actions.push(SettingsAction::DisplayUpdate {
-        model: ep.model.clone(),
+        model: active.model.clone(),
         budget: budget.clone(),
     });
     actions.push(SettingsAction::ActiveIdx(idx));
     actions.push(SettingsAction::Notify(format!(
         "Switched to: {} ({})",
-        ep.label, ep.model
+        ep.label, active.model
     )));
     actions
 }
