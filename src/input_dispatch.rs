@@ -397,6 +397,7 @@ mod tests {
             max_rounds: 10,
             prebuilt_session: None,
             context_budget: ContextBudget::from_context_tokens(8192, 10),
+            tool_backend: crate::tools::ToolBackend::default(),
         };
         let agent = Arc::new(Mutex::new(Agent::new(config.clone())));
         let ks_path = std::env::temp_dir().join(format!(

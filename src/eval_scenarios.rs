@@ -108,6 +108,19 @@ pub fn list_scenario_files() -> std::io::Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn is_replay_scenario(path: &Path) -> bool {
+    let Ok(data) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(raw) = serde_json::from_str::<serde_json::Value>(&data) else {
+        return false;
+    };
+    matches!(
+        raw.get("type").and_then(|v| v.as_str()),
+        Some("probe") | Some("context_budget")
+    )
+}
+
 fn load_scenario(path: &Path) -> Result<Scenario, String> {
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("read {}: {}", path.display(), e))?;
@@ -125,6 +138,9 @@ pub fn run_all_scenarios() -> Vec<(String, String)> {
 
     let mut failures = vec![];
     for path in files {
+        if !is_replay_scenario(&path) {
+            continue;
+        }
         let scenario = match load_scenario(&path) {
             Ok(s) => s,
             Err(e) => {

@@ -1,0 +1,11 @@
+{
+  "name": "smoke_ping",
+  "type": "smoke",
+  "description": "Minimal live LLM check — no tools required",
+  "prompt": "Reply with exactly one line: SMOKE_OK (nothing else).",
+  "mock_tools": {},
+  "expect": {
+    "stdout_contains": ["SMOKE_OK"],
+    "max_tool_rounds": 0
+  }
+}

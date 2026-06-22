@@ -184,9 +184,15 @@ impl Agent {
                     continue;
                 }
 
-                let output = tools::execute(tool_name, raw_args, &self.config.workspace, self.config.context_budget.read_line_limit)
-                    .await
-                    .unwrap_or_else(|e| format!("X Tool execution error: {}", e));
+                let output = tools::execute(
+                    &self.config.tool_backend,
+                    tool_name,
+                    raw_args,
+                    &self.config.workspace,
+                    self.config.context_budget.read_line_limit,
+                )
+                .await
+                .unwrap_or_else(|e| format!("X Tool execution error: {}", e));
 
                 actions.push(ActionRecord {
                     tool: tool_name.clone(),
@@ -271,9 +277,15 @@ impl Agent {
                 continue;
             }
 
-            let output = tools::execute(&tool_name, &raw_args, &self.config.workspace, self.config.context_budget.read_line_limit)
-                .await
-                .unwrap_or_else(|e| format!("❌ Tool error: {}", e));
+            let output = tools::execute(
+                &self.config.tool_backend,
+                &tool_name,
+                &raw_args,
+                &self.config.workspace,
+                self.config.context_budget.read_line_limit,
+            )
+            .await
+            .unwrap_or_else(|e| format!("❌ Tool error: {}", e));
 
             records.push(ActionRecord {
                 tool: tool_name.clone(),

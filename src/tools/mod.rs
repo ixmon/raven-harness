@@ -13,9 +13,13 @@ pub use self::exec::exec;
 pub use self::fs::{read_file, write_file, patch_file, grep_files, list_dir};
 pub use self::web::{web_search, browse};
 
+pub mod backend;
+
 mod exec;
 mod fs;
 mod web;
+
+pub use backend::ToolBackend;
 
 /// Safely truncate a string to at most `max_bytes` bytes without splitting
 /// a multi-byte UTF-8 codepoint.
@@ -227,86 +231,16 @@ pub fn all_tools() -> Vec<ToolDef> {
 
 /// Execute a tool call (name + JSON arguments string) and return the result as a string
 /// that will be fed back to the model as a `tool` message.
-pub async fn execute(name: &str, arguments: &str, workspace: &std::path::Path, max_read_lines: usize) -> Result<String> {
-    // Arguments come as a JSON string from the model (may contain escaped stuff).
-    let args: serde_json::Value = match serde_json::from_str(arguments) {
-        Ok(v) => v,
-        Err(_) => {
-            // Try to fix common issues (unquoted keys etc.) — very defensive
-            let fixed = arguments
-                .replace("\\$", "$");
-            serde_json::from_str(&fixed).unwrap_or(json!({}))
-        }
-    };
-
-    match name {
-        "exec" => {
-            let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(exec(cmd, workspace).await)
-        }
-        "read" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let lines = args.get("lines").and_then(|v| v.as_str());
-            Ok(read_file(path, lines, workspace, max_read_lines))
-        }
-        "write" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(write_file(path, content, workspace))
-        }
-        "patch" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let search = args.get("search").and_then(|v| v.as_str()).unwrap_or("");
-            let replace = args.get("replace").and_then(|v| v.as_str()).unwrap_or("");
-            let near_line = args.get("near_line").and_then(|v| v.as_i64());
-            Ok(patch_file(path, search, replace, near_line, workspace))
-        }
-        "grep" => {
-            let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-            let path = args.get("path").and_then(|v| v.as_str());
-            Ok(grep_files(pattern, path, workspace))
-        }
-        "list" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
-            Ok(list_dir(path, workspace))
-        }
-        "web_search" => {
-            let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
-            // Must run blocking reqwest on a separate thread to avoid "Cannot drop a runtime
-            // in a context where blocking is not allowed" when the blocking Client is dropped
-            // from inside a tokio worker thread.
-            let res = tokio::task::spawn_blocking(move || web_search(&query, count))
-                .await
-                .unwrap_or_else(|e| format!("web_search join error: {}", e));
-            Ok(res)
-        }
-        "browse" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let extract = args.get("extract").and_then(|v| v.as_str()).unwrap_or("text");
-            Ok(browse(url, depth, extract).await)
-        }
-        // These are handled specially by the Agent (they mutate session meta or the file summary cache).
-        // We still return a friendly ack here so the tool result path stays uniform.
-        "update_goal" => {
-            let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Ok(format!("✅ Goal update requested: {}", safe_truncate(&goal, 80)))
-        }
-        "record_discovery" => {
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            Ok(format!("✅ Discovery recorded: {}", safe_truncate(&text, 80)))
-        }
-        "read_summary" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(format!("✅ read_summary requested for {}", path))
-        }
-        "store_summary" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(format!("✅ store_summary requested for {}", path))
-        }
-        other => Ok(format!("❌ Unknown tool: {}", other)),
-    }
+pub async fn execute(
+    backend: &ToolBackend,
+    name: &str,
+    arguments: &str,
+    workspace: &std::path::Path,
+    max_read_lines: usize,
+) -> Result<String> {
+    backend
+        .execute(name, arguments, workspace, max_read_lines)
+        .await
 }
 
 #[cfg(test)]

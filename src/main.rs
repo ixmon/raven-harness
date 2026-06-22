@@ -12,6 +12,7 @@ mod config;
 mod desktop;
 #[cfg(test)]
 mod eval_scenarios;
+mod eval_smoke;
 mod input_dispatch;
 mod key_edit;
 mod keystore;
@@ -77,10 +78,39 @@ async fn main() -> Result<()> {
         eprintln!("raven: terminal color depth detected as {:?} (RGB will be downsampled)", color_depth);
     }
 
-    let workspace = args
-        .workspace
-        .unwrap_or_else(|| std::env::current_dir().expect("cannot get current dir"));
+    let eval_mode = eval_smoke::eval_enabled();
+    let smoke_scenario = if eval_mode {
+        let name = eval_smoke::scenario_name();
+        Some(eval_smoke::load_smoke_scenario(&name)?)
+    } else {
+        None
+    };
+
+    let workspace = if eval_mode {
+        eval_smoke::resolve_eval_workspace()?
+    } else {
+        args.workspace
+            .unwrap_or_else(|| std::env::current_dir().expect("cannot get current dir"))
+    };
     std::fs::create_dir_all(&workspace)?;
+
+    let tool_backend = if let Some(ref scenario) = smoke_scenario {
+        tools::ToolBackend::Mock(eval_smoke::mock_backend_for(scenario))
+    } else {
+        tools::ToolBackend::Real
+    };
+
+    let prompt = args
+        .prompt
+        .clone()
+        .or_else(|| smoke_scenario.as_ref().map(|s| s.prompt.clone()));
+    let is_interactive_tui = prompt.is_none();
+
+    if eval_mode && is_interactive_tui {
+        anyhow::bail!(
+            "RAVEN_EVAL=1 requires --prompt or a smoke scenario with a prompt (set RAVEN_EVAL_SCENARIO)"
+        );
+    }
 
     // Resolve API key: --api-key > LLM_API_KEY > OPENROUTER_API_KEY
     let mut api_key = args
@@ -92,9 +122,27 @@ async fn main() -> Result<()> {
     // safe discovery, and a compact injection block for the model.
     let mut sess = session::Session::init(&workspace)?;
 
+    if eval_mode {
+        eprintln!(
+            "eval: scenario={} workspace={} mock_tools={}",
+            smoke_scenario
+                .as_ref()
+                .map(|s| s.name.as_str())
+                .unwrap_or("?"),
+            workspace.display(),
+            matches!(tool_backend, tools::ToolBackend::Mock(_))
+        );
+        if std::env::var("RAVEN_EVAL_APPROVAL")
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("thunderdome"))
+        {
+            sess.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
+            sess.save_meta()?;
+        }
+    }
+
     // For interactive use we offer the Cursor-style trust prompt.
     // This decides whether we do deep (but safe) indexing of the tree.
-    let is_interactive_tui = args.prompt.is_none();
     if is_interactive_tui {
         // ensure_repo_cache will prompt if not yet trusted
         let _ = session::ensure_repo_cache(&mut sess);
@@ -207,7 +255,7 @@ async fn main() -> Result<()> {
         args.max_rounds,
     );
 
-    if let Some(prompt) = args.prompt {
+    if let Some(prompt) = prompt {
         // Non-interactive single shot — still benefits from session (meta is updated on disk)
         // Set the request on the bootstrapped sess before moving it into config.
         let _ = sess.set_last_user_request(&prompt);
@@ -221,9 +269,14 @@ async fn main() -> Result<()> {
             max_rounds: args.max_rounds,
             prebuilt_session: Some(sess),
             context_budget: context_budget.clone(),
+            tool_backend,
         };
         let mut app = agent::Agent::new(c);
         let result = app.run_turn(&prompt).await?;
+        if let Some(ref scenario) = smoke_scenario {
+            eval_smoke::assert_smoke_result(scenario, &result)?;
+            eprintln!("eval: PASS {:?}", scenario.name);
+        }
         println!("{}", result.final_text);
         if !result.actions.is_empty() {
             println!("\n[actions]");
@@ -245,6 +298,7 @@ async fn main() -> Result<()> {
         max_rounds: args.max_rounds,
         prebuilt_session: Some(sess),
         context_budget,
+        tool_backend,
     };
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.

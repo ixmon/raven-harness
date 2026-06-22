@@ -1,0 +1,19 @@
+{
+  "name": "smoke_list_fixture",
+  "type": "smoke",
+  "description": "Agent uses mock list+read tools against a scripted fixture",
+  "prompt": "Use the list tool on the workspace root, then read README.md. In one sentence, say what this project is.",
+  "mock_tools": {
+    "list": {
+      ".": "README.md\n"
+    },
+    "read": {
+      "README.md": "# Eval Fixture\nA tiny mock project for harness smoke tests.\n"
+    }
+  },
+  "expect": {
+    "stdout_contains": ["fixture", "mock"],
+    "max_tool_rounds": 5,
+    "tools_used": ["list", "read"]
+  }
+}

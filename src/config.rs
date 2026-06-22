@@ -80,6 +80,8 @@ pub struct Config {
     pub prebuilt_session: Option<crate::session::Session>,
     /// Computed context budget — derived from server probe, CLI override, or default.
     pub context_budget: ContextBudget,
+    /// Real tools vs scripted eval mocks (`RAVEN_EVAL=1`).
+    pub tool_backend: crate::tools::ToolBackend,
 }
 
 impl Config {
