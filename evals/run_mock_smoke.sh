@@ -26,7 +26,7 @@ for SCENARIO in "${SCENARIOS[@]}"; do
   echo "--- scenario: $SCENARIO ---"
   export RAVEN_EVAL_SCENARIO="$SCENARIO"
   export RAVEN_EVAL_WORKSPACE="$(mktemp -d "${TMPDIR:-/tmp}/raven-mock-eval.XXXXXX")"
-  cargo run --release --quiet
+  cargo run --release --quiet --bin raven-tui
   rm -rf "$RAVEN_EVAL_WORKSPACE"
 done
 

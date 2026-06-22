@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Raven harness eval operator — entry point (menus + optional AI Shell).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+exec cargo run --quiet --bin raven-eval -- "$@"

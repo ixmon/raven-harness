@@ -1,0 +1,22 @@
+{
+  "run_id": "20260622T204605Z",
+  "profile": "quick",
+  "started_at": "2026-06-22T20:46:05.775271225Z",
+  "finished_at": "2026-06-22T20:46:22.060354390Z",
+  "passed": true,
+  "results": [
+    {
+      "id": "replay",
+      "passed": true,
+      "duration_ms": 5814,
+      "message": "run_replay.sh (exit 0)"
+    },
+    {
+      "id": "mock_smoke_all",
+      "passed": true,
+      "duration_ms": 10470,
+      "message": "run_mock_smoke.sh (exit 0)"
+    }
+  ],
+  "log_dir": "/home/darkstar/cursor/raven-hotel/tui/evals/results/20260622T204605Z"
+}

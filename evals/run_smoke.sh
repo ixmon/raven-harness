@@ -32,7 +32,7 @@ if [[ -z "${RAVEN_EVAL_WORKSPACE:-}" ]]; then
   trap 'rm -rf "$RAVEN_EVAL_WORKSPACE"' EXIT
 fi
 
-cargo run --release --quiet -- \
+cargo run --release --quiet --bin raven-tui -- \
   --base-url "$BASE_URL" \
   --temperature 0 \
   ${LLM_MODEL:+--model "$LLM_MODEL"}
