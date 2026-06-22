@@ -38,6 +38,11 @@ pub struct ActionRecord {
     #[allow(dead_code)]
     pub args: String,
     pub summary: String,
+    /// Sanitized + truncated payload fed back to the model.
+    pub output_to_model: String,
+    #[allow(dead_code)]
+    pub raw_bytes: usize,
+    pub truncated: bool,
 }
 
 #[derive(Debug)]
@@ -108,6 +113,21 @@ impl Agent {
         truncate_for_context(s, self.config.context_budget.tool_result_bytes)
     }
 
+    fn record_tool_action(&self, tool: &str, args: &str, raw_output: &str) -> ActionRecord {
+        let sanitized = crate::sanitize::tool_output(raw_output);
+        let budget = self.config.context_budget.tool_result_bytes;
+        let truncated = sanitized.len() > budget;
+        let to_model = self.truncate_for_context(&sanitized);
+        ActionRecord {
+            tool: tool.to_string(),
+            args: args.to_string(),
+            summary: to_model.lines().next().unwrap_or("").to_string(),
+            output_to_model: to_model,
+            raw_bytes: raw_output.len(),
+            truncated,
+        }
+    }
+
     /// High level entry: give the agent a user goal and let it run until it stops using tools.
     pub async fn run_turn(&mut self, user_input: &str) -> Result<TurnResult> {
         self.on_new_user_input(user_input);
@@ -170,14 +190,12 @@ impl Agent {
 
                 // Intercept session meta + summary cache tools
                 if let Some(ack) = self.handle_session_tool(tool_name, raw_args).await {
-                    actions.push(ActionRecord {
-                        tool: tool_name.clone(),
-                        args: raw_args.clone(),
-                        summary: ack.lines().next().unwrap_or(&ack).to_string(),
-                    });
+                    let rec = self.record_tool_action(tool_name, raw_args, &ack);
+                    let to_model = rec.output_to_model.clone();
+                    actions.push(rec);
                     self.conversation.push(Message {
                         role: "tool".into(),
-                        content: Some(self.truncate_for_context(&ack)),
+                        content: Some(to_model),
                         tool_calls: None,
                         tool_call_id: Some(tc.id.clone()),
                     });
@@ -194,15 +212,13 @@ impl Agent {
                 .await
                 .unwrap_or_else(|e| format!("X Tool execution error: {}", e));
 
-                actions.push(ActionRecord {
-                    tool: tool_name.clone(),
-                    args: raw_args.clone(),
-                    summary: output.lines().next().unwrap_or(&output).to_string(),
-                });
+                let rec = self.record_tool_action(tool_name, raw_args, &output);
+                let to_model = rec.output_to_model.clone();
+                actions.push(rec);
 
                 self.conversation.push(Message {
                     role: "tool".into(),
-                    content: Some(self.truncate_for_context(&output)),
+                    content: Some(to_model),
                     tool_calls: None,
                     tool_call_id: Some(tc.id.clone()),
                 });
@@ -263,14 +279,12 @@ impl Agent {
 
             // Intercept session tools (goal, discovery, summaries)
             if let Some(ack) = self.handle_session_tool(&tool_name, &raw_args).await {
-                records.push(ActionRecord {
-                    tool: tool_name,
-                    args: raw_args,
-                    summary: ack.lines().next().unwrap_or("").to_string(),
-                });
+                let rec = self.record_tool_action(&tool_name, &raw_args, &ack);
+                let to_model = rec.output_to_model.clone();
+                records.push(rec);
                 self.conversation.push(Message {
                     role: "tool".into(),
-                    content: Some(self.truncate_for_context(&ack)),
+                    content: Some(to_model),
                     tool_calls: None,
                     tool_call_id: Some(tc.id.clone()),
                 });
@@ -287,11 +301,9 @@ impl Agent {
             .await
             .unwrap_or_else(|e| format!("❌ Tool error: {}", e));
 
-            records.push(ActionRecord {
-                tool: tool_name.clone(),
-                args: raw_args.clone(),
-                summary: output.lines().next().unwrap_or("").to_string(),
-            });
+            let rec = self.record_tool_action(&tool_name, &raw_args, &output);
+            let to_model = rec.output_to_model.clone();
+            records.push(rec);
 
             self.conversation.push(Message {
                 role: "assistant".into(),
@@ -302,7 +314,7 @@ impl Agent {
 
             self.conversation.push(Message {
                 role: "tool".into(),
-                content: Some(self.truncate_for_context(&output)),
+                content: Some(to_model),
                 tool_calls: None,
                 tool_call_id: Some(tc.id.clone()),
             });
@@ -797,14 +809,17 @@ mod integration_tests {
     use crate::config::{ContextBudget, ContextSource};
     use crate::llm::ChatResponse;
     use crate::tools::backend::{MockToolBackend, ToolBackend};
-    use std::path::PathBuf;
-
     fn mock_eval_config() -> Config {
+        let workspace = std::env::temp_dir().join(format!(
+            "raven_agent_integ_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&workspace);
         Config {
             base_url: "http://mock.local/v1".into(),
             model: "mock-model".into(),
             api_key: None,
-            workspace: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("evals/fixtures/empty"),
+            workspace,
             temperature: 0.0,
             max_tokens: 512,
             max_rounds: 5,

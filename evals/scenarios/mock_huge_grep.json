@@ -1,0 +1,29 @@
+{
+  "name": "mock_huge_grep",
+  "type": "smoke",
+  "description": "Oversized grep output is truncated before returning to the model",
+  "prompt": "Grep for ERROR in logs and say how many matches you saw.",
+  "context_tokens": 2048,
+  "max_rounds": 4,
+  "mock_tools": {
+    "grep": {
+      "ERROR": "@file:evals/fixtures/huge_grep_output.txt"
+    }
+  },
+  "llm_turns": [
+    {
+      "tool_calls": [
+        { "name": "grep", "arguments": { "pattern": "ERROR" } }
+      ]
+    },
+    {
+      "content": "Grep returned many ERROR lines (output was truncated for context)."
+    }
+  ],
+  "expect": {
+    "stdout_contains": ["truncat"],
+    "max_tool_rounds": 2,
+    "tools_used": ["grep"],
+    "any_action_truncated": true
+  }
+}

@@ -22,6 +22,17 @@ pub struct MockToolBackend {
     responses: HashMap<String, HashMap<String, String>>,
 }
 
+fn resolve_mock_value(s: &str) -> String {
+    const PREFIX: &str = "@file:";
+    if let Some(rel) = s.strip_prefix(PREFIX) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel);
+        return std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            format!("[eval mock] could not read fixture {}: {e}", path.display())
+        });
+    }
+    s.to_string()
+}
+
 impl MockToolBackend {
     pub fn from_json(tools: &Value) -> Self {
         let mut responses = HashMap::new();
@@ -33,11 +44,11 @@ impl MockToolBackend {
             if let Some(e) = entries.as_object() {
                 for (k, v) in e {
                     if let Some(s) = v.as_str() {
-                        map.insert(k.clone(), s.to_string());
+                        map.insert(k.clone(), resolve_mock_value(s));
                     }
                 }
             } else if let Some(s) = entries.as_str() {
-                map.insert("default".into(), s.to_string());
+                map.insert("default".into(), resolve_mock_value(s));
             }
             responses.insert(tool.clone(), map);
         }

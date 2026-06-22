@@ -1,0 +1,44 @@
+{
+  "name": "mock_churn_then_answer",
+  "type": "smoke",
+  "description": "Agent retries wrong reads then succeeds — churn / recovery path",
+  "prompt": "Find the server port in config.toml and report it.",
+  "max_rounds": 8,
+  "mock_tools": {
+    "read": {
+      "missing.txt": "Error: file not found: missing.txt\n",
+      "config.toml": "[server]\nport = 8080\nmode = eval\n"
+    }
+  },
+  "llm_turns": [
+    {
+      "tool_calls": [
+        { "name": "read", "arguments": { "path": "missing.txt" } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "name": "read", "arguments": { "path": "missing.txt" } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "name": "read", "arguments": { "path": "missing.txt" } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "name": "read", "arguments": { "path": "config.toml" } }
+      ]
+    },
+    {
+      "content": "The server port in config.toml is 8080."
+    }
+  ],
+  "expect": {
+    "stdout_contains": ["8080"],
+    "min_tool_calls": 4,
+    "max_tool_rounds": 6,
+    "tools_used": ["read"]
+  }
+}

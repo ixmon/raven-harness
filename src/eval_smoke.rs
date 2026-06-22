@@ -7,6 +7,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::agent::TurnResult;
+use crate::session::Session;
 use crate::chat_backend::{mock_tool_call, MockChatBackend};
 use crate::llm::ChatResponse;
 use crate::tools::backend::MockToolBackend;
@@ -33,7 +34,15 @@ pub struct SmokeExpect {
     #[serde(default)]
     pub max_tool_rounds: Option<u32>,
     #[serde(default)]
+    pub min_tool_calls: Option<u32>,
+    #[serde(default)]
     pub tools_used: Vec<String>,
+    #[serde(default)]
+    pub any_action_truncated: Option<bool>,
+    #[serde(default)]
+    pub output_must_not_contain: Vec<String>,
+    #[serde(default)]
+    pub log_must_not_contain: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,8 +56,37 @@ pub struct SmokeScenario {
     pub mock_tools: Value,
     #[serde(default)]
     pub llm_turns: Vec<MockLlmTurn>,
+    /// Override context window for budget-sensitive scenarios.
+    #[serde(default)]
+    pub context_tokens: Option<u32>,
+    #[serde(default)]
+    pub max_rounds: Option<u32>,
     #[serde(default)]
     pub expect: SmokeExpect,
+}
+
+/// Offline smoke scenarios that ship scripted `llm_turns`.
+#[allow(dead_code)]
+pub fn list_offline_smoke_scenarios() -> Result<Vec<String>> {
+    let mut names = vec![];
+    for path in std::fs::read_dir(scenarios_dir())? {
+        let path = path?.path();
+        if path.extension().is_some_and(|x| x == "json") {
+            let data = std::fs::read_to_string(&path)?;
+            let raw: Value = serde_json::from_str(&data)?;
+            if raw.get("type").and_then(|v| v.as_str()) == Some("smoke")
+                && raw.get("llm_turns")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|a| !a.is_empty())
+            {
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    names.push(stem.to_string());
+                }
+            }
+        }
+    }
+    names.sort();
+    Ok(names)
 }
 
 pub fn mock_llm_enabled() -> bool {
@@ -164,6 +202,18 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult) -> Res
         }
     }
 
+    if let Some(min) = scenario.expect.min_tool_calls {
+        let tool_calls = result.actions.len() as u32;
+        if tool_calls < min {
+            bail!(
+                "smoke {:?}: used {} tool calls, min {}",
+                scenario.name,
+                tool_calls,
+                min
+            );
+        }
+    }
+
     if !scenario.expect.tools_used.is_empty() {
         let used: Vec<&str> = result.actions.iter().map(|a| a.tool.as_str()).collect();
         for want in &scenario.expect.tools_used {
@@ -178,6 +228,49 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult) -> Res
         }
     }
 
+    if let Some(want_truncated) = scenario.expect.any_action_truncated {
+        let any = result.actions.iter().any(|a| a.truncated);
+        if any != want_truncated {
+            bail!(
+                "smoke {:?}: any_action_truncated got {}, want {}",
+                scenario.name,
+                any,
+                want_truncated
+            );
+        }
+    }
+
+    for needle in &scenario.expect.output_must_not_contain {
+        for action in &result.actions {
+            if action.output_to_model.contains(needle) {
+                bail!(
+                    "smoke {:?}: tool output to model contains forbidden {:?}",
+                    scenario.name,
+                    needle
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn assert_smoke_session_log(scenario: &SmokeScenario, workspace: &Path) -> Result<()> {
+    if scenario.expect.log_must_not_contain.is_empty() {
+        return Ok(());
+    }
+    let session = Session::init(workspace)?;
+    let log = std::fs::read_to_string(&session.log_path)
+        .with_context(|| format!("read {}", session.log_path.display()))?;
+    for needle in &scenario.expect.log_must_not_contain {
+        if log.contains(needle) {
+            bail!(
+                "smoke {:?}: full_log.jsonl contains forbidden {:?}",
+                scenario.name,
+                needle
+            );
+        }
+    }
     Ok(())
 }
 
@@ -197,6 +290,19 @@ mod tests {
         let s = load_smoke_scenario("mock_tool_loop").expect("load");
         assert_eq!(s.llm_turns.len(), 2);
         assert_eq!(s.llm_turns[0].tool_calls[0].name, "list");
+    }
+
+    #[test]
+    fn list_offline_smoke_includes_new_scenarios() {
+        let names = list_offline_smoke_scenarios().expect("list");
+        for want in [
+            "mock_tool_loop",
+            "mock_churn_then_answer",
+            "mock_huge_grep",
+            "mock_secrets_in_read",
+        ] {
+            assert!(names.iter().any(|n| n == want), "missing {want}");
+        }
     }
 
     #[test]

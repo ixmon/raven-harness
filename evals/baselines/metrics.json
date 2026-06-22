@@ -17,6 +17,18 @@
     "mock_tool_loop": {
       "tool_calls": 1,
       "max_tool_rounds": 2
+    },
+    "mock_churn_then_answer": {
+      "tool_calls": 4,
+      "max_tool_rounds": 6
+    },
+    "mock_huge_grep": {
+      "tool_calls": 1,
+      "max_tool_rounds": 2
+    },
+    "mock_secrets_in_read": {
+      "tool_calls": 1,
+      "max_tool_rounds": 2
     }
   }
 }

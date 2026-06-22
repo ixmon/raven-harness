@@ -12,9 +12,10 @@ mod config;
 mod desktop;
 #[cfg(test)]
 mod eval_scenarios;
+mod chat_backend;
 mod eval_metrics;
 mod eval_smoke;
-mod chat_backend;
+mod sanitize;
 mod input_dispatch;
 mod key_edit;
 mod keystore;
@@ -221,11 +222,17 @@ async fn main() -> Result<()> {
     }
 
     let use_mock_llm = eval_mode && eval_smoke::mock_llm_enabled();
+    let max_rounds = smoke_scenario
+        .as_ref()
+        .and_then(|s| s.max_rounds)
+        .unwrap_or(args.max_rounds);
+    let scenario_n_ctx = smoke_scenario.as_ref().and_then(|s| s.context_tokens);
 
     // === Context budget: probe the active endpoint (after launch override) ===
     let context_budget = if use_mock_llm {
-        eprintln!("eval: mock LLM — skipping server probe");
-        config::ContextBudget::from_context_tokens(8192, args.max_rounds)
+        let n_ctx = scenario_n_ctx.unwrap_or(8192);
+        eprintln!("eval: mock LLM — skipping server probe (n_ctx={n_ctx})");
+        config::ContextBudget::from_context_tokens(n_ctx, max_rounds)
     } else if let Some(n_ctx) = args.context_size {
         let mut b = config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds);
         b.source = config::ContextSource::CliOverride;
@@ -259,7 +266,7 @@ async fn main() -> Result<()> {
         context_budget.source,
         context_budget.tool_result_bytes,
         context_budget.read_line_limit,
-        args.max_rounds,
+        max_rounds,
     );
 
     if let Some(prompt) = prompt {
@@ -273,7 +280,7 @@ async fn main() -> Result<()> {
             workspace: workspace.clone(),
             temperature: args.temperature,
             max_tokens: args.max_tokens,
-            max_rounds: args.max_rounds,
+            max_rounds,
             prebuilt_session: Some(sess),
             context_budget: context_budget.clone(),
             tool_backend,
@@ -290,6 +297,7 @@ async fn main() -> Result<()> {
         let result = app.run_turn(&prompt).await?;
         if let Some(ref scenario) = smoke_scenario {
             eval_smoke::assert_smoke_result(scenario, &result)?;
+            eval_smoke::assert_smoke_session_log(scenario, &workspace)?;
             eval_metrics::assert_smoke_metrics(scenario, &result)?;
             eprintln!("eval: PASS {:?}", scenario.name);
         }
