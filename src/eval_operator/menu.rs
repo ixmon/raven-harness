@@ -1,6 +1,6 @@
 //! Interactive numbered menu for `raven-eval`.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::io::{self, Write};
 
 use super::ai_shell::{explain_last_run, run_repl};
@@ -31,6 +31,7 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
         } else {
             println!("  8) AI Shell                  [unavailable — no LLM]");
         }
+        println!("  9) SWE-bench smoke  verify-grade trio (~2m, needs uv)");
         println!("  q) Quit");
         println!();
         print!("Choice [1]: ");
@@ -90,11 +91,25 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
                 }
                 run_repl(llm, runner)?;
             }
+            "9" => run_swebench_smoke()?,
             "q" | "Q" => break,
             _ => println!("Unknown choice: {choice}"),
         }
     }
     save_state(&state)?;
+    Ok(())
+}
+
+fn run_swebench_smoke() -> Result<()> {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/swebench/run_smoke.sh");
+    println!("Running SWE-bench Lite dev smoke (verify-grade)…");
+    let status = std::process::Command::new("bash")
+        .arg(&script)
+        .status()
+        .with_context(|| format!("run {}", script.display()))?;
+    if !status.success() {
+        anyhow::bail!("SWE-bench smoke failed (exit {:?})", status.code());
+    }
     Ok(())
 }
 

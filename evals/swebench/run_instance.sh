@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# Run one SWE-bench Lite dev instance: materialize repo → Raven → grade.
+#
+# Usage:
+#   ./run_instance.sh <instance_id>              # full run
+#   ./run_instance.sh <instance_id> --verify-grade   # grade gold patch (pipeline check)
+#   ./run_instance.sh <instance_id> --skip-raven     # materialize only
+#   ./run_instance.sh <instance_id> --skip-grade     # Raven only, capture diff
+#
+# Env:
+#   LLM_BASE_URL, LLM_MODEL     — local OpenAI-compatible server
+#   RAVEN_MAX_ROUNDS (30)       — tool loop budget
+#   RAVEN_APPROVAL=thunderdome  — auto-approve writes/exec (default here)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TUI_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+VENV="$SCRIPT_DIR/.venv"
+
+INSTANCE_ID="${1:?usage: run_instance.sh <instance_id> [--verify-grade|--skip-raven|--skip-grade]}"
+shift || true
+
+VERIFY_GRADE=0
+SKIP_RAVEN=0
+SKIP_GRADE=0
+for arg in "$@"; do
+  case "$arg" in
+    --verify-grade) VERIFY_GRADE=1 ;;
+    --skip-raven) SKIP_RAVEN=1 ;;
+    --skip-grade) SKIP_GRADE=1 ;;
+    *) echo "unknown flag: $arg" >&2; exit 2 ;;
+  esac
+done
+
+INSTANCE_JSON="$SCRIPT_DIR/instances/${INSTANCE_ID}.json"
+RESULT_DIR="$SCRIPT_DIR/results/${INSTANCE_ID}"
+CACHE_DIR="$SCRIPT_DIR/cache/${INSTANCE_ID}"
+REPO_DIR="$CACHE_DIR/repo"
+
+ensure_tooling() {
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    echo "==> creating swebench venv"
+    python3 -m venv "$VENV"
+    "$VENV/bin/pip" install -q -r "$SCRIPT_DIR/requirements.txt"
+  fi
+  if [[ ! -f "$INSTANCE_JSON" ]]; then
+    echo "==> exporting instance metadata"
+    "$VENV/bin/python" "$SCRIPT_DIR/export_instances.py"
+  fi
+}
+
+materialize_repo() {
+  local repo base_commit
+  repo="$("$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['repo'])")"
+  base_commit="$("$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['base_commit'])")"
+
+  mkdir -p "$CACHE_DIR"
+  if [[ ! -d "$REPO_DIR/.git" ]]; then
+    echo "==> cloning https://github.com/${repo}.git"
+    git clone --filter=blob:none "https://github.com/${repo}.git" "$REPO_DIR"
+  fi
+
+  echo "==> checkout ${base_commit:0:12}"
+  git -C "$REPO_DIR" fetch origin --quiet || true
+  git -C "$REPO_DIR" reset --hard "$base_commit"
+  git -C "$REPO_DIR" clean -fdx
+}
+
+copy_session_log() {
+  local workspace_abs log_src
+  workspace_abs="$(cd "$REPO_DIR" && pwd)"
+  log_src="$(
+    find "${HOME}/.raven-hotel/sessions" -name 'full_log.jsonl' 2>/dev/null \
+      | while read -r f; do
+          if grep -Fq "\"workspace\": \"${workspace_abs}\"" "$(dirname "$f")/meta.json" 2>/dev/null; then
+            echo "$f"
+            break
+          fi
+        done
+  )"
+  if [[ -n "${log_src:-}" && -f "$log_src" ]]; then
+    cp "$log_src" "$RESULT_DIR/raven_log.jsonl"
+  fi
+}
+
+run_raven() {
+  local prompt
+  prompt="$("$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['problem_statement'])")"
+
+  mkdir -p "$RESULT_DIR"
+  echo "==> running Raven (max_rounds=${RAVEN_MAX_ROUNDS:-30})"
+  (
+    cd "$TUI_ROOT"
+    export RAVEN_APPROVAL="${RAVEN_APPROVAL:-thunderdome}"
+    cargo run --release --quiet --bin raven-tui -- \
+      --workspace "$REPO_DIR" \
+      --prompt "$prompt" \
+      --max-rounds "${RAVEN_MAX_ROUNDS:-30}" \
+      --temperature "${RAVEN_TEMPERATURE:-0}" \
+      --base-url "${LLM_BASE_URL:-http://127.0.0.1:8080/v1}" \
+      ${LLM_MODEL:+--model "$LLM_MODEL"} \
+      >"$RESULT_DIR/raven.stdout" 2>"$RESULT_DIR/raven.stderr"
+  )
+  copy_session_log
+}
+
+capture_model_patch() {
+  mkdir -p "$RESULT_DIR"
+  git -C "$REPO_DIR" diff >"$RESULT_DIR/model_patch.diff"
+  if [[ ! -s "$RESULT_DIR/model_patch.diff" ]]; then
+    echo "warning: model produced empty diff" >&2
+  fi
+}
+
+write_report_stub() {
+  "$VENV/bin/python" - "$RESULT_DIR/report.json" "$INSTANCE_ID" <<'PY'
+import json, sys
+out, iid = sys.argv[1], sys.argv[2]
+json.dump({
+    "instance_id": iid,
+    "skipped_grade": True,
+    "note": "grade skipped (--skip-grade or --skip-raven without verify-grade)",
+}, open(out, "w"), indent=2)
+PY
+}
+
+grade_patch() {
+  local patch_file="$1"
+  mkdir -p "$RESULT_DIR"
+  echo "==> grading $(basename "$patch_file")"
+  "$VENV/bin/python" "$SCRIPT_DIR/grade_instance.py" "$INSTANCE_ID" \
+    --repo "$REPO_DIR" \
+    --patch "$patch_file" \
+    --out "$RESULT_DIR/report.json"
+}
+
+main() {
+  ensure_tooling
+  materialize_repo
+  mkdir -p "$RESULT_DIR"
+  cp "$INSTANCE_JSON" "$RESULT_DIR/instance.json"
+
+  if [[ "$VERIFY_GRADE" -eq 1 ]]; then
+    local gold="$RESULT_DIR/gold_patch.diff"
+    "$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['patch'])" >"$gold"
+    grade_patch "$gold"
+    echo "==> PASS: verify-grade $INSTANCE_ID"
+    return 0
+  fi
+
+  if [[ "$SKIP_RAVEN" -eq 0 ]]; then
+    run_raven
+    capture_model_patch
+  fi
+
+  if [[ "$SKIP_GRADE" -eq 1 ]]; then
+    write_report_stub
+    echo "==> DONE: $INSTANCE_ID (grade skipped)"
+    return 0
+  fi
+
+  if [[ "$SKIP_RAVEN" -eq 1 ]]; then
+    echo "error: --skip-raven requires --verify-grade or a model_patch.diff" >&2
+    exit 2
+  fi
+
+  grade_patch "$RESULT_DIR/model_patch.diff"
+  if "$VENV/bin/python" -c "import json,sys; r=json.load(open('$RESULT_DIR/report.json')); sys.exit(0 if r.get('resolved') else 1)"; then
+    echo "==> RESOLVED: $INSTANCE_ID"
+  else
+    echo "==> UNRESOLVED: $INSTANCE_ID (see $RESULT_DIR)"
+    exit 1
+  fi
+}
+
+main

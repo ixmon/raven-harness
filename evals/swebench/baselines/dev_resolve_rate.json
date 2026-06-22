@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "note": "Update after a full dev run. Never tune on SWE-bench Lite test (300).",
+  "model": null,
+  "harness_commit": null,
+  "dev_total": 23,
+  "smoke_trio": [
+    "marshmallow-code__marshmallow-1343",
+    "sqlfluff__sqlfluff-1625",
+    "pvlib__pvlib-python-1707"
+  ],
+  "resolved": {},
+  "smoke_resolved_rate": null
+}

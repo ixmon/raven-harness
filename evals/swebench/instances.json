@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "note": "Fixed SWE-bench Lite dev smoke trio — see export_instances.py to refresh from Hugging Face.",
+  "smoke_trio": [
+    "marshmallow-code__marshmallow-1343",
+    "sqlfluff__sqlfluff-1625",
+    "pvlib__pvlib-python-1707"
+  ]
+}

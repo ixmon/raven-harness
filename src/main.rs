@@ -135,13 +135,11 @@ async fn main() -> Result<()> {
             workspace.display(),
             matches!(tool_backend, tools::ToolBackend::Mock(_))
         );
-        if std::env::var("RAVEN_EVAL_APPROVAL")
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("thunderdome"))
-        {
-            sess.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
-            sess.save_meta()?;
-        }
+    }
+
+    if approval_env_thunderdome() {
+        sess.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
+        sess.save_meta()?;
     }
 
     // For interactive use we offer the Cursor-style trust prompt.
@@ -334,6 +332,17 @@ async fn main() -> Result<()> {
     // Trust prompt + any eprintln above already happened on the normal terminal.
     let chat_backend = chat_backend::ChatBackend::http(c.clone());
     tui_app::run(c, chat_backend, ks).await
+}
+
+/// Non-interactive evals (SWE-bench, harness smoke) auto-approve tool side effects.
+fn approval_env_thunderdome() -> bool {
+    ["RAVEN_APPROVAL", "RAVEN_EVAL_APPROVAL"]
+        .into_iter()
+        .any(|key| {
+            std::env::var(key)
+                .ok()
+                .is_some_and(|v| v.eq_ignore_ascii_case("thunderdome"))
+        })
 }
 
 /// Get home directory (simple fallback).
