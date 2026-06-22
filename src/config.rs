@@ -82,6 +82,8 @@ pub struct Config {
     pub context_budget: ContextBudget,
     /// Real tools vs scripted eval mocks (`RAVEN_EVAL=1`).
     pub tool_backend: crate::tools::ToolBackend,
+    /// When false, tool schemas are omitted from LLM requests (connectivity-only evals).
+    pub tools_enabled: bool,
 }
 
 impl Config {

@@ -135,12 +135,13 @@ impl Agent {
         let mut actions = vec![];
         let mut last_assistant_text = String::new();
         let tools_schema = tools::all_tools();
+        let tools_for_request = self.config.tools_enabled.then(|| tools_schema.clone());
 
         for round in 0..self.config.max_rounds.clamp(1, MAX_TOOL_ROUNDS) {
             let messages = self.build_messages_for_model();
             let req = ChatRequest {
                 messages,
-                tools: Some(tools_schema.clone()),
+                tools: tools_for_request.clone(),
                 temperature: self.config.temperature,
                 max_tokens: self.config.max_tokens,
                 stream: false,
@@ -835,6 +836,7 @@ mod integration_tests {
                     "list": { ".": "README.md\n" }
                 }),
             )),
+            tools_enabled: true,
         }
     }
 

@@ -61,6 +61,9 @@ pub struct SmokeScenario {
     pub context_tokens: Option<u32>,
     #[serde(default)]
     pub max_rounds: Option<u32>,
+    /// Omit tool schemas from the LLM request (e.g. smoke_ping connectivity check).
+    #[serde(default)]
+    pub disable_tools: bool,
     #[serde(default)]
     pub expect: SmokeExpect,
 }
@@ -182,10 +185,12 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult) -> Res
     let text = result.final_text.to_lowercase();
     for needle in &scenario.expect.stdout_contains {
         if !text.contains(&needle.to_lowercase()) {
+            let preview: String = result.final_text.chars().take(240).collect();
             bail!(
-                "smoke {:?}: stdout missing {:?}",
+                "smoke {:?}: stdout missing {:?}\n  got: {:?}",
                 scenario.name,
-                needle
+                needle,
+                preview
             );
         }
     }

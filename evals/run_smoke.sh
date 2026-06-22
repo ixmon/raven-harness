@@ -34,6 +34,7 @@ fi
 
 cargo run --release --quiet -- \
   --base-url "$BASE_URL" \
+  --temperature 0 \
   ${LLM_MODEL:+--model "$LLM_MODEL"}
 
 echo "==> PASS: harness smoke ($SCENARIO)"

@@ -273,6 +273,9 @@ async fn main() -> Result<()> {
         // Non-interactive single shot — still benefits from session (meta is updated on disk)
         // Set the request on the bootstrapped sess before moving it into config.
         let _ = sess.set_last_user_request(&prompt);
+        let tools_enabled = !smoke_scenario
+            .as_ref()
+            .is_some_and(|s| s.disable_tools);
         let c = config::Config {
             base_url,
             model,
@@ -284,6 +287,7 @@ async fn main() -> Result<()> {
             prebuilt_session: Some(sess),
             context_budget: context_budget.clone(),
             tool_backend,
+            tools_enabled,
         };
         let chat_backend = if use_mock_llm {
             let scenario = smoke_scenario
@@ -323,6 +327,7 @@ async fn main() -> Result<()> {
         prebuilt_session: Some(sess),
         context_budget,
         tool_backend,
+        tools_enabled: true,
     };
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.
