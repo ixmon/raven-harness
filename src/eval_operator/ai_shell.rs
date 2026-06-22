@@ -59,21 +59,42 @@ pub fn explain_deterministic(run: &RunSummary) -> String {
     out
 }
 
+fn read_failure_excerpt(log_dir: &std::path::Path, id: &str, max_chars: usize) -> Option<String> {
+    for name in [
+        format!("{id}.err.log"),
+        format!("{id}.test_output.log"),
+        format!("{id}.report.json"),
+    ] {
+        let path = log_dir.join(&name);
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if !data.trim().is_empty() {
+                return Some(tail_chars(&data, max_chars));
+            }
+        }
+    }
+    None
+}
+
+fn tail_chars(data: &str, max_chars: usize) -> String {
+    data.chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
 fn failure_log_excerpt(run: &RunSummary, max_chars: usize) -> String {
     let mut buf = String::new();
     for r in &run.results {
         if r.passed {
             continue;
         }
-        let err_path = run.log_dir.join(format!("{}.err.log", r.id));
-        if let Ok(data) = std::fs::read_to_string(&err_path) {
+        if let Some(data) = read_failure_excerpt(&run.log_dir, &r.id, max_chars) {
             buf.push_str(&format!("--- {} ---\n", r.id));
-            let tail: String = data.chars().rev().take(max_chars).collect::<String>()
-                .chars()
-                .rev()
-                .collect();
-            buf.push_str(&tail);
-            if !tail.ends_with('\n') {
+            buf.push_str(&data);
+            if !data.ends_with('\n') {
                 buf.push('\n');
             }
         }

@@ -1,6 +1,6 @@
 //! Interactive numbered menu for `raven-eval`.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::io::{self, Write};
 
 use super::ai_shell::{explain_last_run, run_repl};
@@ -91,25 +91,15 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
                 }
                 run_repl(llm, runner)?;
             }
-            "9" => run_swebench_smoke()?,
+            "9" => {
+                let s = runner.run_profile("swebench-smoke", &mut state)?;
+                print_summary(&s);
+            }
             "q" | "Q" => break,
             _ => println!("Unknown choice: {choice}"),
         }
     }
     save_state(&state)?;
-    Ok(())
-}
-
-fn run_swebench_smoke() -> Result<()> {
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/swebench/run_smoke.sh");
-    println!("Running SWE-bench Lite dev smoke (verify-grade)…");
-    let status = std::process::Command::new("bash")
-        .arg(&script)
-        .status()
-        .with_context(|| format!("run {}", script.display()))?;
-    if !status.success() {
-        anyhow::bail!("SWE-bench smoke failed (exit {:?})", status.code());
-    }
     Ok(())
 }
 

@@ -7,6 +7,7 @@ pub mod probe;
 pub mod registry;
 pub mod runner;
 pub mod state;
+pub mod swebench;
 
 pub use registry::load_registry;
 pub use runner::Runner;

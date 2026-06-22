@@ -15,7 +15,7 @@ use raven_tui::eval_operator::{
     about = "Raven harness eval operator — deterministic menus, optional local LLM"
 )]
 struct Args {
-    /// Non-interactive profile: quick | local | full
+    /// Non-interactive profile: quick | local | full | swebench-smoke
     #[arg(long)]
     profile: Option<String>,
 
@@ -74,7 +74,7 @@ fn main() -> Result<()> {
 
     if let Some(profile) = args.profile {
         if profile_ids(&profile).is_err() {
-            anyhow::bail!("unknown profile {profile:?} (use quick, local, or full)");
+            anyhow::bail!("unknown profile {profile:?} (use quick, local, full, or swebench-smoke)");
         }
         let mut state = load_state()?;
         let summary = runner.run_profile(&profile, &mut state)?;

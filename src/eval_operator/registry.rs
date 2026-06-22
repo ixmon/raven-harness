@@ -59,6 +59,13 @@ pub fn load_registry() -> Result<Registry> {
             needs_llm: false,
             offline: true,
         },
+        TestEntry {
+            id: "swebench-smoke".into(),
+            tier: TestTier::Replay,
+            description: "SWE-bench Lite dev smoke trio (verify-grade; needs uv)".into(),
+            needs_llm: false,
+            offline: true,
+        },
     ];
 
     let mut scenarios = vec![];
@@ -184,7 +191,8 @@ pub fn profile_ids(profile: &str) -> Result<Vec<String>> {
             }
             ids
         }
-        other => anyhow::bail!("unknown profile {other:?}"),
+        "swebench-smoke" => super::swebench::smoke_trio_ids(&manifest_dir())?,
+        other => anyhow::bail!("unknown profile {other:?} (use quick, local, full, or swebench-smoke)"),
     };
     Ok(ids)
 }
@@ -199,5 +207,11 @@ mod tests {
         assert!(!reg.fixed.is_empty());
         assert!(reg.scenarios.iter().any(|s| s.id == "smoke_ping"));
         assert!(reg.scenarios.iter().any(|s| s.id == "mock_tool_loop"));
+    }
+
+    #[test]
+    fn swebench_smoke_profile_has_trio() {
+        let ids = profile_ids("swebench-smoke").expect("profile");
+        assert_eq!(ids.len(), 3);
     }
 }

@@ -112,6 +112,8 @@ impl Runner {
             self.run_script("run_mock_smoke.sh", &log_path)?
         } else if id == "unit_tests" {
             self.run_cargo_test(&log_path)?
+        } else if super::swebench::is_instance_id(&self.manifest_dir, id) {
+            self.run_swebench_instance(id, log_dir, &log_path)?
         } else if let Some(entry) = super::registry::find_entry(&reg, id) {
             match entry.tier {
                 TestTier::Replay => {
@@ -174,6 +176,39 @@ impl Runner {
             &output.stderr,
         );
         Ok((output.status, format!("mock:{id}")))
+    }
+
+    fn run_swebench_instance(
+        &self,
+        id: &str,
+        log_dir: &Path,
+        log_path: &PathBuf,
+    ) -> Result<(std::process::ExitStatus, String)> {
+        let script = self.evals_dir().join("swebench/run_instance.sh");
+        let mode = super::swebench::smoke_mode();
+        let mut cmd = Command::new("bash");
+        cmd.arg(&script).arg(id);
+        if mode == "verify-grade" {
+            cmd.arg("--verify-grade");
+        } else if mode != "full" {
+            anyhow::bail!("unknown SWEBENCH_SMOKE_MODE {mode:?} (use verify-grade or full)");
+        }
+        cmd.current_dir(&self.manifest_dir);
+
+        let output = cmd
+            .output()
+            .with_context(|| format!("run {}", script.display()))?;
+        std::fs::write(log_path, &output.stdout)?;
+        let err_path = log_path.with_extension("err.log");
+        std::fs::write(&err_path, &output.stderr)?;
+
+        if !output.status.success() {
+            let _ = super::swebench::copy_failure_artifacts(&self.manifest_dir, id, log_dir);
+        }
+
+        let message = super::swebench::format_instance_message(&self.manifest_dir, id, &mode)
+            .unwrap_or_else(|e| format!("swebench:{mode} (report unreadable: {e})"));
+        Ok((output.status, message))
     }
 
     fn run_live_scenario(&self, id: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
