@@ -10,6 +10,7 @@ use std::path::PathBuf;
 mod agent;
 mod config;
 mod desktop;
+#[cfg(test)]
 mod eval_scenarios;
 mod input_dispatch;
 mod key_edit;

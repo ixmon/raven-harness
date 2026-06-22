@@ -400,7 +400,7 @@ pub struct ServerProbeResult {
     pub matched_by: ProbeMatch,
 }
 
-fn model_aliases<'a>(m: &'a serde_json::Value) -> Vec<&'a str> {
+fn model_aliases(m: &serde_json::Value) -> Vec<&str> {
     m.get("aliases")
         .and_then(|v| v.as_array())
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
