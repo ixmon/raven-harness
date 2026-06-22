@@ -12,7 +12,9 @@ mod config;
 mod desktop;
 #[cfg(test)]
 mod eval_scenarios;
+mod eval_metrics;
 mod eval_smoke;
+mod chat_backend;
 mod input_dispatch;
 mod key_edit;
 mod keystore;
@@ -218,8 +220,13 @@ async fn main() -> Result<()> {
         }
     }
 
+    let use_mock_llm = eval_mode && eval_smoke::mock_llm_enabled();
+
     // === Context budget: probe the active endpoint (after launch override) ===
-    let context_budget = if let Some(n_ctx) = args.context_size {
+    let context_budget = if use_mock_llm {
+        eprintln!("eval: mock LLM — skipping server probe");
+        config::ContextBudget::from_context_tokens(8192, args.max_rounds)
+    } else if let Some(n_ctx) = args.context_size {
         let mut b = config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds);
         b.source = config::ContextSource::CliOverride;
         b
@@ -271,10 +278,19 @@ async fn main() -> Result<()> {
             context_budget: context_budget.clone(),
             tool_backend,
         };
-        let mut app = agent::Agent::new(c);
+        let chat_backend = if use_mock_llm {
+            let scenario = smoke_scenario
+                .as_ref()
+                .expect("RAVEN_EVAL_MOCK_LLM requires a smoke scenario");
+            chat_backend::ChatBackend::Mock(eval_smoke::mock_chat_backend_for(scenario))
+        } else {
+            chat_backend::ChatBackend::http(c.clone())
+        };
+        let mut app = agent::Agent::new(c, chat_backend);
         let result = app.run_turn(&prompt).await?;
         if let Some(ref scenario) = smoke_scenario {
             eval_smoke::assert_smoke_result(scenario, &result)?;
+            eval_metrics::assert_smoke_metrics(scenario, &result)?;
             eprintln!("eval: PASS {:?}", scenario.name);
         }
         println!("{}", result.final_text);
@@ -303,7 +319,8 @@ async fn main() -> Result<()> {
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.
     // Trust prompt + any eprintln above already happened on the normal terminal.
-    tui_app::run(c, ks).await
+    let chat_backend = chat_backend::ChatBackend::http(c.clone());
+    tui_app::run(c, chat_backend, ks).await
 }
 
 /// Get home directory (simple fallback).

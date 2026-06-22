@@ -6,6 +6,8 @@ echo "==> build"
 cargo build --no-default-features
 echo "==> unit + replay tests"
 cargo test --no-default-features
+echo "==> mock smoke (offline)"
+./evals/run_mock_smoke.sh
 echo "==> clippy"
 cargo clippy --no-default-features -- -D warnings
 echo "==> PASS: ci + replay"

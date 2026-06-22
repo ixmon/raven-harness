@@ -38,3 +38,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --no-default-features -- -D warnings
+
+      - name: Harness mock smoke (offline agent loop)
+        run: ./evals/run_mock_smoke.sh

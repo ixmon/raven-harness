@@ -12,5 +12,11 @@
       "tool_result_bytes": 13762,
       "read_line_limit": 305
     }
+  },
+  "smoke": {
+    "mock_tool_loop": {
+      "tool_calls": 1,
+      "max_tool_rounds": 2
+    }
   }
 }

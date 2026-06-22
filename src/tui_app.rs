@@ -788,6 +788,7 @@ impl App {
 
 pub async fn run(
     config: Config,
+    chat_backend: crate::chat_backend::ChatBackend,
     keystore: crate::keystore::Keystore,
 ) -> Result<()> {
     // Setup terminal cleanly.
@@ -810,7 +811,7 @@ pub async fn run(
     // One extra clear via the terminal API (belt + suspenders)
     terminal.clear()?;
 
-    let res = run_app(&mut terminal, config, keystore).await;
+    let res = run_app(&mut terminal, config, chat_backend, keystore).await;
 
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
@@ -831,12 +832,16 @@ pub async fn run(
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     config: Config,
+    chat_backend: crate::chat_backend::ChatBackend,
     mut keystore: crate::keystore::Keystore,
 ) -> Result<()> {
     // Wrap agent in Arc<Mutex> so it persists across spawned turn tasks.
     // Previously each turn moved the agent into the task and recreated a blank
     // one afterward, losing all conversation history.
-    let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(config.clone())));
+    let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(
+        config.clone(),
+        chat_backend,
+    )));
 
     let mut app = App::new(&config);
 

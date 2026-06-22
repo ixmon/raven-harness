@@ -1,0 +1,29 @@
+{
+  "name": "mock_tool_loop",
+  "type": "smoke",
+  "description": "Fully offline agent loop: mock LLM calls list, mock tools return fixture",
+  "prompt": "List the workspace root and summarize what this project is.",
+  "mock_tools": {
+    "list": {
+      ".": "README.md\n"
+    },
+    "read": {
+      "README.md": "# Eval Fixture\nA tiny mock project for harness integration tests.\n"
+    }
+  },
+  "llm_turns": [
+    {
+      "tool_calls": [
+        { "name": "list", "arguments": { "path": "." } }
+      ]
+    },
+    {
+      "content": "This is a mock eval fixture project used for harness integration tests."
+    }
+  ],
+  "expect": {
+    "stdout_contains": ["fixture", "mock"],
+    "max_tool_rounds": 2,
+    "tools_used": ["list"]
+  }
+}

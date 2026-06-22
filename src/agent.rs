@@ -6,7 +6,8 @@
 use anyhow::Result;
 
 use crate::config::Config;
-use crate::llm::{ChatRequest, LlmClient, Message, StreamChunk, ToolCall};
+use crate::chat_backend::ChatBackend;
+use crate::llm::{ChatRequest, Message, StreamChunk, ToolCall};
 use crate::tools;
 use serde_json::json;
 use std::path::Path;
@@ -48,7 +49,7 @@ pub struct TurnResult {
 }
 
 pub struct Agent {
-    client: LlmClient,
+    client: ChatBackend,
     config: Config,
     /// Clean conversation turns only (user / assistant / tool). The rich session
     /// context (repo tree, goal, pitfalls, recent summary) is injected fresh on
@@ -61,8 +62,7 @@ pub struct Agent {
 }
 
 impl Agent {
-    pub fn new(mut config: Config) -> Self {
-        let client = LlmClient::new(config.clone());
+    pub fn new(mut config: Config, client: ChatBackend) -> Self {
         // Use prebuilt session from main (if provided) so that trust prompt + repo
         // cache bootstrap performed before launching the TUI / --prompt is connected.
         // Falls back to a fresh init (loads from disk meta.json / context.db).
@@ -700,7 +700,7 @@ impl Agent {
         self.config.model = endpoint.model.clone();
         self.config.api_key = endpoint.api_key.clone();
         self.config.context_budget = budget;
-        self.client = LlmClient::new(self.config.clone());
+        self.client.reset_http(self.config.clone());
     }
 
     /// Read-only access to the current config (for UI to display active endpoint).
@@ -787,5 +787,67 @@ fn truncate_for_context(s: &str, limit: usize) -> String {
         s.to_string()
     } else {
         format!("{}...\n... ({} bytes total, truncated for context)", tools::safe_truncate(s, limit), s.len())
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::chat_backend::{mock_tool_call, ChatBackend};
+    use crate::config::{ContextBudget, ContextSource};
+    use crate::llm::ChatResponse;
+    use crate::tools::backend::{MockToolBackend, ToolBackend};
+    use std::path::PathBuf;
+
+    fn mock_eval_config() -> Config {
+        Config {
+            base_url: "http://mock.local/v1".into(),
+            model: "mock-model".into(),
+            api_key: None,
+            workspace: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("evals/fixtures/empty"),
+            temperature: 0.0,
+            max_tokens: 512,
+            max_rounds: 5,
+            prebuilt_session: None,
+            context_budget: ContextBudget {
+                context_tokens: 8192,
+                tool_result_bytes: 4000,
+                read_line_limit: 80,
+                source: ContextSource::Default,
+            },
+            tool_backend: ToolBackend::Mock(MockToolBackend::from_json(
+                &serde_json::json!({
+                    "list": { ".": "README.md\n" }
+                }),
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_llm_and_tools_complete_run_turn() {
+        let chat = ChatBackend::Mock(crate::chat_backend::MockChatBackend::new(vec![
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![mock_tool_call("list", r#"{"path":"."}"#)],
+                finish_reason: None,
+                usage: None,
+            },
+            ChatResponse {
+                content: "Workspace contains README.md mock fixture.".into(),
+                tool_calls: vec![],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut agent = Agent::new(mock_eval_config(), chat);
+        let result = agent
+            .run_turn("List files and summarize.")
+            .await
+            .expect("run_turn");
+
+        assert!(result.final_text.contains("README"));
+        assert_eq!(result.actions.len(), 1);
+        assert_eq!(result.actions[0].tool, "list");
     }
 }

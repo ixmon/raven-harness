@@ -7,7 +7,24 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::agent::TurnResult;
+use crate::chat_backend::{mock_tool_call, MockChatBackend};
+use crate::llm::ChatResponse;
 use crate::tools::backend::MockToolBackend;
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MockLlmToolCall {
+    pub name: String,
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct MockLlmTurn {
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub tool_calls: Vec<MockLlmToolCall>,
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct SmokeExpect {
@@ -29,7 +46,15 @@ pub struct SmokeScenario {
     #[serde(default)]
     pub mock_tools: Value,
     #[serde(default)]
+    pub llm_turns: Vec<MockLlmTurn>,
+    #[serde(default)]
     pub expect: SmokeExpect,
+}
+
+pub fn mock_llm_enabled() -> bool {
+    std::env::var("RAVEN_EVAL_MOCK_LLM")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 pub fn eval_enabled() -> bool {
@@ -82,6 +107,39 @@ pub fn mock_backend_for(scenario: &SmokeScenario) -> MockToolBackend {
     MockToolBackend::from_json(&scenario.mock_tools)
 }
 
+pub fn mock_chat_backend_for(scenario: &SmokeScenario) -> MockChatBackend {
+    let turns: Vec<ChatResponse> = scenario
+        .llm_turns
+        .iter()
+        .map(|t| {
+            let tool_calls: Vec<_> = t
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let args = if tc.arguments.is_null() {
+                        "{}".to_string()
+                    } else {
+                        tc.arguments.to_string()
+                    };
+                    mock_tool_call(&tc.name, &args)
+                })
+                .collect();
+            let finish = if tool_calls.is_empty() {
+                Some("stop".into())
+            } else {
+                Some("tool_calls".into())
+            };
+            ChatResponse {
+                content: t.content.clone(),
+                tool_calls,
+                finish_reason: finish,
+                usage: None,
+            }
+        })
+        .collect();
+    MockChatBackend::new(turns)
+}
+
 pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult) -> Result<()> {
     let text = result.final_text.to_lowercase();
     for needle in &scenario.expect.stdout_contains {
@@ -132,6 +190,13 @@ mod tests {
         let s = load_smoke_scenario("smoke_ping").expect("load");
         assert_eq!(s.name, "smoke_ping");
         assert!(!s.prompt.is_empty());
+    }
+
+    #[test]
+    fn mock_tool_loop_has_llm_script() {
+        let s = load_smoke_scenario("mock_tool_loop").expect("load");
+        assert_eq!(s.llm_turns.len(), 2);
+        assert_eq!(s.llm_turns[0].tool_calls[0].name, "list");
     }
 
     #[test]
