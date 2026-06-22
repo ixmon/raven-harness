@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "note": "Harness replay baselines — update deliberately when behavior improves.",
+  "scenarios": {
+    "probe_single_model_fallback": {
+      "context_tokens": 65536,
+      "model_id": "qwen3-coder-next"
+    }
+  },
+  "context_budget": {
+    "n_ctx_65536_max_rounds_10": {
+      "tool_result_bytes": 13762,
+      "read_line_limit": 305
+    }
+  }
+}

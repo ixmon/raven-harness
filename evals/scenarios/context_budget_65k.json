@@ -1,0 +1,11 @@
+{
+  "name": "context_budget_65k",
+  "description": "Probed 65536 ctx with 10 rounds yields expected tool/read limits",
+  "type": "context_budget",
+  "n_ctx": 65536,
+  "max_rounds": 10,
+  "expect": {
+    "tool_result_bytes": 13762,
+    "read_line_limit": 305
+  }
+}

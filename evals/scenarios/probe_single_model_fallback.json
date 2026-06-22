@@ -1,0 +1,18 @@
+{
+  "name": "probe_single_model_fallback",
+  "description": "Stale CLI model name still resolves lone llama.cpp server model + n_ctx",
+  "type": "probe",
+  "body": {
+    "data": [{
+      "id": "qwen3-coder-next",
+      "aliases": ["qwen3-coder-next"],
+      "owned_by": "llamacpp",
+      "meta": { "n_ctx": 65536, "n_ctx_train": 262144 }
+    }]
+  },
+  "model_hint": "qwen2.5-coder",
+  "expect": {
+    "model_id": "qwen3-coder-next",
+    "context_tokens": 65536
+  }
+}

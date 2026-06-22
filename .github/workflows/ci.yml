@@ -33,7 +33,7 @@ jobs:
       - name: Build
         run: cargo build --no-default-features
 
-      - name: Test
+      - name: Test (unit + harness replay scenarios)
         run: cargo test --no-default-features
 
       - name: Clippy
