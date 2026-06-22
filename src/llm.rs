@@ -157,13 +157,12 @@ impl LlmClient {
             .unwrap_or_else(|_| json!({}));
 
         let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
-        let content = message
-            .get("content")
-            .and_then(|c| c.as_str())
-            .unwrap_or("")
-            .to_string();
+        let content = assistant_text_from_message(&message);
 
-        let tool_calls = parse_tool_calls(message.get("tool_calls"));
+        let mut tool_calls = parse_tool_calls(message.get("tool_calls"));
+        if tool_calls.is_empty() {
+            tool_calls = parse_xml_tool_calls_from_content(&content);
+        }
 
         let usage = data.get("usage").and_then(|u| {
             serde_json::from_value::<Usage>(u.clone()).ok()
@@ -343,6 +342,25 @@ impl LlmClient {
     }
 }
 
+/// Prefer `content`; fall back to `reasoning_content` (Qwen / llama.cpp thinking).
+fn assistant_text_from_message(message: &serde_json::Value) -> String {
+    let content = message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("")
+        .trim();
+    if !content.is_empty() {
+        return content.to_string();
+    }
+    message
+        .get("reasoning_content")
+        .and_then(|c| c.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 fn parse_tool_calls(value: Option<&serde_json::Value>) -> Vec<ToolCall> {
     let Some(arr) = value.and_then(|v| v.as_array()) else {
         return vec![];
@@ -378,6 +396,69 @@ fn parse_tool_calls(value: Option<&serde_json::Value>) -> Vec<ToolCall> {
         }
     }
     out
+}
+
+/// Qwen / some llama.cpp templates emit tool calls as XML in assistant text.
+fn parse_xml_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
+    if !content.contains("<function=") {
+        return vec![];
+    }
+
+    let blocks: Vec<&str> = if content.contains("<tool_call>") {
+        content
+            .split("<tool_call>")
+            .skip(1)
+            .filter_map(|s| s.split("</tool_call>").next())
+            .collect()
+    } else {
+        vec![content]
+    };
+
+    let mut out = vec![];
+    for (idx, block) in blocks.iter().enumerate() {
+        let Some(name) = xml_function_name(block) else {
+            continue;
+        };
+        let arguments = serde_json::to_string(&xml_parameters(block)).unwrap_or_else(|_| "{}".into());
+        out.push(ToolCall {
+            id: format!("xml-{name}-{idx}"),
+            r#type: "function".into(),
+            function: FunctionCall { name, arguments },
+        });
+    }
+    out
+}
+
+fn xml_function_name(block: &str) -> Option<String> {
+    let start = block.find("<function=")? + "<function=".len();
+    let rest = &block[start..];
+    let end = rest.find('>')?;
+    let name = rest[..end].trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+fn xml_parameters(block: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    let mut cursor = block;
+    while let Some(start) = cursor.find("<parameter=") {
+        let after_key = &cursor[start + "<parameter=".len()..];
+        let Some(key_end) = after_key.find('>') else {
+            break;
+        };
+        let key = after_key[..key_end].trim().to_string();
+        let value_block = &after_key[key_end + 1..];
+        let Some(value_end) = value_block.find("</parameter>") else {
+            break;
+        };
+        let value = value_block[..value_end].trim();
+        map.insert(key, serde_json::Value::String(value.to_string()));
+        cursor = &value_block[value_end..];
+    }
+    map
 }
 
 /// How a model id was chosen during `/v1/models` probing.
@@ -775,6 +856,48 @@ mod tests {
     #[test]
     fn parse_sse_done_sentinel() {
         assert_eq!(parse_sse_data_payload("[DONE]"), SseParseResult::Done);
+    }
+
+    #[test]
+    fn parse_xml_tool_calls_from_qwen_style_content() {
+        let content = r#"<tool_call>
+<function=list>
+<parameter=path>
+.
+</parameter>
+</function>
+</tool_call>
+<tool_call>
+<function=read_summary>
+<parameter=path>
+README.md
+</parameter>
+</function>
+</tool_call>"#;
+        let calls = parse_xml_tool_calls_from_content(content);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "list");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"."}"#);
+        assert_eq!(calls[1].function.name, "read_summary");
+        assert_eq!(calls[1].function.arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn assistant_text_prefers_content_over_reasoning() {
+        let msg = json!({
+            "content": "hello",
+            "reasoning_content": "thinking"
+        });
+        assert_eq!(assistant_text_from_message(&msg), "hello");
+    }
+
+    #[test]
+    fn assistant_text_falls_back_to_reasoning() {
+        let msg = json!({
+            "content": "",
+            "reasoning_content": "SMOKE_OK\n"
+        });
+        assert_eq!(assistant_text_from_message(&msg), "SMOKE_OK");
     }
 
     #[test]

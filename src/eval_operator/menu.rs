@@ -25,11 +25,10 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
         println!("  4) List tests       show registry");
         println!("  5) Re-run last      repeat last profile");
         println!("  6) View last results");
+        println!("  7) Explain last run (AI or summary)");
         if llm.reachable {
-            println!("  7) Explain last run (AI)");
             println!("  8) AI Shell         freeform questions");
         } else {
-            println!("  7) Explain last run (AI)     [unavailable — no LLM]");
             println!("  8) AI Shell                  [unavailable — no LLM]");
         }
         println!("  q) Quit");
@@ -57,7 +56,7 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
                 print_summary(&s);
             }
             "3" => {
-                let s = runner.run_profile("full", &mut state)?;
+                let s = runner.run_profile_filtered("full", llm, &mut state)?;
                 print_summary(&s);
                 if !llm.reachable {
                     println!("(live scenarios skipped — LLM unreachable)");
@@ -83,13 +82,7 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
                     println!("No runs yet.");
                 }
             }
-            "7" => {
-                if !llm.reachable {
-                    println!("LLM not reachable at {}", llm.base_url);
-                    continue;
-                }
-                explain_last_run(llm)?;
-            }
+            "7" => explain_last_run(llm)?,
             "8" => {
                 if !llm.reachable {
                     println!("LLM not reachable at {}", llm.base_url);

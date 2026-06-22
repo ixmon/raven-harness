@@ -37,6 +37,24 @@ impl Runner {
         self.run_ids(profile, &ids, state)
     }
 
+    pub fn run_profile_filtered(
+        &self,
+        profile: &str,
+        llm: &super::probe::LlmStatus,
+        state: &mut super::state::OperatorState,
+    ) -> Result<RunSummary> {
+        let mut ids = super::registry::profile_ids(profile)?;
+        if !llm.reachable {
+            let reg = super::registry::load_registry()?;
+            ids.retain(|id| {
+                super::registry::find_entry(&reg, id)
+                    .map(|e| !e.needs_llm)
+                    .unwrap_or(true)
+            });
+        }
+        self.run_ids(profile, &ids, state)
+    }
+
     pub fn run_ids(
         &self,
         profile: &str,
@@ -159,6 +177,12 @@ impl Runner {
     }
 
     fn run_live_scenario(&self, id: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+        let workspace = std::env::temp_dir().join(format!(
+            "raven-eval-live-{}-{id}",
+            std::process::id()
+        ));
+        let _ = std::fs::create_dir_all(&workspace);
+
         let output = Command::new("cargo")
             .args([
                 "run",
@@ -175,8 +199,10 @@ impl Runner {
             .current_dir(&self.manifest_dir)
             .env("RAVEN_EVAL", "1")
             .env("RAVEN_EVAL_SCENARIO", id)
+            .env("RAVEN_EVAL_WORKSPACE", &workspace)
             .output()
             .context("live scenario")?;
+        let _ = std::fs::remove_dir_all(&workspace);
         std::fs::write(log_path, &output.stdout)?;
         let _ = std::fs::write(
             log_path.with_extension("err.log"),

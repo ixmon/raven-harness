@@ -14,6 +14,7 @@ if [[ -n "${RAVEN_EVAL_SCENARIO:-}" ]]; then
   SCENARIOS=("$RAVEN_EVAL_SCENARIO")
 else
   SCENARIOS=(
+    smoke_list_fixture
     mock_tool_loop
     mock_churn_then_answer
     mock_huge_grep

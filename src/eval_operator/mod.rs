@@ -1,6 +1,7 @@
 //! Raven harness eval operator (`raven-eval` binary).
 
 pub mod ai_shell;
+pub mod llm_text;
 pub mod menu;
 pub mod probe;
 pub mod registry;

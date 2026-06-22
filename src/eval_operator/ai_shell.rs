@@ -6,27 +6,82 @@ use serde_json::json;
 use std::io::{self, Write};
 use std::time::Duration;
 
+use super::llm_text::extract_from_chat_response;
 use super::probe::LlmStatus;
 use super::registry::{load_registry, list_text};
 use super::runner::{Runner, print_summary};
-use super::state::{load_state, last_run, OperatorState};
+use super::state::{load_state, last_run, RunSummary, OperatorState};
 
 pub fn explain_last_run(llm: &LlmStatus) -> Result<()> {
-    if !llm.reachable {
-        anyhow::bail!("LLM not reachable — cannot explain last run");
-    }
     let state = load_state()?;
     let Some(run) = last_run(&state) else {
         println!("No previous run to explain.");
         return Ok(());
     };
-    let prompt = format!(
-        "Explain this harness eval run to the operator. Be concise and actionable.\n\n{}",
-        serde_json::to_string_pretty(run)?
-    );
-    let answer = ask_llm(llm, &prompt)?;
-    println!("\n{answer}\n");
+
+    if llm.reachable {
+        let prompt = format!(
+            "Explain this harness eval run to the operator. Be concise and actionable. \
+             Mention which scenarios failed and likely causes.\n\n{}\n\nFailure logs:\n{}",
+            serde_json::to_string_pretty(run)?,
+            failure_log_excerpt(run, 1200)
+        );
+        match ask_llm(llm, &prompt) {
+            Ok(answer) if !answer.trim().is_empty() && answer != "(empty response)" => {
+                println!("\n{answer}\n");
+                return Ok(());
+            }
+            Ok(_) => eprintln!("AI returned empty text — using deterministic summary."),
+            Err(e) => eprintln!("AI explain failed ({e}) — using deterministic summary."),
+        }
+    } else {
+        println!("LLM not reachable — deterministic summary:\n");
+    }
+
+    println!("{}", explain_deterministic(run));
     Ok(())
+}
+
+pub fn explain_deterministic(run: &RunSummary) -> String {
+    let mut out = format!(
+        "Run {} profile={} passed={}\n",
+        run.run_id, run.profile, run.passed
+    );
+    for r in &run.results {
+        let mark = if r.passed { "✓" } else { "✗" };
+        out.push_str(&format!("  {mark} {} — {}\n", r.id, r.message));
+    }
+    if !run.passed {
+        out.push_str("\nFailure details:\n");
+        out.push_str(&failure_log_excerpt(run, 2400));
+    }
+    out.push_str(&format!("\nLogs: {}\n", run.log_dir.display()));
+    out
+}
+
+fn failure_log_excerpt(run: &RunSummary, max_chars: usize) -> String {
+    let mut buf = String::new();
+    for r in &run.results {
+        if r.passed {
+            continue;
+        }
+        let err_path = run.log_dir.join(format!("{}.err.log", r.id));
+        if let Ok(data) = std::fs::read_to_string(&err_path) {
+            buf.push_str(&format!("--- {} ---\n", r.id));
+            let tail: String = data.chars().rev().take(max_chars).collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            buf.push_str(&tail);
+            if !tail.ends_with('\n') {
+                buf.push('\n');
+            }
+        }
+    }
+    if buf.is_empty() {
+        return "(no failure logs captured)".into();
+    }
+    buf
 }
 
 pub fn run_repl(llm: &LlmStatus, runner: &Runner) -> Result<()> {
@@ -226,12 +281,12 @@ fn ask_llm_with_context(llm: &LlmStatus, user: &str, context: &str) -> Result<St
         anyhow::bail!("LLM error {}: {}", resp.status(), resp.text().unwrap_or_default());
     }
     let data: serde_json::Value = resp.json()?;
-    let content = data
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("(empty response)")
-        .to_string();
-    Ok(content)
+    let content = extract_from_chat_response(&data);
+    if content.is_empty() {
+        Ok("(empty response)".into())
+    } else {
+        Ok(content)
+    }
 }
 
 fn detect_run_suggestion(answer: &str) -> Option<String> {

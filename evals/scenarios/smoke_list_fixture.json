@@ -11,6 +11,21 @@
       "README.md": "# Eval Fixture\nA tiny mock project for harness smoke tests.\n"
     }
   },
+  "llm_turns": [
+    {
+      "tool_calls": [
+        { "name": "list", "arguments": { "path": "." } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "name": "read", "arguments": { "path": "README.md" } }
+      ]
+    },
+    {
+      "content": "This is a tiny mock eval fixture project for harness smoke tests."
+    }
+  ],
   "expect": {
     "stdout_contains": ["fixture", "mock"],
     "max_tool_rounds": 5,
