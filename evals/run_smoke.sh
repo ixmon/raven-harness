@@ -32,9 +32,15 @@ if [[ -z "${RAVEN_EVAL_WORKSPACE:-}" ]]; then
   trap 'rm -rf "$RAVEN_EVAL_WORKSPACE"' EXIT
 fi
 
+# Write prompt to file + use --prompt-file for all test invocations (avoids quote issues)
+PROMPT_FILE="$(mktemp)"
+jq -r '.prompt' "evals/scenarios/$SCENARIO.json" > "$PROMPT_FILE"
+trap 'rm -f "$PROMPT_FILE"' EXIT
+
 cargo run --release --quiet --bin raven-tui -- \
   --base-url "$BASE_URL" \
   --temperature 0 \
+  --prompt-file "$PROMPT_FILE" \
   ${LLM_MODEL:+--model "$LLM_MODEL"}
 
 echo "==> PASS: harness smoke ($SCENARIO)"

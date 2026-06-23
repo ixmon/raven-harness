@@ -11,6 +11,9 @@
 #   LLM_BASE_URL, LLM_MODEL     — local OpenAI-compatible server
 #   RAVEN_MAX_ROUNDS (30)       — tool loop budget
 #   RAVEN_APPROVAL=thunderdome  — auto-approve writes/exec (default here)
+#
+# The script writes the problem_statement to a file and passes it via --prompt-file
+# to avoid all shell quoting/escaping issues with complex bug reports.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -115,19 +118,54 @@ extract_metrics() {
 }
 
 run_raven() {
-  local prompt started_ms ended_ms raven_exit
+  local started_ms ended_ms raven_exit
+  local prompt
   prompt="$("$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['problem_statement'])")"
 
   mkdir -p "$RESULT_DIR"
+  # Write prompt to file to avoid any shell quoting/escaping issues with large bug reports
+  printf '%s' "$prompt" > "$RESULT_DIR/prompt.txt"
   echo "==> running Raven (max_rounds=${RAVEN_MAX_ROUNDS:-30})"
   started_ms="$("$VENV/bin/python" -c 'import time; print(int(time.time()*1000))')"
+  # Prepare a project-specific venv so the agent sees a working `python` with the package installed.
+  # This lets exec("python ..."), pytest, imports etc. succeed inside the workspace.
+  PROJ_VENV="$CACHE_DIR/venv"
+  if [[ ! -x "$PROJ_VENV/bin/python" ]]; then
+    echo "==> creating project venv for agent execution"
+    python3 -m venv "$PROJ_VENV" -q 2>/dev/null || python3 -m venv "$PROJ_VENV" || true
+    if [[ -x "$PROJ_VENV/bin/python" ]]; then
+      "$PROJ_VENV/bin/pip" install -U pip setuptools wheel --quiet 2>/dev/null || true
+      (
+        cd "$REPO_DIR"
+        "$PROJ_VENV/bin/pip" install -e . --quiet 2>&1 | tail -3 || true
+        [[ -f requirements.txt ]] && "$PROJ_VENV/bin/pip" install -r requirements.txt --quiet 2>&1 | tail -2 || true
+        [[ -f requirements_dev.txt ]] && "$PROJ_VENV/bin/pip" install -r requirements_dev.txt --quiet 2>&1 | tail -2 || true
+        if [[ -f pyproject.toml ]]; then
+          "$PROJ_VENV/bin/pip" install -e ".[test,dev]" --quiet 2>/dev/null || \
+          "$PROJ_VENV/bin/pip" install -e ".[dev]" --quiet 2>/dev/null || true
+        fi
+      )
+    else
+      echo "warning: failed to create project venv, proceeding with system python"
+    fi
+  fi
+
   (
     cd "$TUI_ROOT"
     export RAVEN_APPROVAL="${RAVEN_APPROVAL:-thunderdome}"
     export RAVEN_METRICS_OUT="$RESULT_DIR/harness_turn.json"
-    cargo run --release --quiet --bin raven-tui -- \
+
+    # Ensure 'python' symlink if only python3 exists (some venvs)
+    if [[ -x "$PROJ_VENV/bin/python3" && ! -e "$PROJ_VENV/bin/python" ]]; then
+      ln -sf python3 "$PROJ_VENV/bin/python"
+    fi
+
+    # Explicit PATH for the cargo invocation so the raven-tui process (and its exec tool children)
+    # see the venv first. This should make bare `python` resolve to the project's venv python.
+    # (The venv from `python3 -m venv` always creates a `python` symlink to python3.)
+    PATH="$PROJ_VENV/bin:$PATH" cargo run --release --quiet --bin raven-tui -- \
       --workspace "$REPO_DIR" \
-      --prompt "$prompt" \
+      --prompt-file "$RESULT_DIR/prompt.txt" \
       --max-rounds "${RAVEN_MAX_ROUNDS:-30}" \
       --max-tokens "${RAVEN_MAX_TOKENS:-16384}" \
       --temperature "${RAVEN_TEMPERATURE:-0}" \

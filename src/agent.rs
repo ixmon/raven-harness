@@ -64,13 +64,29 @@ pub struct TurnResult {
     pub metrics: TurnMetrics,
 }
 
+/// Outcome from the inference-based judge used by the driver loop.
+/// The judge looks at the declared goal + achievement_tests + recent actions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TurnJudge {
+    /// The goal + success criteria appear to be satisfied.
+    Fulfilled { note: String },
+    /// Normal situation — continue working (nudging may still be appropriate).
+    Continue,
+    /// Detected unproductive looping / thrashing.
+    /// The agent should stop and ask the user for guidance.
+    Stuck {
+        reason: String,
+        suggested_guidance: String,
+    },
+}
+
 pub struct Agent {
     client: ChatBackend,
     config: Config,
     /// Clean conversation turns only (user / assistant / tool). The rich session
     /// context (repo tree, goal, pitfalls, recent summary) is injected fresh on
     /// every prompt construction so it stays current.
-    conversation: Vec<Message>,
+    pub(crate) conversation: Vec<Message>,
     /// Persistent session (goal tracking, repo cache, full log, meta.json under ~/.raven-hotel/)
     pub(crate) session: Option<crate::session::Session>,
     /// How many conversation messages have been written to full_log.jsonl.
@@ -412,8 +428,12 @@ impl Agent {
     // Session-aware helpers (new context management)
     // ─────────────────────────────────────────────────────────────────
 
-    pub fn on_new_user_input(&mut self, user_input: &str) {
-        // Record the request for the injection block
+    /// Record a user request for metadata (last_user_request, goal seeding) and
+    /// trace logging. Does *not* push into the conversation history. Used for the
+    /// initial top-level prompt so that the (potentially very long) raw task text
+    /// is not appended into chat turns — the system injection block already
+    /// includes it under "Latest User Request" on every model call.
+    pub fn record_user_request(&mut self, user_input: &str) {
         if let Some(s) = &mut self.session {
             let _ = s.set_last_user_request(user_input);
             // Seed an initial goal from the first real request if we don't have one yet
@@ -423,19 +443,8 @@ impl Agent {
             }
         }
 
-        if self.conversation.is_empty() {
-            // We no longer push a static system into conversation. The dynamic
-            // system (base + rich session block) is built on every prompt.
-        }
-
-        self.conversation.push(Message {
-            role: "user".into(),
-            content: Some(user_input.to_string()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-
-        // Log user message to persistent full_log so it survives restarts
+        // Log the request event to persistent full_log (for traces, evals, raven_log.jsonl)
+        // even though we don't put the full raw text into conversation turns.
         if let Some(s) = &self.session {
             let entry = serde_json::json!({
                 "ts": chrono::Utc::now().to_rfc3339(),
@@ -445,6 +454,19 @@ impl Agent {
             });
             let _ = s.append_log(&entry.to_string());
         }
+    }
+
+    pub fn on_new_user_input(&mut self, user_input: &str) {
+        // For follow-ups / interjects / interactive turns we record + append as a
+        // conversation user message so the model sees the new instruction in context.
+        self.record_user_request(user_input);
+
+        self.conversation.push(Message {
+            role: "user".into(),
+            content: Some(user_input.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
 
     /// Build the exact messages array we will send to the model this turn.
@@ -578,14 +600,18 @@ impl Agent {
                 let _ = s.append_log(&entry.to_string());
                 self.logged_message_count += 1;
             }
-            // Also refresh the rolling recent-turns summary occasionally
-            // (lightweight; the prune path does heavier compression).
-            if self.conversation.len().is_multiple_of(4) {
-                let last_few: Vec<_> = self.conversation.iter().rev().take(4).cloned().collect();
+            // Rolling recent-turns summary refresh. Don't do this too often: each
+            // call consumes one LLM round (and for mock backends, depletes the
+            // scripted response queue). The heavy prune_history at 48 messages
+            // handles full compression.
+            if self.conversation.len() >= 24
+                && self.conversation.len() % 12 == 0
+                && !matches!(self.client, ChatBackend::Mock(_))
+            {
+                let last_few: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
                 if !last_few.is_empty() {
                     let sm = self.summarize_messages(&last_few).await;
                     if let Some(s_mut) = &mut self.session {
-                        // merge conservatively
                         let prev = &s_mut.meta.recent_turns_summary;
                         let merged = if prev.is_empty() { sm } else { format!("{}\n{}", prev, sm) };
                         let trimmed = if merged.len() > SUMMARY_CHAR_LIMIT { tools::safe_truncate(&merged, SUMMARY_CHAR_LIMIT).to_string() + "..." } else { merged };
@@ -661,6 +687,108 @@ impl Agent {
     pub fn session_ref(&self) -> Option<&crate::session::Session> {
         self.session.as_ref()
     }
+
+    pub fn has_session(&self) -> bool {
+        self.session.is_some()
+    }
+
+    /// Uses a lightweight inference call to analyze the current state.
+    /// It decides:
+    /// - whether the request/goal has been fulfilled, or
+    /// - whether the model is looping unproductively and should ask the user for help.
+    ///
+    /// This replaces pure hardcoded nudge/continue counts with smarter judgment.
+    pub async fn judge_turn(&self, last_assistant_text: &str, recent_actions: &[ActionRecord]) -> TurnJudge {
+        let Some(s) = &self.session else {
+            return TurnJudge::Continue;
+        };
+        let m = &s.meta;
+
+        if m.current_goal.trim().is_empty() || m.current_goal.contains("not yet established") {
+            return TurnJudge::Continue;
+        }
+
+        // Build compact recent activity for loop detection
+        let activity: String = recent_actions
+            .iter()
+            .rev()
+            .take(6)
+            .map(|a| format!("• {} → {}", a.tool, a.summary))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut judge_prompt = format!(
+            "Current goal: {}\n\n",
+            m.current_goal
+        );
+
+        if !m.achievement_tests.is_empty() {
+            judge_prompt.push_str("Success criteria (only answer FULFILLED if these are clearly met):\n");
+            for test in &m.achievement_tests {
+                judge_prompt.push_str(&format!("- {}\n", test));
+            }
+            judge_prompt.push('\n');
+        }
+
+        // Explicitly include the original user request so the judge knows the full intent
+        if let Some(req) = &m.last_user_request {
+            judge_prompt.push_str(&format!("Original user request:\n{}\n\n", req));
+        }
+
+        if !activity.is_empty() {
+            judge_prompt.push_str("Recent actions (most recent last):\n");
+            judge_prompt.push_str(&activity);
+            judge_prompt.push_str("\n\n");
+        }
+
+        judge_prompt.push_str(&format!(
+            "Latest model output:\n{}\n\n\
+             CRITICAL RULES FOR DECISION:\n\
+             - Only answer FULFILLED if the actions provide clear evidence that the ENTIRE request was completed (not just the model's claim).\n\
+             - If the request asked to 'write AND run AND show output', there must be an 'exec' action with matching output in the recent actions.\n\
+             - A write alone is never enough for a 'run it' request.\n\
+             - For bug report / code fix requests (no explicit 'run' language): FULFILLED requires at least one successful `write` or `patch` action on a main source file in the library (e.g. under src/, the package dir), not merely on a temp diagnostic script the agent created. The edit must address the reported issue.\n\
+             - If the model is claiming success without evidence in actions, treat as not fulfilled.\n\n\
+             Reply with the first line being exactly one of:\n\
+             FULFILLED\n\
+             CONTINUE\n\
+             STUCK\n\
+             Then a short reason on the following line.\n\
+             If STUCK, also give a specific question the agent should ask the user for guidance.",
+            last_assistant_text.trim()
+        ));
+
+        let req = crate::llm::ChatRequest {
+            messages: vec![crate::llm::Message {
+                role: "user".into(),
+                content: Some(judge_prompt),
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: 0.0,
+            max_tokens: 48,
+            stream: false,
+        };
+
+        let response = match self.client.chat(req).await {
+            Ok(r) => r.content.trim().to_string(),
+            Err(_) => return TurnJudge::Continue,
+        };
+
+        let upper = response.to_uppercase();
+        if upper.contains("FULFILLED") {
+            TurnJudge::Fulfilled { note: response }
+        } else if upper.contains("STUCK") {
+            // crude extraction of reason + suggestion
+            let parts: Vec<&str> = response.lines().collect();
+            let reason = parts.get(1).unwrap_or(&"Repeating similar actions without progress").to_string();
+            let suggested = parts.get(2).unwrap_or(&"What additional information or direction do you have?").to_string();
+            TurnJudge::Stuck { reason, suggested_guidance: suggested.to_string() }
+        } else {
+            TurnJudge::Continue
+        }
+    }
 }
 
 fn message_byte_size(m: &Message) -> usize {
@@ -694,6 +822,12 @@ Workspace root: {}
 - `web_search` finds candidate pages. `browse` reads them. Use search → browse for research.
 - If a tool fails, report the exact error and adapt. Do not pretend it succeeded.
 
+## Bug fixes (SWE-bench style tasks)
+- User requests are often bug reports. Goal: locate the root cause then apply the minimal correct edit to the library source using `patch` (strongly preferred) or `write`.
+- After reading the buggy code and relevant tests, edit the actual source file under src/ (or equivalent package dir) rather than only writing separate diagnostic scripts.
+- Use `python3` explicitly for python commands when `python` is unavailable (common in minimal envs). Prefer `python3 -m pytest ...` or the project's documented test command for verification.
+- Exploratory scripts are allowed but must not prevent you from shipping the source fix.
+
 ## Available Tools
 exec, read, write, patch, grep, list, web_search, browse, update_goal, record_discovery, read_summary, store_summary
 
@@ -701,8 +835,9 @@ read_summary and store_summary manage the mtime-matched file summary cache (see 
 
 ## Output Style
 - Be concise but complete.
-- When you finish a meaningful chunk of work, give a short summary of changes + any commands the user should run next.
+- When you finish a meaningful chunk of work, give a short summary of what you did + the actual results (e.g. after running a script to show output, clearly state "The output is \"hello\"." or similar).
 - Use markdown for code or file paths when helpful.
+- Ignore any messages or notes that start with [JUDGE DEBUG] or [HIDDEN] or [DEBUG - these are internal harness diagnostics only.
 
 ## Context Management (important for local models)
 A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important files, current goal + achievement tests + pitfalls to avoid, key discoveries, and a summary of recent turns) is prepended to your system prompt on every turn. It comes from the persistent ~/.raven-hotel/ session for this workspace.

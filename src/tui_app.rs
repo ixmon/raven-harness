@@ -20,6 +20,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::agent::Agent;
+use crate::agent_driver::TurnObserver;
 use crate::config::Config;
 use crate::desktop::{load_raven_art, DesktopState, WorkspacePane};
 use crate::input_dispatch::{
@@ -27,7 +28,10 @@ use crate::input_dispatch::{
     SlashDispatch,
 };
 use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
-use crate::llm::{StreamChunk, ToolCall};
+use crate::llm::ToolCall;
+use crate::session::ExecApprovalMode;
+use async_trait::async_trait;
+use tokio::sync::oneshot;
 use crate::search::SearchState;
 use crate::settings_modal::{handle_settings_key, SettingsModal};
 
@@ -1150,7 +1154,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                           app.right_scroll = 10_000;
                         }
                         UiUpdate::ToolResult { name, summary } => {
-                          app.trace_lines.push(format!("   ↳ {} → {}", name, truncate(&summary, 120)));
+                          if name == "system" && summary.contains("JUDGE") {
+                              app.trace_lines.push(format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140)));
+                          } else {
+                              app.trace_lines.push(format!("   ↳ {} → {}", name, truncate(&summary, 120)));
+                          }
                           app.right_follow_output = true;
                           app.right_scroll = 10_000;
                         }
@@ -1562,12 +1570,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                            app.tool_calls_this_turn = 0;
                            app.turn_rounds = 0;
 
-                            // Spawn the agent turn — agent is behind Arc<Mutex> so it
-                            // persists across turns with full conversation history.
+                            // Spawn the agent turn — now using the unified drive_turn() via TuiObserver.
+                            // The observer delivers UI events and handles live approvals + interjects.
+                            // All nudges, auto-continue, finish_reason handling etc. come from one place.
                             let tx2 = tx.clone();
                             let agent_clone = agent.clone();
                             let prompt2 = prompt.clone();
-                            let max_rounds = config.max_rounds.min(12);
 
                             let approval_req_tx2 = approval_req_tx.clone();
                             let stop = stop_signal.clone();
@@ -1589,374 +1597,27 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     summary: format!("Turn started with exec mode: {:?}", mode),
                                 }).await;
 
-                                // Start the first streaming inference (adds user message to history)
-                                let first_stream = match agent.run_turn_streaming(&prompt2).await {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
-                                        return;
-                                    }
+                                let mut observer = TuiObserver {
+                                    tx: tx2.clone(),
+                                    approval_req_tx: approval_req_tx2,
+                                    stop,
+                                    queued,
+                                    instant,
+                                    denials_this_turn: 0,
+                                    halt_tools: false,
+                                    exec_mode: mode,
                                 };
 
-                                let mut current_stream = first_stream;
-                                let mut final_text = String::new();
-                                let max_auto_continues: u32 = 3;
-                                let max_text_nudges: u32 = 2;
-                                let mut denials_this_turn: u32 = 0;
-                                let mut text_nudges: u32 = 0;
-                                let mut tools_used_this_turn: usize = 0;
+                                let result = crate::agent_driver::drive_turn(&mut agent, &prompt2, &mut observer).await;
 
-                                // Outer loop: auto-continue when the model hits the round
-                                // limit but was still actively calling tools.
-                                'auto_continue: for continuation in 0..=max_auto_continues {
-                                    let mut completed_naturally = false;
-
-                                    // Inner loop: multi-round tool use within one budget.
-                                    for _round in 0..max_rounds {
-                                        let mut round_text = String::new();
-                                        let mut tool_calls = vec![];
-
-                                        // Consume the stream for this round
-                                        while let Some(chunk) = current_stream.recv().await {
-                                            // Check stop signal between chunks
-                                            if stop.load(Ordering::SeqCst) {
-                                                break;
-                                            }
-                                            match chunk {
-                                                StreamChunk::Token(t) => {
-                                                    round_text.push_str(&t);
-                                                    let _ = tx2.send(UiUpdate::Token(t)).await;
-                                                }
-                                                StreamChunk::Thinking(t) => {
-                                                    let _ = tx2.send(UiUpdate::Thinking(t)).await;
-                                                }
-                                                StreamChunk::Done { content, tool_calls: tcs, .. } => {
-                                                    if !content.is_empty() && round_text.is_empty() {
-                                                        round_text = content.clone();
-                                                        let _ = tx2.send(UiUpdate::Token(content)).await;
-                                                    }
-                                                    tool_calls = tcs;
-                                                }
-                                                StreamChunk::Error(e) => {
-                                                    let _ = tx2.send(UiUpdate::Error(e)).await;
-                                                    return;
-                                                }
-                                            }
-                                        }
-
-                                        match handle_stop_signal(
-                                            &stop,
-                                            &instant,
-                                            &mut agent,
-                                            &tx2,
-                                            &round_text,
-                                        )
-                                        .await
-                                        {
-                                            StopAction::RestartStream(s) => {
-                                                current_stream = s;
-                                                continue;
-                                            }
-                                            StopAction::Halt { partial } => {
-                                                let _ = tx2
-                                                    .send(UiUpdate::Done { final_text: partial })
-                                                    .await;
-                                                return;
-                                            }
-                                            StopAction::Abort => return,
-                                            StopAction::Continue => {}
-                                        }
-
-                                        // Record assistant text in the conversation history
-                                        if !round_text.trim().is_empty() {
-                                            agent.push_assistant_text(&round_text);
-                                            final_text = round_text.clone();
-                                        }
-
-                                        if let Some(s) = try_apply_queued_interject(
-                                            &queued,
-                                            &mut agent,
-                                            &tx2,
-                                            &mut tool_calls,
-                                        )
-                                        .await
-                                        {
-                                            current_stream = s;
-                                            continue;
-                                        }
-
-                                        // No tool calls → model stopped on its own.
-                                        // But if tools were used this turn and we have
-                                        // nudge budget, push it to keep working rather
-                                         // than narrating.
-                                        if tool_calls.is_empty() {
-                                            if tools_used_this_turn > 0 && text_nudges < max_text_nudges {
-                                                text_nudges += 1;
-                                                let _ = tx2.send(UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: format!("Nudging agent to continue (text-only pause {}/{})", text_nudges, max_text_nudges),
-                                                }).await;
-                                                // Push a continuation nudge as a user message
-                                                agent.push_continuation_nudge();
-                                                match agent.continue_turn_streaming().await {
-                                                    Ok(s) => { current_stream = s; continue; }
-                                                    Err(e) => {
-                                                        let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
-                                                        return;
-                                                    }
-                                                }
-                                            }
-                                            completed_naturally = true;
-                                            break;
-                                        }
-                                        tools_used_this_turn += tool_calls.len();
-
-                                        match handle_stop_signal(
-                                            &stop,
-                                            &instant,
-                                            &mut agent,
-                                            &tx2,
-                                            "",
-                                        )
-                                        .await
-                                        {
-                                            StopAction::RestartStream(s) => {
-                                                current_stream = s;
-                                                continue;
-                                            }
-                                            StopAction::Halt { .. } => {
-                                                let _ = tx2
-                                                    .send(UiUpdate::Done {
-                                                        final_text: final_text.clone(),
-                                                    })
-                                                    .await;
-                                                return;
-                                            }
-                                            StopAction::Abort => return,
-                                            StopAction::Continue => {}
-                                        }
-
-                                        // Execute tool calls (with possible approval dialog) and report to UI
-                                        // We only actually execute the subset that are approved (or don't need approval).
-                                        let mut to_execute: Vec<ToolCall> = vec![];
-
-                                        for tc in &tool_calls {
-                                            let current_mode = agent.current_exec_mode();
-
-                                            let name = tc.function.name.as_str();
-                                            let is_mutating = matches!(name, "write" | "patch" | "exec");
-
-                                            let is_outside = if name == "exec" {
-                                                let cmd = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                                                    .ok()
-                                                    .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_owned()))
-                                                    .unwrap_or_default();
-                                                // simple sandbox escape detection (cd / , absolute outside ws, network)
-                                                cmd.contains("cd /") ||
-                                                cmd.contains("/etc") || cmd.contains("/root") ||
-                                                cmd.contains("curl ") || cmd.contains("wget ") || cmd.contains("nc ")
-                                            } else {
-                                                false
-                                            };
-
-                                            let needs = match current_mode {
-                                                crate::session::ExecApprovalMode::Babysitter => is_mutating,
-                                                crate::session::ExecApprovalMode::SpringBreak => false,
-                                                crate::session::ExecApprovalMode::Vegas => name == "exec" && is_outside,
-                                                crate::session::ExecApprovalMode::Thunderdome => false,
-                                            };
-
-                                            if needs {
-                                                // Build a short, safe description (never dump full file content)
-                                                let desc = match name {
-                                                    "write" => {
-                                                        let v: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                                                        let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                                                        let n = v.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0);
-                                                        format!("write {} ({} bytes)", path, n)
-                                                    }
-                                                    "patch" => {
-                                                        let v: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                                                        let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                                                        format!("patch {}", path)
-                                                    }
-                                                    "exec" => {
-                                                        let v: serde_json::Value = serde_json::from_str(&tc.function.arguments).unwrap_or_default();
-                                                        let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                                                        // truncate long commands for the dialog
-                                                        let short = truncate(cmd, 72);
-                                                        format!("exec: {}", short)
-                                                    }
-                                                    "update_goal" => {
-                                                        let goal = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
-                                                            .ok()
-                                                            .and_then(|v| v.get("goal").and_then(|g| g.as_str()).map(|s| s.to_string()))
-                                                            .unwrap_or_else(|| tc.function.arguments.clone());
-                                                        format!("update_goal: {}", truncate(&goal, 80))
-                                                    }
-                                                    other => format!("{} (args omitted for display)", other),
-                                                };
-
-                                                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<bool>();
-                                                let _ = approval_req_tx2.send((desc.clone(), resp_tx)).await;
-                                                let _ = tx2.send(UiUpdate::ApprovalRequested).await;  // wake UI to show dialog
-                                                // UI will show dialog; block here until user answers
-                                                match resp_rx.await {
-                                                    Ok(true) => {
-                                                        to_execute.push(tc.clone());
-                                                        let _ = tx2.send(UiUpdate::ToolStart {
-                                                            name: tc.function.name.clone(),
-                                                            args: tc.function.arguments.clone(),
-                                                        }).await;
-                                                    }
-                                                    _ => {
-                                                        let deny = format!(
-                                                            "DENIED: The user refused to approve this {} action. \
-                                                             Do NOT retry the same action. \
-                                                             Either try a different approach, ask the user what they want, \
-                                                             or explain what you were trying to do and why.",
-                                                            tc.function.name
-                                                        );
-                                                        denials_this_turn += 1;
-                                                        let _ = tx2.send(UiUpdate::ToolResult {
-                                                            name: tc.function.name.clone(),
-                                                            summary: deny.to_string(),
-                                                        }).await;
-                                                        // Feed denial back to the model so the turn can continue consistently
-                                                        agent.record_tool_denial(tc, &deny);
-                                                        // After too many denials, stop the tool loop entirely
-                                                        if denials_this_turn >= 3 {
-                                                            let _ = tx2.send(UiUpdate::ToolResult {
-                                                                name: "system".into(),
-                                                                summary: "3 actions denied this turn — stopping tool loop. Send a new message to continue.".into(),
-                                                            }).await;
-                                                            break;
-                                                        }
-                                                        continue;
-                                                    }
-                                                }
-                                            } else {
-                                                to_execute.push(tc.clone());
-                                                let _ = tx2.send(UiUpdate::ToolStart {
-                                                    name: tc.function.name.clone(),
-                                                    args: tc.function.arguments.clone(),
-                                                }).await;
-                                            }
-                                        }
-
-                                        if let Some(s) = try_apply_queued_interject(
-                                            &queued,
-                                            &mut agent,
-                                            &tx2,
-                                            &mut tool_calls,
-                                        )
-                                        .await
-                                        {
-                                            current_stream = s;
-                                            continue;
-                                        }
-
-                                        let records = agent
-                                            .execute_and_record_tool_calls(&to_execute)
-                                            .await;
-
-                                        for r in records {
-                                            let _ = tx2.send(UiUpdate::ToolResult {
-                                                name: r.tool,
-                                                summary: r.summary,
-                                            }).await;
-                                        }
-
-                                        // Push updated context usage to UI (lock-free)
-                                        let _ = tx2.send(UiUpdate::ContextUsage {
-                                            used_tokens: agent.estimated_context_tokens(),
-                                        }).await;
-
-                                        if let Some(s) = try_apply_queued_interject(
-                                            &queued,
-                                            &mut agent,
-                                            &tx2,
-                                            &mut Vec::new(),
-                                        )
-                                        .await
-                                        {
-                                            current_stream = s;
-                                            continue;
-                                        }
-
-                                        match handle_stop_signal(
-                                            &stop,
-                                            &instant,
-                                            &mut agent,
-                                            &tx2,
-                                            "",
-                                        )
-                                        .await
-                                        {
-                                            StopAction::RestartStream(s) => {
-                                                current_stream = s;
-                                                continue;
-                                            }
-                                            StopAction::Halt { .. } => {
-                                                let _ = tx2
-                                                    .send(UiUpdate::Done {
-                                                        final_text: final_text.clone(),
-                                                    })
-                                                    .await;
-                                                return;
-                                            }
-                                            StopAction::Abort => return,
-                                            StopAction::Continue => {}
-                                        }
-
-                                        // Continue with another streaming inference
-                                        match agent.continue_turn_streaming().await {
-                                            Ok(s) => current_stream = s,
-                                            Err(e) => {
-                                                let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
-                                                return;
-                                            }
-                                        }
+                                match result {
+                                    Ok(r) => {
+                                        let _ = tx2.send(UiUpdate::Done { final_text: r.final_text }).await;
                                     }
-
-                                    // Model stopped calling tools — we're done
-                                    if completed_naturally {
-                                        break 'auto_continue;
+                                    Err(e) => {
+                                        let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
                                     }
-
-                                    // Hit round limit while still calling tools.
-                                    // The last iteration already created a pending stream
-                                    // via continue_turn_streaming that hasn't been consumed.
-                                    if continuation >= max_auto_continues {
-                                        // Exhausted auto-continue budget
-                                        let _ = tx2.send(UiUpdate::RoundLimitHit {
-                                            continuation: continuation + 1,
-                                            max_continuations: max_auto_continues + 1,
-                                            exhausted: true,
-                                        }).await;
-                                        break 'auto_continue;
-                                    }
-
-                                    // Auto-continue: notify UI and loop back to consume
-                                    // the pending stream with a fresh round budget.
-                                    let _ = tx2.send(UiUpdate::RoundLimitHit {
-                                        continuation: continuation + 1,
-                                        max_continuations: max_auto_continues + 1,
-                                        exhausted: false,
-                                    }).await;
-
-                                    // current_stream is already set from the last
-                                    // continue_turn_streaming — just loop back.
                                 }
-
-                                // Flush session summary so it's fresh for the next restart
-                                agent.force_flush_session().await;
-
-                                // Final context usage snapshot
-                                let _ = tx2.send(UiUpdate::ContextUsage {
-                                    used_tokens: agent.estimated_context_tokens(),
-                                }).await;
-                                let _ = tx2.send(UiUpdate::Done { final_text }).await;
                             });
                         }
                     }
@@ -2079,83 +1740,8 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
 }
 
-enum StopAction {
-    Continue,
-    RestartStream(mpsc::Receiver<StreamChunk>),
-    Halt { partial: String },
-    Abort,
-}
-
-/// Apply a queued interject (Policy A: supersede pending tool calls).
-async fn try_apply_queued_interject(
-    queued: &Arc<Mutex<Option<String>>>,
-    agent: &mut Agent,
-    tx: &mpsc::Sender<UiUpdate>,
-    pending_tool_calls: &mut Vec<ToolCall>,
-) -> Option<mpsc::Receiver<StreamChunk>> {
-    let msg = queued.lock().ok()?.take()?;
-    if !pending_tool_calls.is_empty() {
-        let n = pending_tool_calls.len();
-        pending_tool_calls.clear();
-        let _ = tx
-            .send(UiUpdate::ToolResult {
-                name: "system".into(),
-                summary: format!(
-                    "Interject applied — {} pending tool call(s) superseded",
-                    n
-                ),
-            })
-            .await;
-    }
-    agent.on_new_user_input(&msg);
-    let _ = tx.send(UiUpdate::InterjectRestart).await;
-    match agent.continue_turn_streaming().await {
-        Ok(stream) => Some(stream),
-        Err(e) => {
-            let _ = tx.send(UiUpdate::Error(e.to_string())).await;
-            None
-        }
-    }
-}
-
-async fn handle_stop_signal(
-    stop: &Arc<AtomicBool>,
-    instant: &Arc<Mutex<Option<String>>>,
-    agent: &mut Agent,
-    tx: &mpsc::Sender<UiUpdate>,
-    round_text: &str,
-) -> StopAction {
-    if !stop.load(Ordering::SeqCst) {
-        return StopAction::Continue;
-    }
-
-    let interject = instant
-        .lock()
-        .ok()
-        .and_then(|mut guard| guard.take())
-        .filter(|m| !m.trim().is_empty());
-
-    if !round_text.trim().is_empty() {
-        agent.push_assistant_text(round_text);
-    }
-
-    if let Some(msg) = interject {
-        agent.on_new_user_input(&msg);
-        let _ = tx.send(UiUpdate::InterjectRestart).await;
-        stop.store(false, Ordering::SeqCst);
-        match agent.continue_turn_streaming().await {
-            Ok(stream) => StopAction::RestartStream(stream),
-            Err(e) => {
-                let _ = tx.send(UiUpdate::Error(e.to_string())).await;
-                StopAction::Abort
-            }
-        }
-    } else {
-        StopAction::Halt {
-            partial: round_text.to_string(),
-        }
-    }
-}
+// StopAction, try_apply_queued_interject, and handle_stop_signal were removed
+// as part of migrating the interactive loop to the unified drive_turn + TuiObserver.
 
 enum UiUpdate {
     Token(String),
@@ -2181,6 +1767,213 @@ fn truncate(s: &str, max: usize) -> String {
             end -= 1;
         }
         format!("{}...", &s[..end])
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TuiObserver — wires the unified drive_turn() to the interactive TUI.
+// All agentic policy lives in drive_turn; this only does UI events + live control.
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct TuiObserver {
+    tx: mpsc::Sender<UiUpdate>,
+    approval_req_tx: mpsc::Sender<(String, oneshot::Sender<bool>)>,
+    stop: Arc<AtomicBool>,
+    queued: Arc<Mutex<Option<String>>>,
+    instant: Arc<Mutex<Option<String>>>,
+    denials_this_turn: u32,
+    halt_tools: bool,
+    exec_mode: ExecApprovalMode,
+}
+
+#[async_trait]
+impl TurnObserver for TuiObserver {
+    fn on_token(&mut self, t: &str) {
+        let _ = self.tx.try_send(UiUpdate::Token(t.to_string()));
+    }
+
+    fn on_thinking(&mut self, t: &str) {
+        let _ = self.tx.try_send(UiUpdate::Thinking(t.to_string()));
+    }
+
+    fn on_tool_start(&mut self, name: &str, args: &str) {
+        let _ = self.tx.try_send(UiUpdate::ToolStart {
+            name: name.to_string(),
+            args: args.to_string(),
+        });
+    }
+
+    fn on_tool_result(&mut self, record: &crate::agent::ActionRecord) {
+        let summary = if record.tool == "system" && record.summary.contains("JUDGE") {
+            record.summary.clone()  // already has ⭐ from driver
+        } else {
+            record.summary.clone()
+        };
+        let _ = self.tx.try_send(UiUpdate::ToolResult {
+            name: record.tool.clone(),
+            summary,
+        });
+    }
+
+    fn on_nudge(&mut self, count: u32, max: u32) {
+        let _ = self.tx.try_send(UiUpdate::ToolResult {
+            name: "system".into(),
+            summary: format!("Nudging agent to continue (text-only pause {}/{})", count, max),
+        });
+    }
+
+    fn on_round_limit(&mut self, continuation: u32, max: u32, exhausted: bool) {
+        let _ = self.tx.try_send(UiUpdate::RoundLimitHit {
+            continuation,
+            max_continuations: max,
+            exhausted,
+        });
+    }
+
+    fn on_stuck(&mut self, reason: &str, suggested: &str) {
+        let _ = self.tx.try_send(UiUpdate::ToolResult {
+            name: "system".into(),
+            summary: format!("⚠ Agent looping: {}. Ask user: {}", reason, suggested),
+        });
+    }
+
+    fn on_context_usage(&mut self, tokens: u32) {
+        let _ = self.tx.try_send(UiUpdate::ContextUsage { used_tokens: tokens });
+    }
+
+    fn should_stop(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    fn on_interject(&mut self, _msg: &str) {
+        let _ = self.tx.try_send(UiUpdate::InterjectRestart);
+    }
+
+    fn take_interject(&mut self) -> Option<String> {
+        // Prefer instant interject (Esc + immediate new prompt)
+        if let Ok(mut guard) = self.instant.lock() {
+            if let Some(msg) = guard.take() {
+                if !msg.trim().is_empty() {
+                    self.stop.store(false, Ordering::SeqCst);
+                    return Some(msg);
+                }
+            }
+        }
+        if let Ok(mut guard) = self.queued.lock() {
+            if let Some(msg) = guard.take() {
+                if !msg.trim().is_empty() {
+                    self.stop.store(false, Ordering::SeqCst);
+                    return Some(msg);
+                }
+            }
+        }
+        None
+    }
+
+    async fn approve_tool(&mut self, tc: &ToolCall) -> bool {
+        let name = &tc.function.name;
+        let args = &tc.function.arguments;
+
+        if !self.needs_approval(name, args) {
+            return true;
+        }
+
+        let desc = Self::build_approval_description(name, args);
+        let (resp_tx, resp_rx) = oneshot::channel::<bool>();
+        let _ = self.approval_req_tx.send((desc.clone(), resp_tx)).await;
+        let _ = self.tx.send(UiUpdate::ApprovalRequested).await;
+
+        // UI will show dialog and respond via the oneshot.
+        // If approved, the caller (drive_turn) will emit on_tool_start right after.
+        match resp_rx.await {
+            Ok(true) => {
+                true
+            }
+            _ => {
+                let deny = format!(
+                    "DENIED: The user refused to approve this {} action. \
+                     Do NOT retry the same action. \
+                     Either try a different approach, ask the user what they want, \
+                     or explain what you were trying to do and why.",
+                    name
+                );
+                self.denials_this_turn += 1;
+                let _ = self.tx.send(UiUpdate::ToolResult {
+                    name: name.clone(),
+                    summary: deny.clone(),
+                }).await;
+
+                if self.denials_this_turn >= 3 {
+                    let _ = self.tx.send(UiUpdate::ToolResult {
+                        name: "system".into(),
+                        summary: "3 actions denied this turn — stopping tool loop. Send a new message to continue.".into(),
+                    }).await;
+                    self.halt_tools = true;
+                }
+                false
+            }
+        }
+    }
+
+    fn stop_tool_processing(&self) -> bool {
+        self.halt_tools
+    }
+}
+
+impl TuiObserver {
+    fn needs_approval(&self, name: &str, args: &str) -> bool {
+        let is_mutating = matches!(name, "write" | "patch" | "exec");
+
+        let is_outside = if name == "exec" {
+            let cmd = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_owned()))
+                .unwrap_or_default();
+            cmd.contains("cd /")
+                || cmd.contains("/etc")
+                || cmd.contains("/root")
+                || cmd.contains("curl ")
+                || cmd.contains("wget ")
+                || cmd.contains("nc ")
+        } else {
+            false
+        };
+
+        match self.exec_mode {
+            ExecApprovalMode::Babysitter => is_mutating,
+            ExecApprovalMode::SpringBreak => false,
+            ExecApprovalMode::Vegas => name == "exec" && is_outside,
+            ExecApprovalMode::Thunderdome => false,
+        }
+    }
+
+    fn build_approval_description(name: &str, args: &str) -> String {
+        match name {
+            "write" => {
+                let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                let n = v.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0);
+                format!("write {} ({} bytes)", path, n)
+            }
+            "patch" => {
+                let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                format!("patch {}", path)
+            }
+            "exec" => {
+                let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+                let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                let short = truncate(cmd, 72);
+                format!("exec: {}", short)
+            }
+            "update_goal" => {
+                let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+                let goal = v.get("goal").and_then(|g| g.as_str()).map(|s| s.to_string())
+                    .unwrap_or_else(|| args.to_string());
+                format!("update_goal: {}", truncate(&goal, 80))
+            }
+            other => format!("{} (args omitted for display)", other),
+        }
     }
 }
 

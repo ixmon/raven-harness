@@ -11,10 +11,14 @@ use raven_tui::tools::ToolBackend;
 use std::path::PathBuf;
 
 /// Build a minimal Config suitable for mock eval scenarios.
+/// Uses a unique temp directory to prevent session state from accumulating
+/// across test runs (Session::init persists to ~/.raven/sessions/<hash>).
 fn eval_config(scenario: &raven_tui::eval_smoke::SmokeScenario, tool_backend: ToolBackend) -> Config {
     let ctx_tokens = scenario.context_tokens.unwrap_or(8192);
     let max_rounds = scenario.max_rounds.unwrap_or(10);
-    let workspace = raven_tui::eval_smoke::default_eval_workspace();
+    // Create a unique workspace per test invocation so we get a fresh session
+    let workspace = std::env::temp_dir()
+        .join(format!("raven_smoke_{}_{}", scenario.name, std::process::id()));
     std::fs::create_dir_all(&workspace).ok();
 
     Config {

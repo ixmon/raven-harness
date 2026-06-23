@@ -284,9 +284,16 @@ impl LlmClient {
                 let data_str = &line[6..];
                 if data_str == "[DONE]" {
                     // Emit final
-                    let final_tools: Vec<ToolCall> = tool_accum
+                    let mut final_tools: Vec<ToolCall> = tool_accum
                         .into_values()
                         .collect();
+
+                    // Fallback: if no structured tool_calls were accumulated
+                    // but the content contains XML tool calls (Qwen native format),
+                    // parse them from the text.
+                    if final_tools.is_empty() {
+                        final_tools = parse_xml_tool_calls_from_content(&full_text);
+                    }
 
                     let _ = tx
                         .send(StreamChunk::Done {
@@ -345,7 +352,11 @@ impl LlmClient {
         }
 
         // If we fell out without a [DONE], still emit what we have
-        let final_tools: Vec<ToolCall> = tool_accum.into_values().collect();
+        let mut final_tools: Vec<ToolCall> = tool_accum.into_values().collect();
+        // XML fallback for Qwen-style tool calls in content
+        if final_tools.is_empty() {
+            final_tools = parse_xml_tool_calls_from_content(&full_text);
+        }
         let _ = tx
             .send(StreamChunk::Done {
                 content: full_text,
@@ -416,19 +427,44 @@ fn parse_tool_calls(value: Option<&serde_json::Value>) -> Vec<ToolCall> {
 }
 
 /// Qwen / some llama.cpp templates emit tool calls as XML in assistant text.
+///
+/// Handles two variants:
+/// 1. Full: `<tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>`
+/// 2. Truncated (llama.cpp streaming often strips the leading `<tool_call>\n<`):
+///    `function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>`
 fn parse_xml_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
-    if !content.contains("<function=") {
+    // Quick reject: need either `<function=` or bare `function=` at/near start
+    let has_xml_function = content.contains("<function=");
+    let has_bare_function = content.contains("function=") && content.contains("<parameter=");
+    if !has_xml_function && !has_bare_function {
         return vec![];
     }
 
-    let blocks: Vec<&str> = if content.contains("<tool_call>") {
-        content
+    // Normalize: if the content starts with the truncated form (missing `<`),
+    // prepend `<` so the rest of the parser sees `<function=`.
+    let normalized: std::borrow::Cow<str> = if !has_xml_function && has_bare_function {
+        // Find where `function=` appears and insert `<` before it
+        if let Some(pos) = content.find("function=") {
+            let mut s = content.to_string();
+            if pos == 0 || content.as_bytes().get(pos.wrapping_sub(1)) != Some(&b'<') {
+                s.insert(pos, '<');
+            }
+            std::borrow::Cow::Owned(s)
+        } else {
+            std::borrow::Cow::Borrowed(content)
+        }
+    } else {
+        std::borrow::Cow::Borrowed(content)
+    };
+
+    let blocks: Vec<&str> = if normalized.contains("<tool_call>") {
+        normalized
             .split("<tool_call>")
             .skip(1)
             .filter_map(|s| s.split("</tool_call>").next())
             .collect()
     } else {
-        vec![content]
+        vec![&normalized]
     };
 
     let mut out = vec![];
@@ -759,6 +795,17 @@ README.md
         assert_eq!(calls[0].function.arguments, r#"{"path":"."}"#);
         assert_eq!(calls[1].function.name, "read_summary");
         assert_eq!(calls[1].function.arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn parse_xml_tool_calls_truncated_streaming_format() {
+        // llama.cpp streaming sometimes strips the leading `<tool_call>\n<`
+        // so the content starts with bare `function=name>`.
+        let content = "function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_xml_tool_calls_from_content(content);
+        assert_eq!(calls.len(), 1, "should parse truncated XML: {:?}", calls);
+        assert_eq!(calls[0].function.name, "list");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"."}"#);
     }
 
     #[test]

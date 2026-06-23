@@ -216,8 +216,12 @@ impl Runner {
     }
 
     fn run_mock_scenario(&self, id: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+        let prompt_file = self.write_scenario_prompt_file(id, log_path)?;
         let output = Command::new("cargo")
-            .args(["run", "--release", "--quiet", "--bin", "raven-tui"])
+            .args([
+                "run", "--release", "--quiet", "--bin", "raven-tui", "--",
+                "--prompt-file", prompt_file.to_str().unwrap(),
+            ])
             .current_dir(&self.manifest_dir)
             .env("RAVEN_EVAL", "1")
             .env("RAVEN_EVAL_MOCK_LLM", "1")
@@ -279,6 +283,8 @@ impl Runner {
         ));
         let _ = std::fs::create_dir_all(&workspace);
 
+        let prompt_file = self.write_scenario_prompt_file(id, log_path)?;
+
         let output = Command::new("cargo")
             .args([
                 "run",
@@ -291,6 +297,8 @@ impl Runner {
                 &self.llm_base_url,
                 "--temperature",
                 "0",
+                "--prompt-file",
+                prompt_file.to_str().unwrap(),
             ])
             .current_dir(&self.manifest_dir)
             .env("RAVEN_EVAL", "1")
@@ -305,6 +313,22 @@ impl Runner {
             &output.stderr,
         );
         Ok((output.status, format!("live:{id}")))
+    }
+
+    fn write_scenario_prompt_file(&self, id: &str, log_path: &PathBuf) -> Result<PathBuf> {
+        let scenario_path = self.evals_dir().join("scenarios").join(format!("{}.json", id));
+        let data = std::fs::read_to_string(&scenario_path)
+            .with_context(|| format!("read scenario {}", scenario_path.display()))?;
+        let v: serde_json::Value = serde_json::from_str(&data)
+            .with_context(|| format!("parse scenario {}", scenario_path.display()))?;
+        let prompt = v.get("prompt")
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow::anyhow!("scenario {} has no prompt field", id))?;
+
+        let prompt_file = log_path.with_file_name(format!("{}_prompt.txt", id));
+        std::fs::write(&prompt_file, prompt)
+            .with_context(|| format!("write prompt file for {}", id))?;
+        Ok(prompt_file)
     }
 }
 

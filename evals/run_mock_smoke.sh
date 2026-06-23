@@ -27,7 +27,11 @@ for SCENARIO in "${SCENARIOS[@]}"; do
   echo "--- scenario: $SCENARIO ---"
   export RAVEN_EVAL_SCENARIO="$SCENARIO"
   export RAVEN_EVAL_WORKSPACE="$(mktemp -d "${TMPDIR:-/tmp}/raven-mock-eval.XXXXXX")"
-  cargo run --release --quiet --bin raven-tui
+  # Write prompt to file + use --prompt-file for all test invocations
+  PROMPT_FILE="$(mktemp)"
+  jq -r '.prompt' "evals/scenarios/$SCENARIO.json" > "$PROMPT_FILE"
+  cargo run --release --quiet --bin raven-tui -- --prompt-file "$PROMPT_FILE"
+  rm -f "$PROMPT_FILE"
   rm -rf "$RAVEN_EVAL_WORKSPACE"
 done
 

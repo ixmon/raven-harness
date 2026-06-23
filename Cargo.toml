@@ -25,6 +25,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 futures-util = "0.3"
 urlencoding = "2.1"
+async-trait = "0.1"
 bytes = "1"
 arboard = { version = "3.4", optional = true }  # clipboard support (glm.md)
 rusqlite = { version = "0.31", features = ["bundled"] }

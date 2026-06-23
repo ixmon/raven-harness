@@ -3,7 +3,7 @@
 //! Talks to localhost:8080 by default (llama.cpp / Qwen model).
 //! Provides the agent with practical tools: filesystem ops, shell exec, web search, and page browsing.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -67,9 +67,16 @@ struct Args {
     #[arg(long, env = "LLM_CONTEXT_SIZE")]
     context_size: Option<u32>,
 
-    /// Run a single prompt non-interactively and exit (useful for scripting)
+    /// Run a single prompt non-interactively and exit (useful for scripting).
+    /// For large or complex prompts (e.g. full bug reports), prefer --prompt-file to avoid
+    /// shell quoting problems.
     #[arg(long)]
     prompt: Option<String>,
+
+    /// Read the prompt from a file (avoids shell quoting issues with large/complex prompts
+    /// such as full SWE-bench bug reports). Mutually exclusive with --prompt.
+    #[arg(long, value_name = "FILE")]
+    prompt_file: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -105,10 +112,18 @@ async fn main() -> Result<()> {
         tools::ToolBackend::Real
     };
 
-    let prompt = args
-        .prompt
-        .clone()
-        .or_else(|| smoke_scenario.as_ref().map(|s| s.prompt.clone()));
+    let prompt = if let Some(p) = &args.prompt {
+        if args.prompt_file.is_some() {
+            anyhow::bail!("--prompt and --prompt-file are mutually exclusive");
+        }
+        Some(p.clone())
+    } else if let Some(path) = &args.prompt_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
+        Some(content)
+    } else {
+        smoke_scenario.as_ref().map(|s| s.prompt.clone())
+    };
     let is_interactive_tui = prompt.is_none();
 
     if eval_mode && is_interactive_tui {
@@ -299,6 +314,15 @@ async fn main() -> Result<()> {
             chat_backend::ChatBackend::http(c.clone())
         };
         let mut app = agent::Agent::new(c, chat_backend);
+
+        // Each --prompt / --prompt-file invocation (swebench, smoke evals, direct headless use)
+        // is an independent task against a freshly checked-out workspace (run_instance.sh etc.
+        // do `git reset --hard $base + clean -fdx`). Do not append the full raw prompt (or any
+        // prior attempt's history) on top of restored conversation from a previous run on the
+        // same workspace dir. Keep the persistent session (goal, repo cache, last_user_request)
+        // but start the message history fresh for this attempt.
+        app.reset();
+
         let turn_started = std::time::Instant::now();
 
         // Use drive_turn with HeadlessObserver — same loop as TUI
