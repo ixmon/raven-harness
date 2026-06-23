@@ -45,12 +45,23 @@ pub struct ActionRecord {
     pub truncated: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TurnMetrics {
+    pub llm_rounds: u32,
+    pub tool_calls: u32,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub round_limit_hit: bool,
+}
+
 #[derive(Debug)]
 pub struct TurnResult {
     pub final_text: String,
     pub actions: Vec<ActionRecord>,
     #[allow(dead_code)]
     pub rounds_used: u32,
+    pub metrics: TurnMetrics,
 }
 
 pub struct Agent {
@@ -134,10 +145,13 @@ impl Agent {
 
         let mut actions = vec![];
         let mut last_assistant_text = String::new();
+        let mut prompt_tokens: u64 = 0;
+        let mut completion_tokens: u64 = 0;
         let tools_schema = tools::all_tools();
         let tools_for_request = self.config.tools_enabled.then(|| tools_schema.clone());
+        let max_rounds = self.config.max_rounds.clamp(1, MAX_TOOL_ROUNDS);
 
-        for round in 0..self.config.max_rounds.clamp(1, MAX_TOOL_ROUNDS) {
+        for round in 0..max_rounds {
             let messages = self.build_messages_for_model();
             let req = ChatRequest {
                 messages,
@@ -148,6 +162,10 @@ impl Agent {
             };
 
             let resp = self.client.chat(req).await?;
+            if let Some(u) = &resp.usage {
+                prompt_tokens += u.prompt_tokens.unwrap_or(0) as u64;
+                completion_tokens += u.completion_tokens.unwrap_or(0) as u64;
+            }
 
             if !resp.content.trim().is_empty() {
                 last_assistant_text = resp.content.clone();
@@ -172,10 +190,19 @@ impl Agent {
 
             if resp.tool_calls.is_empty() {
                 self.persist_turn().await;
+                let tool_calls = actions.len() as u32;
                 return Ok(TurnResult {
                     final_text: last_assistant_text,
                     actions,
                     rounds_used: round + 1,
+                    metrics: TurnMetrics {
+                        llm_rounds: round + 1,
+                        tool_calls,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                        round_limit_hit: false,
+                    },
                 });
             }
 
@@ -238,10 +265,19 @@ impl Agent {
         });
         self.persist_turn().await;
 
+        let tool_calls = actions.len() as u32;
         Ok(TurnResult {
             final_text: last_assistant_text + "\n\n" + exhaustion,
             actions,
-            rounds_used: self.config.max_rounds,
+            rounds_used: max_rounds,
+            metrics: TurnMetrics {
+                llm_rounds: max_rounds,
+                tool_calls,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+                round_limit_hit: true,
+            },
         })
     }
 
@@ -719,6 +755,16 @@ impl Agent {
     /// Read-only access to the current config (for UI to display active endpoint).
     pub fn current_config(&self) -> &Config {
         &self.config
+    }
+
+    /// Number of messages in the live conversation (for test assertions).
+    pub fn conversation_len(&self) -> usize {
+        self.conversation.len()
+    }
+
+    /// Read-only access to the session (for test assertions on meta, log, etc.).
+    pub fn session_ref(&self) -> Option<&crate::session::Session> {
+        self.session.as_ref()
     }
 }
 

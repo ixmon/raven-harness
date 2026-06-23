@@ -22,6 +22,7 @@ mod keystore;
 mod llm;
 mod palette;
 mod search;
+mod server_probe;
 mod session;
 mod settings_modal;
 mod tools;
@@ -274,6 +275,7 @@ async fn main() -> Result<()> {
         let tools_enabled = !smoke_scenario
             .as_ref()
             .is_some_and(|s| s.disable_tools);
+        let model_label = model.clone();
         let c = config::Config {
             base_url,
             model,
@@ -296,7 +298,17 @@ async fn main() -> Result<()> {
             chat_backend::ChatBackend::http(c.clone())
         };
         let mut app = agent::Agent::new(c, chat_backend);
+        let turn_started = std::time::Instant::now();
         let result = app.run_turn(&prompt).await?;
+        if let Ok(out) = std::env::var("RAVEN_METRICS_OUT") {
+            let _ = eval_metrics::write_turn_metrics(
+                std::path::Path::new(&out),
+                &result,
+                turn_started.elapsed().as_millis() as u64,
+                &model_label,
+                max_rounds,
+            );
+        }
         if let Some(ref scenario) = smoke_scenario {
             eval_smoke::assert_smoke_result(scenario, &result)?;
             eval_smoke::assert_smoke_session_log(scenario, &workspace)?;

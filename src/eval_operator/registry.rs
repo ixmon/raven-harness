@@ -66,6 +66,13 @@ pub fn load_registry() -> Result<Registry> {
             needs_llm: false,
             offline: true,
         },
+        TestEntry {
+            id: "swebench-live".into(),
+            tier: TestTier::LiveSmoke,
+            description: "SWE-bench Lite dev smoke trio (live Raven agent; needs LLM + uv)".into(),
+            needs_llm: true,
+            offline: false,
+        },
     ];
 
     let mut scenarios = vec![];
@@ -180,8 +187,8 @@ pub fn find_entry<'a>(reg: &'a Registry, id: &str) -> Option<&'a TestEntry> {
 pub fn profile_ids(profile: &str) -> Result<Vec<String>> {
     let reg = load_registry()?;
     let ids = match profile {
-        "quick" => vec!["replay".into(), "mock_smoke_all".into()],
-        "local" => vec!["replay".into(), "mock_smoke_all".into(), "smoke_ping".into()],
+        "quick" => vec!["unit_tests".into(), "replay".into(), "mock_smoke_all".into()],
+        "local" => vec!["unit_tests".into(), "replay".into(), "mock_smoke_all".into(), "smoke_ping".into()],
         "full" => {
             let mut ids = vec!["replay".into(), "mock_smoke_all".into()];
             for s in &reg.scenarios {
@@ -191,8 +198,12 @@ pub fn profile_ids(profile: &str) -> Result<Vec<String>> {
             }
             ids
         }
-        "swebench-smoke" => super::swebench::smoke_trio_ids(&manifest_dir())?,
-        other => anyhow::bail!("unknown profile {other:?} (use quick, local, full, or swebench-smoke)"),
+        "swebench-smoke" | "swebench-live" => {
+            super::swebench::smoke_trio_ids(&manifest_dir())?
+        }
+        other => anyhow::bail!(
+            "unknown profile {other:?} (use quick, local, full, swebench-smoke, or swebench-live)"
+        ),
     };
     Ok(ids)
 }
@@ -213,5 +224,13 @@ mod tests {
     fn swebench_smoke_profile_has_trio() {
         let ids = profile_ids("swebench-smoke").expect("profile");
         assert_eq!(ids.len(), 3);
+        assert!(ids.iter().any(|id| id.contains("marshmallow")));
+    }
+
+    #[test]
+    fn swebench_live_profile_has_same_trio() {
+        let smoke = profile_ids("swebench-smoke").expect("smoke");
+        let live = profile_ids("swebench-live").expect("live");
+        assert_eq!(smoke, live);
     }
 }

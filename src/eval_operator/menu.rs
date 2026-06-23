@@ -5,6 +5,7 @@ use std::io::{self, Write};
 
 use super::ai_shell::{explain_last_run, run_repl};
 use super::probe::{format_status, LlmStatus};
+use super::registry::find_entry;
 use super::registry::{load_registry, list_text};
 use super::runner::{Runner, print_summary};
 use super::state::{format_last_run, load_state, save_state};
@@ -29,9 +30,15 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
         if llm.reachable {
             println!("  8) AI Shell         freeform questions");
         } else {
-            println!("  8) AI Shell                  [unavailable — no LLM]");
+            println!("  8) AI Shell                  [unavailable — endpoint down]");
         }
         println!("  9) SWE-bench smoke  verify-grade trio (~2m, needs uv)");
+        if llm.ready_for_agent {
+            println!(" 10) SWE-bench live   Raven agent trio (slow, needs LLM + uv)");
+        } else {
+            println!(" 10) SWE-bench live            [unavailable — probe not ready]");
+        }
+        println!(" 11) Run single test  pick a scenario by ID");
         println!("  q) Quit");
         println!();
         print!("Choice [1]: ");
@@ -93,6 +100,41 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
             }
             "9" => {
                 let s = runner.run_profile("swebench-smoke", &mut state)?;
+                print_summary(&s);
+            }
+            "10" => {
+                if !llm.ready_for_agent {
+                    println!(
+                        "LLM probe not ready at {} — need /v1/models with resolvable model + n_ctx.",
+                        llm.base_url
+                    );
+                    if let Some(e) = &llm.error {
+                        println!("  ({e})");
+                    }
+                    continue;
+                }
+                let s = runner.run_profile("swebench-live", &mut state)?;
+                print_summary(&s);
+            }
+            "11" => {
+                let reg = load_registry()?;
+                print!("{}", list_text(&reg));
+                print!("\nTest ID to run: ");
+                io::stdout().flush()?;
+                let mut id_line = String::new();
+                io::stdin().read_line(&mut id_line)?;
+                let id = id_line.trim();
+                if id.is_empty() {
+                    println!("(cancelled)");
+                    continue;
+                }
+                if find_entry(&reg, id).is_none()
+                    && !super::swebench::is_instance_id(&runner.manifest_dir, id)
+                {
+                    println!("Unknown test ID: {id}");
+                    continue;
+                }
+                let s = runner.run_ids(&format!("single:{id}"), &[id.to_string()], &mut state)?;
                 print_summary(&s);
             }
             "q" | "Q" => break,

@@ -1,10 +1,11 @@
 //! Baseline regression checks against `evals/baselines/metrics.json`.
+//! Also writes per-turn harness metrics when `RAVEN_METRICS_OUT` is set.
 
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::agent::TurnResult;
 use crate::eval_smoke::SmokeScenario;
@@ -65,5 +66,49 @@ pub fn assert_smoke_metrics(scenario: &SmokeScenario, result: &TurnResult) -> Re
         }
     }
 
+    Ok(())
+}
+
+/// Write agent turn metrics for SWE-bench / harness scorecards (`RAVEN_METRICS_OUT`).
+pub fn write_turn_metrics(
+    path: &Path,
+    result: &TurnResult,
+    duration_ms: u64,
+    model: &str,
+    max_rounds: u32,
+) -> Result<()> {
+    let tool_counts: serde_json::Map<String, Value> = result
+        .actions
+        .iter()
+        .fold(serde_json::Map::new(), |mut acc, a| {
+            let n = acc
+                .get(&a.tool)
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                + 1;
+            acc.insert(a.tool.clone(), json!(n));
+            acc
+        });
+
+    let payload = json!({
+        "version": 1,
+        "source": "raven_turn",
+        "model": model,
+        "max_rounds": max_rounds,
+        "duration_ms": duration_ms,
+        "llm_rounds": result.metrics.llm_rounds,
+        "tool_calls": result.metrics.tool_calls,
+        "round_limit_hit": result.metrics.round_limit_hit,
+        "prompt_tokens": result.metrics.prompt_tokens,
+        "completion_tokens": result.metrics.completion_tokens,
+        "total_tokens": result.metrics.total_tokens,
+        "tool_counts": tool_counts,
+        "tools_used": result.actions.iter().map(|a| &a.tool).collect::<Vec<_>>(),
+    });
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&payload)?)?;
     Ok(())
 }

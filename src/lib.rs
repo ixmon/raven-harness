@@ -1,2 +1,13 @@
-//! Library surface for secondary binaries (`raven-eval`, etc.).
+//! Library surface for secondary binaries (`raven-eval`, etc.) and integration tests.
+
+pub mod agent;
+pub mod chat_backend;
+pub mod config;
+pub mod eval_metrics;
 pub mod eval_operator;
+pub mod eval_smoke;
+pub mod llm;
+pub mod sanitize;
+pub mod server_probe;
+pub mod session;
+pub mod tools;

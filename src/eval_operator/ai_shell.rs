@@ -202,21 +202,55 @@ fn compare_runs(run_id: &str) -> Result<()> {
             .find(|r| r.run_id == run_id)
             .ok_or_else(|| anyhow::anyhow!("run_id not found: {run_id}"))?
     };
-    println!("Compare {} vs {}", a.run_id, b.run_id);
-    println!("  {} passed={}", a.profile, a.passed);
-    println!("  {} passed={}", b.profile, b.passed);
-    for id in a
+    println!("\nCompare: {} vs {}", a.run_id, b.run_id);
+    println!("  A: {} passed={}", a.profile, a.passed);
+    println!("  B: {} passed={}", b.profile, b.passed);
+    println!();
+
+    // Collect all scenario IDs from both runs
+    let all_ids: std::collections::BTreeSet<&str> = a
         .results
         .iter()
-        .map(|r| &r.id)
-        .collect::<std::collections::BTreeSet<_>>()
-    {
-        let ap = a.results.iter().find(|r| &r.id == id).map(|r| r.passed);
-        let bp = b.results.iter().find(|r| &r.id == id).map(|r| r.passed);
-        if ap != bp {
-            println!("  Δ {id}: {:?} → {:?}", ap, bp);
-        }
+        .map(|r| r.id.as_str())
+        .chain(b.results.iter().map(|r| r.id.as_str()))
+        .collect();
+
+    println!("  {:<36} {:>6} {:>6}  {:>8} {:>8}", "Scenario", "A", "B", "A ms", "B ms");
+    println!("  {}", "─".repeat(70));
+
+    for id in &all_ids {
+        let ar = a.results.iter().find(|r| r.id == *id);
+        let br = b.results.iter().find(|r| r.id == *id);
+        let a_mark = ar.map(|r| if r.passed { "✓" } else { "✗" }).unwrap_or("—");
+        let b_mark = br.map(|r| if r.passed { "✓" } else { "✗" }).unwrap_or("—");
+        let a_ms = ar.map(|r| format!("{}", r.duration_ms)).unwrap_or_else(|| "—".into());
+        let b_ms = br.map(|r| format!("{}", r.duration_ms)).unwrap_or_else(|| "—".into());
+
+        let changed = ar.map(|r| r.passed) != br.map(|r| r.passed);
+        let marker = if changed { " Δ" } else { "" };
+        println!("  {:<36} {:>6} {:>6}  {:>8} {:>8}{}", id, a_mark, b_mark, a_ms, b_ms, marker);
     }
+
+    // Totals
+    let a_pass = a.results.iter().filter(|r| r.passed).count();
+    let b_pass = b.results.iter().filter(|r| r.passed).count();
+    let a_total_ms: u64 = a.results.iter().map(|r| r.duration_ms).sum();
+    let b_total_ms: u64 = b.results.iter().map(|r| r.duration_ms).sum();
+    println!("  {}", "─".repeat(70));
+    println!(
+        "  {:<36} {:>5}/{} {:>5}/{}  {:>8} {:>8}",
+        "Total",
+        a_pass, a.results.len(),
+        b_pass, b.results.len(),
+        a_total_ms, b_total_ms
+    );
+
+    if a_total_ms > 0 && b_total_ms > 0 {
+        let pct = ((a_total_ms as f64 - b_total_ms as f64) / b_total_ms as f64) * 100.0;
+        let dir = if pct > 0.0 { "slower" } else { "faster" };
+        println!("  Duration: {:.1}% {} than previous", pct.abs(), dir);
+    }
+    println!();
     Ok(())
 }
 
@@ -268,9 +302,16 @@ fn ask_llm_with_context(llm: &LlmStatus, user: &str, context: &str) -> Result<St
     let base = llm.base_url.trim_end_matches('/');
     let url = format!("{base}/chat/completions");
     let model = llm
-        .model_hint
+        .model_id
         .clone()
-        .or_else(|| std::env::var("LLM_MODEL").ok())
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            if llm.model_hint.is_empty() {
+                std::env::var("LLM_MODEL").ok()
+            } else {
+                Some(llm.model_hint.clone())
+            }
+        })
         .unwrap_or_else(|| "local-model".into());
 
     let system = format!(

@@ -37,8 +37,17 @@ pub fn instance_results_dir(manifest_dir: &Path, instance_id: &str) -> PathBuf {
         .join(instance_id)
 }
 
+/// SWE-bench run mode: `verify-grade` (gold patch) or `full` (live Raven agent).
 pub fn smoke_mode() -> String {
     std::env::var("SWEBENCH_SMOKE_MODE").unwrap_or_else(|_| "verify-grade".into())
+}
+
+/// Resolve mode from eval profile; `swebench-live` always runs the agent.
+pub fn mode_for_profile(profile: &str) -> String {
+    if profile == "swebench-live" {
+        return "full".into();
+    }
+    smoke_mode()
 }
 
 pub fn smoke_trio_ids(manifest_dir: &Path) -> Result<Vec<String>> {
@@ -110,5 +119,12 @@ mod tests {
         let ids = smoke_trio_ids(&manifest).expect("load");
         assert_eq!(ids.len(), 3);
         assert!(ids.iter().any(|id| id.contains("marshmallow")));
+    }
+
+    #[test]
+    fn mode_for_profile_live_vs_smoke() {
+        assert_eq!(mode_for_profile("swebench-live"), "full");
+        assert_eq!(mode_for_profile("swebench-smoke"), "verify-grade");
+        assert_eq!(mode_for_profile("single:foo"), "verify-grade");
     }
 }

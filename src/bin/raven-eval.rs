@@ -15,9 +15,13 @@ use raven_tui::eval_operator::{
     about = "Raven harness eval operator — deterministic menus, optional local LLM"
 )]
 struct Args {
-    /// Non-interactive profile: quick | local | full | swebench-smoke
+    /// Non-interactive profile: quick | local | full | swebench-smoke | swebench-live
     #[arg(long)]
     profile: Option<String>,
+
+    /// Live Raven agent for a single SWE-bench instance (--run <instance_id> only)
+    #[arg(long)]
+    live: bool,
 
     /// List registry and exit
     #[arg(long)]
@@ -54,7 +58,21 @@ fn main() -> Result<()> {
 
     if let Some(id) = args.run {
         let mut state = load_state()?;
-        let summary = runner.run_ids(&format!("single:{id}"), &[id], &mut state)?;
+        let is_swebench = raven_tui::eval_operator::swebench::is_instance_id(
+            &runner.manifest_dir,
+            &id,
+        );
+        if args.live && !is_swebench {
+            anyhow::bail!("--live requires a SWE-bench instance id (see evals/swebench/instances/)");
+        }
+        let profile = if args.live {
+            "swebench-live".into()
+        } else if is_swebench {
+            "swebench-smoke".into()
+        } else {
+            format!("single:{id}")
+        };
+        let summary = runner.run_ids(&profile, &[id], &mut state)?;
         print_summary(&summary);
         if !summary.passed {
             std::process::exit(1);
@@ -74,7 +92,9 @@ fn main() -> Result<()> {
 
     if let Some(profile) = args.profile {
         if profile_ids(&profile).is_err() {
-            anyhow::bail!("unknown profile {profile:?} (use quick, local, full, or swebench-smoke)");
+            anyhow::bail!(
+                "unknown profile {profile:?} (use quick, local, full, swebench-smoke, or swebench-live)"
+            );
         }
         let mut state = load_state()?;
         let summary = runner.run_profile(&profile, &mut state)?;

@@ -66,8 +66,8 @@ materialize_repo() {
   git -C "$REPO_DIR" clean -fdx
 }
 
-copy_session_log() {
-  local workspace_abs log_src
+copy_session_artifacts() {
+  local workspace_abs log_src session_dir
   workspace_abs="$(cd "$REPO_DIR" && pwd)"
   log_src="$(
     find "${HOME}/.raven-hotel/sessions" -name 'full_log.jsonl' 2>/dev/null \
@@ -80,18 +80,51 @@ copy_session_log() {
   )"
   if [[ -n "${log_src:-}" && -f "$log_src" ]]; then
     cp "$log_src" "$RESULT_DIR/raven_log.jsonl"
+    session_dir="$(dirname "$log_src")"
+    if [[ -f "$session_dir/meta.json" ]]; then
+      cp "$session_dir/meta.json" "$RESULT_DIR/meta.json"
+    fi
   fi
 }
 
+write_run_timing() {
+  local started_ms ended_ms raven_exit
+  started_ms="${1:?}"
+  ended_ms="${2:?}"
+  raven_exit="${3:-0}"
+  "$VENV/bin/python" - "$RESULT_DIR/run_timing.json" "$started_ms" "$ended_ms" "$raven_exit" <<'PY'
+import json, sys
+out, start, end, code = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+json.dump({
+    "started_ms": start,
+    "ended_ms": end,
+    "wall_duration_ms": max(0, end - start),
+    "raven_exit_code": code,
+}, open(out, "w"), indent=2)
+PY
+}
+
+extract_metrics() {
+  local mode="${1:-verify-grade}"
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    return 0
+  fi
+  "$VENV/bin/python" "$SCRIPT_DIR/extract_harness_metrics.py" \
+    "$RESULT_DIR" --mode "$mode" --out "$RESULT_DIR/metrics.json" \
+    >"$RESULT_DIR/metrics.stdout" 2>"$RESULT_DIR/metrics.stderr" || true
+}
+
 run_raven() {
-  local prompt
+  local prompt started_ms ended_ms raven_exit
   prompt="$("$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['problem_statement'])")"
 
   mkdir -p "$RESULT_DIR"
   echo "==> running Raven (max_rounds=${RAVEN_MAX_ROUNDS:-30})"
+  started_ms="$("$VENV/bin/python" -c 'import time; print(int(time.time()*1000))')"
   (
     cd "$TUI_ROOT"
     export RAVEN_APPROVAL="${RAVEN_APPROVAL:-thunderdome}"
+    export RAVEN_METRICS_OUT="$RESULT_DIR/harness_turn.json"
     cargo run --release --quiet --bin raven-tui -- \
       --workspace "$REPO_DIR" \
       --prompt "$prompt" \
@@ -101,7 +134,11 @@ run_raven() {
       ${LLM_MODEL:+--model "$LLM_MODEL"} \
       >"$RESULT_DIR/raven.stdout" 2>"$RESULT_DIR/raven.stderr"
   )
-  copy_session_log
+  raven_exit=$?
+  ended_ms="$("$VENV/bin/python" -c 'import time; print(int(time.time()*1000))')"
+  write_run_timing "$started_ms" "$ended_ms" "$raven_exit"
+  copy_session_artifacts
+  return "$raven_exit"
 }
 
 capture_model_patch() {
@@ -144,6 +181,7 @@ main() {
     local gold="$RESULT_DIR/gold_patch.diff"
     "$VENV/bin/python" -c "import json; print(json.load(open('$INSTANCE_JSON'))['patch'])" >"$gold"
     grade_patch "$gold"
+    extract_metrics "verify-grade"
     echo "==> PASS: verify-grade $INSTANCE_ID"
     return 0
   fi
@@ -155,6 +193,7 @@ main() {
 
   if [[ "$SKIP_GRADE" -eq 1 ]]; then
     write_report_stub
+    extract_metrics "full"
     echo "==> DONE: $INSTANCE_ID (grade skipped)"
     return 0
   fi
@@ -165,6 +204,7 @@ main() {
   fi
 
   grade_patch "$RESULT_DIR/model_patch.diff"
+  extract_metrics "full"
   if "$VENV/bin/python" -c "import json,sys; r=json.load(open('$RESULT_DIR/report.json')); sys.exit(0 if r.get('resolved') else 1)"; then
     echo "==> RESOLVED: $INSTANCE_ID"
   else

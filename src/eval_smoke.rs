@@ -317,6 +317,7 @@ mod tests {
             final_text: "SMOKE_OK — all good".into(),
             actions: vec![],
             rounds_used: 0,
+            metrics: crate::agent::TurnMetrics::default(),
         };
         assert_smoke_result(&s, &result).expect("assert");
     }
