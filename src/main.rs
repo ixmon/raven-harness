@@ -8,6 +8,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 mod agent;
+mod agent_driver;
 mod config;
 mod desktop;
 #[cfg(test)]
@@ -269,8 +270,8 @@ async fn main() -> Result<()> {
     );
 
     if let Some(prompt) = prompt {
-        // Non-interactive single shot — still benefits from session (meta is updated on disk)
-        // Set the request on the bootstrapped sess before moving it into config.
+        // Non-interactive single shot — uses the SAME agent loop as the TUI
+        // (streaming, nudges, auto-continue) via drive_turn().
         let _ = sess.set_last_user_request(&prompt);
         let tools_enabled = !smoke_scenario
             .as_ref()
@@ -299,7 +300,11 @@ async fn main() -> Result<()> {
         };
         let mut app = agent::Agent::new(c, chat_backend);
         let turn_started = std::time::Instant::now();
-        let result = app.run_turn(&prompt).await?;
+
+        // Use drive_turn with HeadlessObserver — same loop as TUI
+        let mut observer = agent_driver::HeadlessObserver;
+        let result = agent_driver::drive_turn(&mut app, &prompt, &mut observer).await?;
+
         if let Ok(out) = std::env::var("RAVEN_METRICS_OUT") {
             let _ = eval_metrics::write_turn_metrics(
                 std::path::Path::new(&out),

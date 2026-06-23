@@ -91,7 +91,14 @@ pub struct Usage {
 pub enum StreamChunk {
     Token(String),
     Thinking(String), // for models that emit reasoning_content (Qwen etc.)
-    Done { content: String, tool_calls: Vec<ToolCall>, #[allow(dead_code)] usage: Option<Usage> },
+    Done {
+        content: String,
+        tool_calls: Vec<ToolCall>,
+        #[allow(dead_code)]
+        usage: Option<Usage>,
+        /// "stop", "length", "tool_calls", etc. — needed for nudge decisions.
+        finish_reason: Option<String>,
+    },
     Error(String),
 }
 
@@ -250,6 +257,7 @@ impl LlmClient {
         let mut full_text = String::new();
         let mut tool_accum: HashMap<usize, ToolCall> = HashMap::new();
         let mut last_usage: Option<Usage> = None;
+        let mut last_finish_reason: Option<String> = None;
         let mut stream = resp.bytes_stream();
         let mut buffer = String::new();
 
@@ -285,6 +293,7 @@ impl LlmClient {
                             content: full_text.clone(),
                             tool_calls: final_tools.clone(),
                             usage: last_usage,
+                            finish_reason: last_finish_reason,
                         })
                         .await;
                     return Ok(());
@@ -300,6 +309,10 @@ impl LlmClient {
 
                     if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
                         if let Some(choice) = choices.first() {
+                            // Capture finish_reason from the last chunk that has it
+                            if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                                last_finish_reason = Some(fr.to_string());
+                            }
                             let delta_val = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
                             let delta = &delta_val;
 
@@ -338,6 +351,7 @@ impl LlmClient {
                 content: full_text,
                 tool_calls: final_tools,
                 usage: last_usage,
+                finish_reason: last_finish_reason,
             })
             .await;
 

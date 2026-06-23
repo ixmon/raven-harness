@@ -78,6 +78,7 @@ impl MockChatBackend {
                 content: resp.content,
                 tool_calls: resp.tool_calls,
                 usage: resp.usage,
+                finish_reason: resp.finish_reason,
             })
             .await;
         Ok(rx)

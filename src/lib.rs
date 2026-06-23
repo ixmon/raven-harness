@@ -1,6 +1,7 @@
 //! Library surface for secondary binaries (`raven-eval`, etc.) and integration tests.
 
 pub mod agent;
+pub mod agent_driver;
 pub mod chat_backend;
 pub mod config;
 pub mod eval_metrics;

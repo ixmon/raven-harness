@@ -140,164 +140,13 @@ impl Agent {
     }
 
     /// High level entry: give the agent a user goal and let it run until it stops using tools.
+    ///
+    /// This delegates to `agent_driver::drive_turn()` with a `SilentObserver`,
+    /// so it uses the exact same driving loop as the interactive TUI (nudges,
+    /// auto-continue, streaming, etc.).
     pub async fn run_turn(&mut self, user_input: &str) -> Result<TurnResult> {
-        self.on_new_user_input(user_input);
-
-        let mut actions = vec![];
-        let mut last_assistant_text = String::new();
-        let mut prompt_tokens: u64 = 0;
-        let mut completion_tokens: u64 = 0;
-        let tools_schema = tools::all_tools();
-        let tools_for_request = self.config.tools_enabled.then(|| tools_schema.clone());
-        let max_rounds = self.config.max_rounds.clamp(1, MAX_TOOL_ROUNDS);
-
-        for round in 0..max_rounds {
-            let messages = self.build_messages_for_model();
-            let req = ChatRequest {
-                messages,
-                tools: tools_for_request.clone(),
-                temperature: self.config.temperature,
-                max_tokens: self.config.max_tokens,
-                stream: false,
-            };
-
-            let resp = self.client.chat(req).await?;
-            if let Some(u) = &resp.usage {
-                prompt_tokens += u.prompt_tokens.unwrap_or(0) as u64;
-                completion_tokens += u.completion_tokens.unwrap_or(0) as u64;
-            }
-
-            if !resp.content.trim().is_empty() {
-                last_assistant_text = resp.content.clone();
-                self.conversation.push(Message {
-                    role: "assistant".into(),
-                    content: Some(resp.content.clone()),
-                    tool_calls: if resp.tool_calls.is_empty() {
-                        None
-                    } else {
-                        Some(resp.tool_calls.clone())
-                    },
-                    tool_call_id: None,
-                });
-            } else if !resp.tool_calls.is_empty() {
-                self.conversation.push(Message {
-                    role: "assistant".into(),
-                    content: Some("".into()),
-                    tool_calls: Some(resp.tool_calls.clone()),
-                    tool_call_id: None,
-                });
-            }
-
-            if resp.tool_calls.is_empty() {
-                // If finish_reason is "length", the model ran out of output tokens
-                // (common with thinking models like Qwen3 that spend tokens on reasoning).
-                // Nudge it to continue with tool calls instead of returning early.
-                let hit_length = resp.finish_reason.as_deref() == Some("length");
-                if hit_length && round + 1 < max_rounds {
-                    self.conversation.push(Message {
-                        role: "user".into(),
-                        content: Some(
-                            "[system: Your previous response was truncated (output limit). \
-                             Please use your tools now to investigate and solve the task. \
-                             Start with `list` or `read` to explore the codebase.]"
-                                .into(),
-                        ),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    continue;
-                }
-
-                self.persist_turn().await;
-                let tool_calls = actions.len() as u32;
-                return Ok(TurnResult {
-                    final_text: last_assistant_text,
-                    actions,
-                    rounds_used: round + 1,
-                    metrics: TurnMetrics {
-                        llm_rounds: round + 1,
-                        tool_calls,
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens: prompt_tokens + completion_tokens,
-                        round_limit_hit: false,
-                    },
-                });
-            }
-
-            // Execute tools (special session tools are intercepted)
-            for tc in &resp.tool_calls {
-                let tool_name = &tc.function.name;
-                let raw_args = &tc.function.arguments;
-
-                // Invalidate file summaries for any write/patch (so read_summary sees fresh mtime next time)
-                if let Ok(args_val) = serde_json::from_str::<serde_json::Value>(raw_args) {
-                    self.maybe_invalidate_summary(tool_name, &args_val);
-                }
-
-                // Intercept session meta + summary cache tools
-                if let Some(ack) = self.handle_session_tool(tool_name, raw_args).await {
-                    let rec = self.record_tool_action(tool_name, raw_args, &ack);
-                    let to_model = rec.output_to_model.clone();
-                    actions.push(rec);
-                    self.conversation.push(Message {
-                        role: "tool".into(),
-                        content: Some(to_model),
-                        tool_calls: None,
-                        tool_call_id: Some(tc.id.clone()),
-                    });
-                    continue;
-                }
-
-                let output = tools::execute(
-                    &self.config.tool_backend,
-                    tool_name,
-                    raw_args,
-                    &self.config.workspace,
-                    self.config.context_budget.read_line_limit,
-                )
-                .await
-                .unwrap_or_else(|e| format!("X Tool execution error: {}", e));
-
-                let rec = self.record_tool_action(tool_name, raw_args, &output);
-                let to_model = rec.output_to_model.clone();
-                actions.push(rec);
-
-                self.conversation.push(Message {
-                    role: "tool".into(),
-                    content: Some(to_model),
-                    tool_calls: None,
-                    tool_call_id: Some(tc.id.clone()),
-                });
-            }
-
-            self.persist_turn().await;
-        }
-
-        // Exhausted rounds
-        let exhaustion = "⏸️ Reached tool round limit for this turn. Send another message to continue.";
-        self.conversation.push(Message {
-            role: "assistant".into(),
-            content: Some(exhaustion.into()),
-            tool_calls: None,
-            tool_call_id: None,
-        });
-        self.persist_turn().await;
-
-        let tool_calls = actions.len() as u32;
-        Ok(TurnResult {
-            final_text: last_assistant_text + "\n\n" + exhaustion,
-            actions,
-            rounds_used: max_rounds,
-            metrics: TurnMetrics {
-                llm_rounds: max_rounds,
-                tool_calls,
-                prompt_tokens,
-                completion_tokens,
-                total_tokens: prompt_tokens + completion_tokens,
-                round_limit_hit: true,
-            },
-        })
+        let mut observer = crate::agent_driver::SilentObserver;
+        crate::agent_driver::drive_turn(self, user_input, &mut observer).await
     }
 
     /// Get a streaming turn. The caller is responsible for consuming chunks and
@@ -421,8 +270,7 @@ impl Agent {
         self.conversation.push(Message {
             role: "user".into(),
             content: Some(
-                "[Continue working. You paused to describe your plan instead of executing it. \
-                 Call the next tool now — do not narrate.]".to_string()
+                crate::agent_driver::CONTINUATION_NUDGE.to_string()
             ),
             tool_calls: None,
             tool_call_id: None,
@@ -444,6 +292,34 @@ impl Agent {
             stream: true,
         };
         self.client.chat_stream(req).await
+    }
+
+    /// Send a streaming request with optional tool schemas.
+    /// Used by `agent_driver::drive_turn()` as the canonical inference call.
+    pub async fn send_streaming_request(
+        &mut self,
+        tools: Option<Vec<crate::llm::ToolDef>>,
+    ) -> Result<mpsc::Receiver<StreamChunk>> {
+        self.prune_history().await;
+        let messages = self.build_messages_for_model();
+        let req = ChatRequest {
+            messages,
+            tools,
+            temperature: self.config.temperature,
+            max_tokens: self.config.max_tokens,
+            stream: true,
+        };
+        self.client.chat_stream(req).await
+    }
+
+    /// Push an arbitrary message into the conversation (for nudges, system notes, etc.).
+    pub fn push_message(&mut self, role: &str, content: &str) {
+        self.conversation.push(Message {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
     }
 
     /// Context management (evolved for sessions).
