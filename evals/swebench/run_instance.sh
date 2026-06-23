@@ -175,6 +175,8 @@ grade_patch() {
 main() {
   ensure_tooling
   materialize_repo
+  # Clean stale results (e.g. report.json from a previous verify-grade run)
+  rm -rf "$RESULT_DIR"
   mkdir -p "$RESULT_DIR"
   cp "$INSTANCE_JSON" "$RESULT_DIR/instance.json"
 
