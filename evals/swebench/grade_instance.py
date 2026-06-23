@@ -186,6 +186,17 @@ def grade_instance(
     test_spec = make_test_spec(instance)
 
     _reset_repo(repo_dir, base_commit)
+
+    if not model_patch.strip():
+        # No changes produced — skip the full grading pipeline and return
+        # an unresolved report so the scorecard can aggregate cleanly.
+        return {
+            KEY_INSTANCE_ID: instance["instance_id"],
+            "resolved": False,
+            "resolved_status": "unresolved",
+            "note": "model produced empty patch",
+        }
+
     _apply_patch(repo_dir, test_patch, "test")
     _apply_patch(repo_dir, model_patch, "model")
 

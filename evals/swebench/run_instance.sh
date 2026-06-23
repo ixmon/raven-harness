@@ -67,6 +67,19 @@ materialize_repo() {
   git -C "$REPO_DIR" fetch origin --quiet || true
   git -C "$REPO_DIR" reset --hard "$base_commit"
   git -C "$REPO_DIR" clean -fdx
+
+  # ── Clear the persistent raven session for this workspace ──
+  # Without this, the agent's load_recent_conversation() picks up stale tool
+  # calls from previous runs, confusing the model about what's already been done.
+  local workspace_abs
+  workspace_abs="$(cd "$REPO_DIR" && pwd)"
+  for session_dir in "${HOME}/.raven-hotel/sessions"/*; do
+    [[ -d "$session_dir" ]] || continue
+    if [[ -f "$session_dir/meta.json" ]] && grep -Fq "\"$workspace_abs\"" "$session_dir/meta.json" 2>/dev/null; then
+      echo "==> clearing stale session for $workspace_abs"
+      rm -f "$session_dir/full_log.jsonl" "$session_dir/meta.json"
+    fi
+  done
 }
 
 copy_session_artifacts() {
