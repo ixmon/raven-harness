@@ -77,6 +77,12 @@ struct Args {
     /// such as full SWE-bench bug reports). Mutually exclusive with --prompt.
     #[arg(long, value_name = "FILE")]
     prompt_file: Option<PathBuf>,
+
+    /// Run without any persistent session. No conversation history is loaded,
+    /// no goal/discovery tracking, no session injection block. Each invocation
+    /// is a completely clean slate — ideal for evals and benchmarks.
+    #[arg(long)]
+    no_session: bool,
 }
 
 #[tokio::main]
@@ -140,46 +146,58 @@ async fn main() -> Result<()> {
     // === New session / context management ( ~/.raven-hotel/ ) ===
     // One persistent session per workspace. Supports goal tracking, repo cache,
     // safe discovery, and a compact injection block for the model.
-    let mut sess = session::Session::init(&workspace)?;
+    // When --no-session is set, no session is created at all — the agent runs
+    // with a completely clean slate (no history, no goal tracking).
+    let no_session = args.no_session;
+    let mut sess = if no_session {
+        None
+    } else {
+        Some(session::Session::init(&workspace)?)
+    };
 
     if eval_mode {
         eprintln!(
-            "eval: scenario={} workspace={} mock_tools={}",
+            "eval: scenario={} workspace={} mock_tools={} no_session={}",
             smoke_scenario
                 .as_ref()
                 .map(|s| s.name.as_str())
                 .unwrap_or("?"),
             workspace.display(),
-            matches!(tool_backend, tools::ToolBackend::Mock(_))
+            matches!(tool_backend, tools::ToolBackend::Mock(_)),
+            no_session,
         );
     }
 
-    if approval_env_thunderdome() {
-        sess.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
-        sess.save_meta()?;
-    }
+    if let Some(ref mut s) = sess {
+        if approval_env_thunderdome() {
+            s.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
+            s.save_meta()?;
+        }
 
-    // For interactive use we offer the Cursor-style trust prompt.
-    // This decides whether we do deep (but safe) indexing of the tree.
-    if is_interactive_tui {
-        // ensure_repo_cache will prompt if not yet trusted
-        let _ = session::ensure_repo_cache(&mut sess);
-    } else if !sess.meta.trusted {
-        // Non-interactive: be conservative, do not index giant trees automatically.
-        // The agent can still explore with list/read/grep.
-        sess.meta.trusted = false;
-        sess.save_meta()?;
+        // For interactive use we offer the Cursor-style trust prompt.
+        // This decides whether we do deep (but safe) indexing of the tree.
+        if is_interactive_tui {
+            let _ = session::ensure_repo_cache(s);
+        } else if !s.meta.trusted {
+            // Non-interactive: be conservative, do not index giant trees automatically.
+            s.meta.trusted = false;
+            s.save_meta()?;
+        }
     }
 
     // Small one-time status (goes to stderr so it doesn't pollute --prompt output)
     if is_interactive_tui {
-        eprintln!(
-            "raven session: {} | goal: {} | repo files: {} | trusted: {}",
-            sess.id,
-            { let g = &sess.meta.current_goal; let end = g.len().min(60); let end = (0..=end).rev().find(|&i| g.is_char_boundary(i)).unwrap_or(0); &g[..end] },
-            sess.meta.repo_cache.total_files_considered,
-            sess.meta.trusted
-        );
+        if let Some(ref s) = sess {
+            eprintln!(
+                "raven session: {} | goal: {} | repo files: {} | trusted: {}",
+                s.id,
+                { let g = &s.meta.current_goal; let end = g.len().min(60); let end = (0..=end).rev().find(|&i| g.is_char_boundary(i)).unwrap_or(0); &g[..end] },
+                s.meta.repo_cache.total_files_considered,
+                s.meta.trusted
+            );
+        } else {
+            eprintln!("raven: running without session (--no-session)");
+        }
     }
 
     // === Encrypted endpoint vault ===
@@ -287,7 +305,9 @@ async fn main() -> Result<()> {
     if let Some(prompt) = prompt {
         // Non-interactive single shot — uses the SAME agent loop as the TUI
         // (streaming, nudges, auto-continue) via drive_turn().
-        let _ = sess.set_last_user_request(&prompt);
+        if let Some(ref mut s) = sess {
+            let _ = s.set_last_user_request(&prompt);
+        }
         let tools_enabled = !smoke_scenario
             .as_ref()
             .is_some_and(|s| s.disable_tools);
@@ -300,7 +320,7 @@ async fn main() -> Result<()> {
             temperature: args.temperature,
             max_tokens: args.max_tokens,
             max_rounds,
-            prebuilt_session: Some(sess),
+            prebuilt_session: sess,
             context_budget: context_budget.clone(),
             tool_backend,
             tools_enabled,
@@ -363,7 +383,7 @@ async fn main() -> Result<()> {
         temperature: args.temperature,
         max_tokens: args.max_tokens,
         max_rounds: args.max_rounds,
-        prebuilt_session: Some(sess),
+        prebuilt_session: sess,
         context_budget,
         tool_backend,
         tools_enabled: true,

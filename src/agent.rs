@@ -97,11 +97,10 @@ impl Agent {
     pub fn new(mut config: Config, client: ChatBackend) -> Self {
         // Use prebuilt session from main (if provided) so that trust prompt + repo
         // cache bootstrap performed before launching the TUI / --prompt is connected.
-        // Falls back to a fresh init (loads from disk meta.json / context.db).
+        // When prebuilt_session is None (e.g. --no-session), the agent runs without
+        // any session — no conversation history, no goal tracking, no injection block.
         let prebuilt = std::mem::take(&mut config.prebuilt_session);
-        let session = prebuilt.or_else(|| {
-            crate::session::Session::init(&config.workspace).ok()
-        });
+        let session = prebuilt;
         let mut conversation = vec![];
 
         // Restore recent conversation from the persistent log so the model

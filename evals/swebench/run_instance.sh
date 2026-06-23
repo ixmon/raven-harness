@@ -68,18 +68,7 @@ materialize_repo() {
   git -C "$REPO_DIR" reset --hard "$base_commit"
   git -C "$REPO_DIR" clean -fdx
 
-  # ── Clear the persistent raven session for this workspace ──
-  # Without this, the agent's load_recent_conversation() picks up stale tool
-  # calls from previous runs, confusing the model about what's already been done.
-  local workspace_abs
-  workspace_abs="$(cd "$REPO_DIR" && pwd)"
-  for session_dir in "${HOME}/.raven-hotel/sessions"/*; do
-    [[ -d "$session_dir" ]] || continue
-    if [[ -f "$session_dir/meta.json" ]] && grep -Fq "\"$workspace_abs\"" "$session_dir/meta.json" 2>/dev/null; then
-      echo "==> clearing stale session for $workspace_abs"
-      rm -f "$session_dir/full_log.jsonl" "$session_dir/meta.json"
-    fi
-  done
+  # Session pollution is handled by --no-session flag on the raven-tui invocation below.
 }
 
 copy_session_artifacts() {
@@ -179,6 +168,7 @@ run_raven() {
     PATH="$PROJ_VENV/bin:$PATH" cargo run --release --quiet --bin raven-tui -- \
       --workspace "$REPO_DIR" \
       --prompt-file "$RESULT_DIR/prompt.txt" \
+      --no-session \
       --max-rounds "${RAVEN_MAX_ROUNDS:-30}" \
       --max-tokens "${RAVEN_MAX_TOKENS:-16384}" \
       --temperature "${RAVEN_TEMPERATURE:-0}" \
