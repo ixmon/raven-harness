@@ -129,6 +129,7 @@ run_raven() {
       --workspace "$REPO_DIR" \
       --prompt "$prompt" \
       --max-rounds "${RAVEN_MAX_ROUNDS:-30}" \
+      --max-tokens "${RAVEN_MAX_TOKENS:-16384}" \
       --temperature "${RAVEN_TEMPERATURE:-0}" \
       --base-url "${LLM_BASE_URL:-http://127.0.0.1:8080/v1}" \
       ${LLM_MODEL:+--model "$LLM_MODEL"} \

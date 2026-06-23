@@ -189,6 +189,25 @@ impl Agent {
             }
 
             if resp.tool_calls.is_empty() {
+                // If finish_reason is "length", the model ran out of output tokens
+                // (common with thinking models like Qwen3 that spend tokens on reasoning).
+                // Nudge it to continue with tool calls instead of returning early.
+                let hit_length = resp.finish_reason.as_deref() == Some("length");
+                if hit_length && round + 1 < max_rounds {
+                    self.conversation.push(Message {
+                        role: "user".into(),
+                        content: Some(
+                            "[system: Your previous response was truncated (output limit). \
+                             Please use your tools now to investigate and solve the task. \
+                             Start with `list` or `read` to explore the codebase.]"
+                                .into(),
+                        ),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                    continue;
+                }
+
                 self.persist_turn().await;
                 let tool_calls = actions.len() as u32;
                 return Ok(TurnResult {
