@@ -42,9 +42,11 @@ pub fn smoke_mode() -> String {
     std::env::var("SWEBENCH_SMOKE_MODE").unwrap_or_else(|_| "verify-grade".into())
 }
 
-/// Resolve mode from eval profile; `swebench-live` always runs the agent.
+/// Resolve mode from eval profile; `swebench-live` and `easy-bench-live` (which
+/// includes a real SWE-bench case) always run the agent ("full"). Other profiles
+/// default to "verify-grade" (gold patch smoke test, no agent run).
 pub fn mode_for_profile(profile: &str) -> String {
-    if profile == "swebench-live" {
+    if profile == "swebench-live" || profile == "easy-bench-live" {
         return "full".into();
     }
     smoke_mode()
@@ -124,6 +126,7 @@ mod tests {
     #[test]
     fn mode_for_profile_live_vs_smoke() {
         assert_eq!(mode_for_profile("swebench-live"), "full");
+        assert_eq!(mode_for_profile("easy-bench-live"), "full");
         assert_eq!(mode_for_profile("swebench-smoke"), "verify-grade");
         assert_eq!(mode_for_profile("single:foo"), "verify-grade");
     }

@@ -28,7 +28,7 @@ use crate::input_dispatch::{
     SlashDispatch,
 };
 use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
-use crate::llm::ToolCall;
+use crate::llm::{strip_xml_tool_call_blocks, ToolCall};
 use crate::session::ExecApprovalMode;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
@@ -174,7 +174,7 @@ impl App {
              Endpoint: {}\n\
              Model:    {}\n\
              Workspace: {}\n\n\
-             Session context, goal tracking, and a safe repo cache (tree + importance + recent summary)\n\
+             Session context (goal tracking disabled by default; enable with RAVEN_GOAL_TRACKING=1), and a safe repo cache (tree + importance + recent summary)\n\
              are now persisted under ~/.raven-hotel/ and injected on every turn.\n\
              The model can call update_goal(...) and record_discovery(...) when intent shifts.\n\
              Type / in the input for commands (help, clear, reset, status...).\n\
@@ -231,7 +231,7 @@ impl App {
             search: SearchState::default(),
             search_mode: false,
             cached_mode_label: String::new(),
-            cached_goal_text: "(no goal set)".into(),
+            cached_goal_text: "none".into(),
             desktop: DesktopState::new(),
             raven_art: load_raven_art(),
         }
@@ -849,6 +849,19 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     let mut app = App::new(&config);
 
+    // Support for raven-eval --test ... --interactive : prefill the input with the test's prompt
+    // so the user sees the TUI with the prompt ready and can press Enter to start.
+    if let Ok(pfile) = std::env::var("RAVEN_EVAL_INITIAL_PROMPT_FILE") {
+        if let Ok(text) = std::fs::read_to_string(&pfile) {
+            let text = text.trim().to_string();
+            if !text.is_empty() {
+                app.input = text;
+                app.cursor_pos = app.input.len();
+                app.needs_redraw = true;
+            }
+        }
+    }
+
     // Channel for agent to push live updates into the TUI
     let (tx, mut rx) = mpsc::channel::<UiUpdate>(64);
 
@@ -909,12 +922,16 @@ async fn run_app<B: ratatui::backend::Backend>(
         // On lock contention, reuse cached labels instead of showing "…" to avoid flicker.
         let (mode_label, goal_text) = if let Ok(ag) = agent.try_lock() {
             let mode = ag.current_exec_mode().label().to_string();
-            let goal = ag.session.as_ref()
-                .and_then(|s| {
-                    let g = s.meta.current_goal.as_str();
-                    if g.is_empty() { None } else { Some(g.to_string()) }
-                })
-                .unwrap_or_else(|| "(no goal set)".into());
+            let goal = if std::env::var("RAVEN_GOAL_TRACKING").is_ok() {
+                ag.session.as_ref()
+                    .and_then(|s| {
+                        let g = s.meta.current_goal.as_str();
+                        if g.is_empty() { None } else { Some(g.to_string()) }
+                    })
+                    .unwrap_or_else(|| "(no goal set)".into())
+            } else {
+                "none".into()
+            };
             (mode, goal)
         } else {
             (app.cached_mode_label.clone(), app.cached_goal_text.clone())
@@ -1184,10 +1201,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                             // Use the Done's final_text as a robust fallback in case no individual
                             // Token updates were emitted by the stream (some llama.cpp configurations
                             // deliver the full response only in the final payload).
-                            let output = if !app.current_response.trim().is_empty() {
-                                app.current_response.trim().to_string()
-                            } else if !final_text.trim().is_empty() {
+                            let mut output = if !final_text.trim().is_empty() {
+                                // Prefer the cleaned version from the Done payload (already stripped of XML tool call syntax)
                                 final_text
+                            } else if !app.current_response.trim().is_empty() {
+                                app.current_response.trim().to_string()
                             } else if !app.current_thinking.trim().is_empty() {
                                 // Fallback: if the model delivered the response via the reasoning/thinking channel
                                 // (no regular content tokens), use it so output appears in the conversation pane.
@@ -1195,6 +1213,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                             } else {
                                 String::new()
                             };
+                            if !output.trim().is_empty() {
+                                output = strip_xml_tool_call_blocks(&output);
+                            }
                             if !output.is_empty() {
                                app.left_committed.push(format!("Agent: {}", output));
                                 #[cfg(feature = "clipboard")]

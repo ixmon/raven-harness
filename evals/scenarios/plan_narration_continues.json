@@ -1,0 +1,38 @@
+{
+  "name": "plan_narration_continues",
+  "type": "smoke",
+  "description": "Model first narrates a plan without calling a tool. Should get continuation nudge and actually act next turn.",
+  "prompt": "Summarize the project root.",
+  "max_rounds": 5,
+  "mock_tools": {
+    "list": {
+      ".": "README.md\nCargo.toml\n"
+    },
+    "read": {
+      "README.md": "This is the raven project for agent evals."
+    }
+  },
+  "llm_turns": [
+    {
+      "content": "Let me first explore the directory structure to understand the project."
+    },
+    {
+      "tool_calls": [
+        { "name": "list", "arguments": { "path": "." } }
+      ]
+    },
+    {
+      "tool_calls": [
+        { "name": "read", "arguments": { "path": "README.md" } }
+      ]
+    },
+    {
+      "content": "The project is for testing agent flows with evals."
+    }
+  ],
+  "expect": {
+    "stdout_contains": ["evals", "flows"],
+    "min_tool_calls": 2,
+    "tools_used": ["list", "read"]
+  }
+}

@@ -11,6 +11,10 @@ pub struct ScenarioResult {
     pub passed: bool,
     pub duration_ms: u64,
     pub message: String,
+    // Agent-side metrics captured via RAVEN_METRICS_OUT / harness_turn / metrics.json
+    pub turns: Option<u32>,
+    pub tool_calls: Option<u32>,
+    pub agent_duration_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

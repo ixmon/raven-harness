@@ -1,0 +1,30 @@
+{
+  "name": "empty_first_recovery",
+  "type": "smoke",
+  "description": "First model response is completely empty (no content, no tools). Driver should recover with nudge and continue to do work.",
+  "prompt": "List the files in the root.",
+  "max_rounds": 5,
+  "mock_tools": {
+    "list": {
+      ".": "README.md\nsrc/\n"
+    }
+  },
+  "llm_turns": [
+    {
+      "content": ""
+    },
+    {
+      "tool_calls": [
+        { "name": "list", "arguments": { "path": "." } }
+      ]
+    },
+    {
+      "content": "The root contains README.md and a src directory."
+    }
+  ],
+  "expect": {
+    "stdout_contains": ["README.md", "src"],
+    "min_tool_calls": 1,
+    "tools_used": ["list"]
+  }
+}

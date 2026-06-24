@@ -73,6 +73,20 @@ pub fn load_registry() -> Result<Registry> {
             needs_llm: true,
             offline: false,
         },
+        TestEntry {
+            id: "easy-bench-live".into(),
+            tier: TestTier::LiveSmoke,
+            description: "Easy-bench live series (hello-world, fizzbuzz, ...): quick live functional tests of agent (real tools/LLM)".into(),
+            needs_llm: true,
+            offline: false,
+        },
+        TestEntry {
+            id: "easy-fizzbuzz".into(),
+            tier: TestTier::LiveSmoke,
+            description: "Easy-bench live (harder): write fizzbuzz.py that prints FizzBuzz 1-20 (live agent)".into(),
+            needs_llm: true,
+            offline: false,
+        },
     ];
 
     let mut scenarios = vec![];
@@ -119,7 +133,7 @@ fn load_scenario_entry(path: &Path) -> Result<Option<TestEntry>> {
             needs_llm: false,
             offline: true,
         }),
-        "smoke" => {
+        "smoke" | "live" => {
             let has_mock_llm = raw
                 .get("llm_turns")
                 .and_then(|v| v.as_array())
@@ -184,6 +198,25 @@ pub fn find_entry<'a>(reg: &'a Registry, id: &str) -> Option<&'a TestEntry> {
         .or_else(|| reg.scenarios.iter().find(|e| e.id == id))
 }
 
+fn load_easy_bench_ids() -> Result<Vec<String>> {
+    let path = manifest_dir().join("evals/easy_bench.json");
+    let data = std::fs::read_to_string(&path)
+        .with_context(|| format!("read {}", path.display()))?;
+    let v: Value = serde_json::from_str(&data)?;
+    let arr = v
+        .get("easy_tests")
+        .and_then(|x| x.as_array())
+        .ok_or_else(|| anyhow::anyhow!("easy_bench.json missing easy_tests array"))?;
+    let ids: Vec<String> = arr
+        .iter()
+        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+        .collect();
+    if ids.is_empty() {
+        anyhow::bail!("easy_tests is empty in {}", path.display());
+    }
+    Ok(ids)
+}
+
 pub fn profile_ids(profile: &str) -> Result<Vec<String>> {
     let reg = load_registry()?;
     let ids = match profile {
@@ -201,8 +234,11 @@ pub fn profile_ids(profile: &str) -> Result<Vec<String>> {
         "swebench-smoke" | "swebench-live" => {
             super::swebench::smoke_trio_ids(&manifest_dir())?
         }
+        "easy-bench-live" => load_easy_bench_ids().unwrap_or_else(|_| vec!["easy-hello-world".into(), "easy-fizzbuzz".into()]),
+        "easy-hello-world" => vec!["easy-hello-world".into()],
+        "easy-fizzbuzz" => vec!["easy-fizzbuzz".into()],
         other => anyhow::bail!(
-            "unknown profile {other:?} (use quick, local, full, swebench-smoke, or swebench-live)"
+            "unknown profile {other:?} (use quick, local, full, swebench-smoke, swebench-live, or easy-bench-live)"
         ),
     };
     Ok(ids)
@@ -218,6 +254,8 @@ mod tests {
         assert!(!reg.fixed.is_empty());
         assert!(reg.scenarios.iter().any(|s| s.id == "smoke_ping"));
         assert!(reg.scenarios.iter().any(|s| s.id == "mock_tool_loop"));
+        assert!(reg.scenarios.iter().any(|s| s.id == "easy-fizzbuzz"));
+        assert!(reg.fixed.iter().any(|s| s.id == "easy-bench-live"));
     }
 
     #[test]
@@ -232,5 +270,20 @@ mod tests {
         let smoke = profile_ids("swebench-smoke").expect("smoke");
         let live = profile_ids("swebench-live").expect("live");
         assert_eq!(smoke, live);
+    }
+
+    #[test]
+    fn easy_bench_live_profile() {
+        let ids = profile_ids("easy-bench-live").expect("profile");
+        assert!(ids.len() >= 3, "easy-bench-live should run a series of >1 easy tests (incl. marshmallow SWE case)");
+        assert!(ids.contains(&"easy-hello-world".to_string()));
+        assert!(ids.contains(&"easy-fizzbuzz".to_string()));
+        assert!(ids.contains(&"marshmallow-code__marshmallow-1343".to_string()));
+    }
+
+    #[test]
+    fn easy_fizzbuzz_profile() {
+        let ids = profile_ids("easy-fizzbuzz").expect("profile");
+        assert_eq!(ids, vec!["easy-fizzbuzz".to_string()]);
     }
 }

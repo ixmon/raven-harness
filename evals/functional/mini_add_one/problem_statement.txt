@@ -1,0 +1,11 @@
+The `add_one` function is broken: it returns the input unchanged instead of adding one.
+
+## Expected Behaviour
+add_one(0) == 1
+add_one(1) == 2
+add_one(-1) == 0
+
+## Observed Behaviour
+add_one(0) == 0
+
+Fix the implementation in add_one.py so that the tests in test_add_one.py pass.

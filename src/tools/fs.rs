@@ -130,8 +130,22 @@ pub fn write_file(user_path: &str, content: &str, workspace: &Path) -> String {
         }
     }
 
+    // Read before to detect no-op writes (helps models realize their "edit" matched existing content)
+    let before = fs::read_to_string(&path).unwrap_or_default();
+    let will_change = before != content;
+
     match fs::write(&path, content) {
-        Ok(_) => format!("Wrote {} bytes to {}", content.len(), path.display()),
+        Ok(_) => {
+            if will_change || !path.exists() {
+                format!("Wrote {} bytes to {}", content.len(), path.display())
+            } else {
+                format!(
+                    "Wrote {} bytes to {} (no net change — file already contained exactly this content)",
+                    content.len(),
+                    path.display()
+                )
+            }
+        }
         Err(e) => format!("❌ Write error for {}: {}", path.display(), e),
     }
 }
@@ -163,6 +177,8 @@ pub fn patch_file(
     if count == 0 {
         return format!("⚠️ Search text not found in {}", path.display());
     }
+
+    let original = content.clone();
 
     let new_content = if count == 1 {
         content.replacen(search, replace, 1)
@@ -204,8 +220,19 @@ pub fn patch_file(
         );
     };
 
+    let changed = new_content != original;
+
     match fs::write(&path, &new_content) {
-        Ok(_) => format!("✅ Patched {}", path.display()),
+        Ok(_) => {
+            if changed {
+                format!("✅ Patched {}", path.display())
+            } else {
+                format!(
+                    "✅ Patched {} (no net change — the content after the edit was identical to before)",
+                    path.display()
+                )
+            }
+        }
         Err(e) => format!("❌ Patch write error: {}", e),
     }
 }

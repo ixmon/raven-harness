@@ -122,6 +122,15 @@ impl TurnObserver for HeadlessObserver {
     fn on_tool_result(&mut self, record: &ActionRecord) {
         eprintln!("{}", record.summary.lines().next().unwrap_or(""));
     }
+    /// Print thinking/reasoning_content live (llama.cpp, Qwen, etc.).
+    /// This makes the model's "productive thinking" visible in headless runs
+    /// (e.g. tail -f results/.../raven.stderr) the same way the TUI shows it
+    /// in the trace pane. Raw stream so you see the CoT as it is generated.
+    fn on_thinking(&mut self, text: &str) {
+        if !text.is_empty() {
+            eprint!("{}", text);
+        }
+    }
     fn on_nudge(&mut self, count: u32, max: u32) {
         eprintln!("  [nudge {}/{}]", count, max);
     }
@@ -156,17 +165,11 @@ pub async fn drive_turn(
     prompt: &str,
     observer: &mut dyn TurnObserver,
 ) -> Result<TurnResult> {
-    // When we have a session, the initial prompt is injected into the system block
-    // as "Latest User Request" on every model call. Using record_user_request()
-    // avoids re-appending the (potentially huge) raw task text into conversation
-    // history on each headless launch. When there's NO session (integration tests,
-    // simple --prompt without workspace), we must push the prompt into conversation
-    // directly so the model sees it.
-    if agent.has_session() {
-        agent.record_user_request(prompt);
-    } else {
-        agent.on_new_user_input(prompt);
-    }
+    // Record the user prompt (initial or follow-up). This always pushes the
+    // latest user input onto the conversation as a role:user turn so the model
+    // has proper alternating history context. (The SESSION CONTEXT injection
+    // block also includes "Latest User Message" + summaries + repo for richness.)
+    agent.on_new_user_input(prompt);
 
     let max_rounds = agent.current_config().max_rounds.clamp(1, MAX_TOOL_ROUNDS);
     let tools_schema = tools::all_tools();
@@ -194,7 +197,7 @@ pub async fn drive_turn(
             // transient errors (e.g. decode errors from the server). We do
             // not push error text into assistant history and do not treat
             // a retried error as a normal "no tools" round.
-            let (round_text, tool_calls, usage, finish_reason) = {
+            let (raw_round_text, tool_calls, usage, finish_reason, round_thinking) = {
                 let mut attempt = 0u32;
                 loop {
                     let stream = match agent.send_streaming_request(tools_for_request.clone()).await {
@@ -207,14 +210,14 @@ pub async fn drive_turn(
                     };
                     total_llm_rounds += 1;
 
-                    let (text, calls, usg, fr) = consume_stream(stream, observer).await;
+                    let (text, calls, usg, fr, thk) = consume_stream(stream, observer).await;
 
                     if text.starts_with("LLM error:") && attempt < MAX_STREAM_RETRIES {
                         attempt += 1;
                         // retry the send without polluting conversation
                         continue;
                     }
-                    break (text, calls, usg, fr);
+                    break (text, calls, usg, fr, thk);
                 }
             };
 
@@ -223,16 +226,54 @@ pub async fn drive_turn(
                 completion_tokens += u.completion_tokens.unwrap_or(0) as u64;
             }
 
-            let is_llm_error = round_text.starts_with("LLM error:");
+            let is_llm_error = raw_round_text.starts_with("LLM error:");
+            // Always sanitize any tool XML fragments (including the reported case of
+            // stray "}" + closing tags like "</parameter></function></tool_call>")
+            // out of the visible/model text. This protects history, judge, final_text,
+            // and display even if upstream stripping missed a weird generation.
+            let round_text = if is_llm_error {
+                raw_round_text
+            } else {
+                crate::llm::strip_xml_tool_call_blocks(&raw_round_text)
+            };
+
+            // Persist separate thinking/reasoning_content (if any) for this round.
+            // In interactive TUI this powers the right-pane "Thinking (live)".
+            // In headless (and thus swebench eval logs) it was previously invisible
+            // both live and in full_log.jsonl / raven_log.jsonl.
+            // We record it under role="thinking" so it doesn't pollute normal assistant
+            // content for resume, last_assistant_content checks, or model history.
+            if !is_llm_error && !round_thinking.trim().is_empty() {
+                if let Some(s) = &agent.session {
+                    let entry = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "role": "thinking",
+                        "round": total_llm_rounds,
+                        "content": round_thinking,
+                    });
+                    let _ = s.append_log(&entry.to_string());
+                }
+            }
+
+            // For history pushes and "was this empty?" logic, fall back to thinking
+            // if the regular content channel was empty. This ensures CoT emitted
+            // only via reasoning_content still gets into the assistant messages
+            // the model will see on future turns (and avoids treating pure-thinking
+            // generations as "empty responses").
+            let effective_text = if !round_text.trim().is_empty() {
+                round_text.clone()
+            } else {
+                round_thinking.clone()
+            };
 
             // Interject takes precedence (user injected a new instruction live).
             // Commit any partial text we received, inject the new user message,
             // notify, and immediately request the next model response.
             // Never commit raw LLM error text as assistant output.
             if let Some(msg) = observer.take_interject() {
-                if !round_text.trim().is_empty() && !is_llm_error {
-                    agent.push_assistant_text(&round_text);
-                    last_assistant_text = round_text.clone();
+                if !effective_text.trim().is_empty() && !is_llm_error {
+                    agent.push_assistant_text(&effective_text);
+                    last_assistant_text = effective_text.clone();
                 }
                 agent.on_new_user_input(&msg);
                 observer.on_interject(&msg);
@@ -241,9 +282,9 @@ pub async fn drive_turn(
 
             // Hard stop (e.g. Esc) with no interject: commit partial and end.
             if observer.should_stop() {
-                if !round_text.trim().is_empty() && !is_llm_error {
-                    agent.push_assistant_text(&round_text);
-                    last_assistant_text = round_text.clone();
+                if !effective_text.trim().is_empty() && !is_llm_error {
+                    agent.push_assistant_text(&effective_text);
+                    last_assistant_text = effective_text.clone();
                 }
                 break 'auto_continue;
             }
@@ -251,9 +292,9 @@ pub async fn drive_turn(
             // Record assistant text (normal case).
             // Never push "LLM error: ..." strings as model output — they are
             // transient transport problems, not assistant content.
-            if !round_text.trim().is_empty() && !is_llm_error {
-                agent.push_assistant_text(&round_text);
-                last_assistant_text = round_text.clone();
+            if !effective_text.trim().is_empty() && !is_llm_error {
+                agent.push_assistant_text(&effective_text);
+                last_assistant_text = effective_text.clone();
             }
 
             // ── No tool calls: decide what to do ──
@@ -262,6 +303,7 @@ pub async fn drive_turn(
                     // Exhausted retries for this call. Give the agent a chance
                     // to continue instead of treating the error as completion.
                     if total_llm_rounds < max_rounds {
+                        agent.log_harness_event_with_round("nudge", "llm-stream-error-recovery", total_llm_rounds);
                         agent.push_message(
                             "user",
                             "[LLM stream error during request. Please continue using your tools to solve the task.]",
@@ -273,16 +315,190 @@ pub async fn drive_turn(
                 // finish_reason=length → recovery nudge
                 let hit_length = finish_reason.as_deref() == Some("length");
                 if hit_length && total_llm_rounds < max_rounds {
+                    agent.log_harness_event_with_round("nudge", "length-recovery", total_llm_rounds);
                     agent.push_message("user", LENGTH_RECOVERY_NUDGE);
                     continue;
                 }
+
+                // If completion criteria (from define_done) is set, ALWAYS let the judge decide
+                // on a no-tool round (empty or text response). Follow its decision:
+                // - Fulfilled: accept done, clear criteria
+                // - Stuck: stop and surface guidance
+                // - Continue: nudge (with criteria reminder) and keep going.
+                // This way the judge keeps nudging on every round where criteria is not met,
+                // not only on the 3rd call and not gated behind "no repair yet".
+                if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
+                    if !c.trim().is_empty() {
+                        let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
+                        let decision = agent.judge_turn(&effective_text, &recent).await;
+                        let summary = format!("⭐ JUDGE (criteria active): {:?}", decision);
+                        observer.on_tool_result(&ActionRecord {
+                            tool: "system".into(),
+                            args: "".into(),
+                            summary: summary.clone(),
+                            output_to_model: "".into(),
+                            raw_bytes: 0,
+                            truncated: false,
+                        });
+                        agent.log_harness_event_with_round("judge", &summary, total_llm_rounds);
+                        match decision {
+                            TurnJudge::Fulfilled { .. } => {
+                                if let Some(s) = &mut agent.session {
+                                    s.meta.completion_criteria = None;
+                                    let _ = s.save_meta();
+                                }
+                                completed_naturally = true;
+                                break;
+                            }
+                            TurnJudge::Stuck { reason, suggested_guidance } => {
+                                observer.on_stuck(&reason, &suggested_guidance);
+                                let msg = format!("[JUDGE: stuck with criteria defined. {} {}]", reason, suggested_guidance);
+                                agent.log_harness_event_with_round("stuck", &msg, total_llm_rounds);
+                                agent.push_message("user", &msg);
+                                completed_naturally = true;
+                                break;
+                            }
+                            TurnJudge::Continue => {
+                                if total_llm_rounds < max_rounds {
+                                    text_nudges += 1;
+                                    observer.on_nudge(text_nudges, 999); // criteria path intentionally exceeds MAX_TEXT_NUDGES
+                                    let nudge_text = format!("[You defined done as: {}. Now use tools to satisfy the criteria (read the files and patch the source).]", c);
+                                    agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/999: {}", text_nudges, nudge_text), total_llm_rounds);
+                                    agent.push_message("user", &nudge_text);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Empty first/early response recovery.
+                // The model (or server) sometimes emits a response with zero content
+                // and zero tool calls on the opening turn (pure system message + injection,
+                // reasoning-only deltas, or transient generation). Do not treat this as
+                // natural completion — nudge once and retry while budget allows.
+                if effective_text.trim().is_empty() && !is_llm_error {
+                    if total_llm_rounds < max_rounds {
+                        if text_nudges < MAX_TEXT_NUDGES {
+                            text_nudges += 1;
+                            observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                            let base = "[Your previous response was empty (no text, no tool calls). \
+                                        Start working immediately: use list / read / grep (or read_summary) \
+                                        to explore the code and make progress on the task.]";
+                            // Re-anchor to the original request if available (helps the model if it "forgot")
+                            let reminder = agent.session.as_ref()
+                                .and_then(|s| s.meta.last_user_request.as_deref())
+                                .map(|r| format!("\n\nRemember the original request:\n{}", r))
+                                .unwrap_or_default();
+                            let criteria_reminder = if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
+                                format!("\n\nYou defined done as: {}. Read the files in the traceback (schema.py, fields.py etc.) and use patch to make it true.", c)
+                            } else { "".to_string() };
+                            if text_nudges < MAX_TEXT_NUDGES {
+                                let nudge = format!("{}{}{}", base, reminder, criteria_reminder);
+                                agent.log_harness_event("nudge", &format!("empty-recovery nudge {}/{}: {}", text_nudges, MAX_TEXT_NUDGES, nudge));
+                                agent.push_message("user", &nudge);
+                            } else {
+                                // This is the 3rd nudge: run the judge and decide whether to
+                                // allow it (and effectively increase the nudge allowance).
+                                let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
+                                let decision = agent.judge_turn(&effective_text, &recent).await;
+                                let summary = format!("⭐ JUDGE ON 3RD EMPTY NUDGE: {:?}", decision);
+                                observer.on_tool_result(&ActionRecord {
+                                    tool: "system".into(),
+                                    args: "".into(),
+                                    summary: summary.clone(),
+                                    output_to_model: "".into(),
+                                    raw_bytes: 0,
+                                    truncated: false,
+                                });
+                                agent.log_harness_event("judge", &summary);
+                                match decision {
+                                    TurnJudge::Fulfilled { .. } => {
+                                        // Only judge clears completion_criteria
+                                        if let Some(s) = &mut agent.session {
+                                            if s.meta.completion_criteria.is_some() {
+                                                s.meta.completion_criteria = None;
+                                                let _ = s.save_meta();
+                                            }
+                                        }
+                                        completed_naturally = true;
+                                        break;
+                                    }
+                                    TurnJudge::Stuck { reason, suggested_guidance } => {
+                                        observer.on_stuck(&reason, &suggested_guidance);
+                                        let guidance = format!(
+                                            "[You appear to be looping without progress after empty responses: {}. \
+                                             Stop and explain the situation or ask for guidance: {}]",
+                                            reason, suggested_guidance
+                                        );
+                                        agent.log_harness_event("stuck", &guidance);
+                                        agent.push_message("user", &guidance);
+                                        completed_naturally = true;
+                                        break;
+                                    }
+                                    TurnJudge::Continue => {
+                                        let criteria_reminder = if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
+                                            format!(" You defined done as: {}. Now read the key files and patch to satisfy it.", c)
+                                        } else { "".to_string() };
+                                        let nudge = format!("{}{} [JUDGE: Continue despite limit.{}]", base, reminder, criteria_reminder);
+                                        agent.log_harness_event("nudge", &format!("3rd-empty-continue nudge: {}", nudge));
+                                        agent.push_message("user", &nudge);
+                                        continue;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Detect "plan narration" responses where the model describes what it will do
+                // ("Let me implement...", "the fix is...", "I will now patch") but does not
+                // actually call the tool. This is common when explicitly asked to "produce a patch".
+                // Force a continuation nudge so it acts instead of completing the turn with text only.
+                let text_lower = effective_text.to_lowercase();
+                let looks_like_plan_narration = tool_calls.is_empty() &&
+                    (text_lower.contains("let me ") ||
+                     text_lower.contains("i will ") ||
+                     text_lower.contains("the fix is") ||
+                     text_lower.contains("implement this") ||
+                     text_lower.contains("re-read the code") ||
+                     (text_lower.contains("implement") && text_lower.contains("fix")));
+                if looks_like_plan_narration && !is_llm_error {
+                    if text_nudges < MAX_TEXT_NUDGES {
+                        text_nudges += 1;
+                        observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                        agent.log_harness_event_with_round("nudge", &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES), total_llm_rounds);
+                        agent.push_continuation_nudge();
+                        continue;
+                    }
+                }
+
+                // Detect malformed/partial tool call syntax in the (post-strip) text even if parse failed to extract tool_calls.
+                // Examples: "read><parameter", "function=read>", "</parameter", "parameter ", "path>"
+                //
+                // We apply the check both to the just-received round_text *and* to the
+                // tail of the session log (last committed assistant content). The log tail
+                // is the durable record of what actually landed in history for this turn,
+                // which can be more reliable than only the last streaming packet / in-turn
+                // accumulation when fragments leak past per-token suppression.
+                let log_tail = agent
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.last_assistant_content())
+                    .unwrap_or_default();
+                let looks_like_malformed_tool =
+                    (crate::llm::contains_tool_xml_syntax(&round_text)
+                        || crate::llm::contains_tool_xml_syntax(&log_tail))
+                        && tool_calls.is_empty();
 
                 // Rich inference judge: decides fulfillment *and* whether the agent
                 // is looping unproductively and should ask the user for guidance.
                 // Only consult the judge when the stop reason is ambiguous.
                 // finish_reason=stop means the model deliberately finished — accept it.
+                // We now also consult for early-turn malformed tool syntax so the judge can decide if more nudge is warranted.
                 let model_stopped = finish_reason.as_deref() == Some("stop");
-                if !model_stopped && tools_used_this_turn > 0 {
+                if !model_stopped && (tools_used_this_turn > 0 || looks_like_malformed_tool) {
                     let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
 
                     // Hard safety: if the *original user request* clearly asks to
@@ -303,14 +519,16 @@ pub async fn drive_turn(
 
                     if implies_run && !has_exec {
                         // Force continuation / nudge; do not trust judge or model claim yet.
+                        let summary = "⭐ JUDGE/HARD-SAFETY: request implies run but no exec yet → forcing nudge".to_string();
                         observer.on_tool_result(&ActionRecord {
                             tool: "system".into(),
                             args: "".into(),
-                            summary: "⭐ JUDGE/HARD-SAFETY: request implies run but no exec yet → forcing nudge".into(),
+                            summary: summary.clone(),
                             output_to_model: "".into(),
                             raw_bytes: 0,
                             truncated: false,
                         });
+                        agent.log_harness_event("judge", &summary);
                         // Do not push the debug into the conversation history for the model.
                         // It pollutes request_text scans and the model's context.
                         // The observer already surfaces it for logs/trace.
@@ -337,21 +555,30 @@ pub async fn drive_turn(
                         }
                     }
 
-                    let decision = agent.judge_turn(&round_text, &recent).await;
+                    let decision = agent.judge_turn(&effective_text, &recent).await;
+                    let summary = format!("⭐ JUDGE DECISION: {:?}", decision);
                     observer.on_tool_result(&ActionRecord {
                         tool: "system".into(),
                         args: "".into(),
-                        summary: format!("⭐ JUDGE DECISION: {:?}", decision),
+                        summary: summary.clone(),
                         output_to_model: "".into(),
                         raw_bytes: 0,
                         truncated: false,
                     });
+                    agent.log_harness_event_with_round("judge", &summary, total_llm_rounds);
                     // Note: we no longer push judge decisions as user messages (they
                     // polluted request_text and the model's context). The observer
                     // call above is enough for trace / logs.
 
                     match decision {
                         TurnJudge::Fulfilled { .. } => {
+                            // Only judge clears completion_criteria (agent sets it one-time via define_done)
+                            if let Some(s) = &mut agent.session {
+                                if s.meta.completion_criteria.is_some() {
+                                    s.meta.completion_criteria = None;
+                                    let _ = s.save_meta();
+                                }
+                            }
                             completed_naturally = true;
                             break;
                         }
@@ -364,6 +591,7 @@ pub async fn drive_turn(
                                  If the diagnosis is clear, immediately use `patch` or `write` on the relevant source file to apply the fix.",
                                 reason, suggested_guidance
                             );
+                            agent.log_harness_event("stuck", &guidance);
                             agent.push_message("user", &guidance);
                             // For headless/eval runs, give the model one more chance to act on the guidance
                             // instead of hard-terminating. Use continuation nudge path if budget allows.
@@ -377,9 +605,14 @@ pub async fn drive_turn(
                             break;
                         }
                         TurnJudge::Continue => {
-                            if text_nudges < MAX_TEXT_NUDGES {
+                            let criteria_active = agent.session.as_ref()
+                                .and_then(|s| s.meta.completion_criteria.as_ref())
+                                .map_or(false, |c| !c.trim().is_empty());
+                            if criteria_active || text_nudges < MAX_TEXT_NUDGES {
                                 text_nudges += 1;
-                                observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                                let display_max = if criteria_active { 999 } else { MAX_TEXT_NUDGES };
+                                observer.on_nudge(text_nudges, display_max);
+                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/{}", text_nudges, display_max), total_llm_rounds);
                                 agent.push_continuation_nudge();
                                 continue;
                             }
@@ -446,9 +679,28 @@ pub async fn drive_turn(
     agent.force_flush_session().await;
     observer.on_context_usage(agent.estimated_context_tokens());
 
+    // Final authoritative pass: apply strip to the tail of the session log.
+    // This is more reliable than relying solely on the last streaming packet
+    // or the per-round accumulation, because the log contains the exact
+    // string that was committed as the assistant turn.
+    let final_text = if let Some(tail) = agent
+        .session
+        .as_ref()
+        .and_then(|s| s.last_assistant_content())
+    {
+        let cleaned = crate::llm::strip_xml_tool_call_blocks(&tail);
+        if !cleaned.trim().is_empty() {
+            cleaned
+        } else {
+            last_assistant_text
+        }
+    } else {
+        last_assistant_text
+    };
+
     let tool_call_count = all_actions.len() as u32;
     let result = TurnResult {
-        final_text: last_assistant_text,
+        final_text,
         actions: all_actions,
         rounds_used: total_llm_rounds,
         metrics: TurnMetrics {
@@ -470,11 +722,12 @@ pub async fn drive_turn(
 async fn consume_stream(
     mut stream: mpsc::Receiver<StreamChunk>,
     observer: &mut dyn TurnObserver,
-) -> (String, Vec<ToolCall>, Option<Usage>, Option<String>) {
+) -> (String, Vec<ToolCall>, Option<Usage>, Option<String>, String) {
     let mut text = String::new();
     let mut tool_calls = vec![];
     let mut usage = None;
     let mut finish_reason = None;
+    let mut thinking = String::new();
 
     while let Some(chunk) = stream.recv().await {
         if observer.should_stop() {
@@ -488,6 +741,7 @@ async fn consume_stream(
             }
             StreamChunk::Thinking(t) => {
                 observer.on_thinking(&t);
+                thinking.push_str(&t);
             }
             StreamChunk::Done {
                 content,
@@ -512,5 +766,5 @@ async fn consume_stream(
         }
     }
 
-    (text, tool_calls, usage, finish_reason)
+    (text, tool_calls, usage, finish_reason, thinking)
 }

@@ -3,7 +3,10 @@
 //! Layout:
 //!   ~/.raven-hotel/sessions/<session_id>/
 //!     meta.json          -- goal, pitfalls, tests, discoveries, repo_cache, etc.
-//!     full_log.jsonl     -- append-only record of real conversation turns (for resume + replay)
+//!     full_log.jsonl     -- append-only record of conversation turns + harness diagnostics
+//!                           (user/assistant/tool + role=system events for nudges/judges/thinking).
+//!                           Useful for human debugging of eval runs and for the agent to
+//!                           inspect its own history (e.g. via exec/grep) when context is summarized.
 //!
 //! On startup (for interactive TUI):
 //!   - Ask "Do you trust the code in <workspace>?" (Cursor-style) to gate deep indexing.
@@ -95,6 +98,13 @@ pub struct SessionMeta {
     pub current_goal: String,
     /// How we (or the model) would know the goal is done.
     pub achievement_tests: Vec<String>,
+
+    /// Agent-defined definition of "done" for the current task (set once early via tool).
+    /// Only the judge path clears it when Fulfilled.
+    /// Useful in no-goal or self-directed evals: model declares what success looks like,
+    /// judge validates against actions and clears on completion.
+    #[serde(default)]
+    pub completion_criteria: Option<String>,
     /// Things the model has been told (or discovered) to avoid.
     pub pitfalls: Vec<String>,
     /// Key facts / files / insights discovered during the session.
@@ -130,12 +140,33 @@ pub struct Session {
 impl Session {
     /// Initialize or resume a session for the given workspace.
     /// Creates the ~/.raven-hotel/sessions/<id>/ tree if needed.
+    /// The session id is derived from the workspace path.
     pub fn init(workspace: &Path) -> Result<Self> {
+        Self::init_internal(workspace, None)
+    }
+
+    /// Initialize or resume a *named* session for the given workspace.
+    /// This allows multiple independent resumable sessions for the same
+    /// workspace (e.g. "daily-work", "swebench-marshmallow-1234", or a
+    /// fresh one created on the fly for evals).
+    ///
+    /// The resulting session dir will incorporate the name so histories
+    /// don't mix, but the session is still associated with the workspace
+    /// (for repo cache / summaries / trusted flag etc.).
+    pub fn init_named(workspace: &Path, name: &str) -> Result<Self> {
+        Self::init_internal(workspace, Some(name))
+    }
+
+    fn init_internal(workspace: &Path, explicit_name: Option<&str>) -> Result<Self> {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
         fs::create_dir_all(&base)?;
 
-        let id = make_session_id(workspace);
+        let id = if let Some(name) = explicit_name {
+            make_session_id_with_name(workspace, Some(name))
+        } else {
+            make_session_id(workspace)
+        };
         let dir = base.join(&id);
         fs::create_dir_all(&dir)?;
 
@@ -163,10 +194,12 @@ impl Session {
         }
         meta.updated_at = now_iso();
 
-        // If no goal yet, leave it empty — the first user message will seed it.
-        if meta.current_goal.is_empty() {
-            meta.current_goal = "(not yet established — will be set from the first substantive request or via update_goal)".into();
-        }
+        // Default: no goal. For baseline experiments we deliberately start empty
+        // (no placeholder) so we can test harness mechanisms (nudges, judge on actions,
+        // last_user_request) without relying on explicit goal tracking.
+        // The model should call define_done early (once) from the initial prompt to declare
+        // what success looks like; the judge will use and clear it.
+        // Seeding from first request is also conditional (see record_user_request).
 
         let s = Session {
             id,
@@ -227,6 +260,35 @@ impl Session {
         entries[start..].to_vec()
     }
 
+    /// Return the most recent non-empty assistant content from full_log.jsonl.
+    ///
+    /// This inspects the *committed* tail of the session log rather than a
+    /// transient streaming buffer / "last packet" / per-turn full_text accumulation.
+    /// Useful for reliably detecting whether a previous (or just committed)
+    /// model response leaked XML tool call fragments into visible Agent text.
+    pub fn last_assistant_content(&self) -> Option<String> {
+        let data = fs::read_to_string(&self.log_path).ok()?;
+        for line in data.lines().rev() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let obj: serde_json::Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if obj.get("role").and_then(|v| v.as_str()) == Some("assistant") {
+                if let Some(c) = obj.get("content").and_then(|v| v.as_str()) {
+                    let trimmed = c.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Return the block that should be injected into the system prompt / early context.
     /// Keep this small and high-signal.
     pub fn get_injection_block(&self) -> String {
@@ -238,16 +300,24 @@ impl Session {
         block.push_str(&format!("Workspace: {}\n", m.workspace.display()));
         block.push_str(&format!("Session: {}\n\n", m.session_id));
 
-        block.push_str("### Current Goal\n");
-        block.push_str(&m.current_goal);
-        block.push_str("\n\n");
+        if std::env::var("RAVEN_GOAL_TRACKING").is_ok() {
+            block.push_str("### Current Goal\n");
+            block.push_str(&m.current_goal);
+            block.push_str("\n\n");
 
-        if !m.achievement_tests.is_empty() {
-            block.push_str("### Tests for Goal Achievement (stop when these are satisfied)\n");
-            for t in &m.achievement_tests {
-                block.push_str(&format!("- {}\n", t));
+            if !m.achievement_tests.is_empty() {
+                block.push_str("### Tests for Goal Achievement (stop when these are satisfied)\n");
+                for t in &m.achievement_tests {
+                    block.push_str(&format!("- {}\n", t));
+                }
+                block.push('\n');
             }
-            block.push('\n');
+
+            if let Some(criteria) = &m.completion_criteria {
+                block.push_str("### Agent-Defined Completion Criteria (what 'done' looks like)\n");
+                block.push_str(criteria);
+                block.push_str("\n\n");
+            }
         }
 
         if !m.pitfalls.is_empty() {
@@ -267,9 +337,11 @@ impl Session {
         }
 
         if let Some(req) = &m.last_user_request {
-            block.push_str("### Latest User Request\n");
-            block.push_str(req);
-            block.push_str("\n\n");
+            if req.len() > 20 {
+                block.push_str("### Latest User Message (context for any active task)\n");
+                block.push_str(req);
+                block.push_str("\n\n");
+            }
         }
 
         // Repo cache — the heart of the "better context"
@@ -296,6 +368,7 @@ impl Session {
             block.push_str("### Summary of Recent Turns (last ~10)\n");
             block.push_str(&m.recent_turns_summary);
             block.push_str("\n\n");
+            block.push_str("(The above is compressed history only. The Latest User Message and Key Discoveries above take priority.)\n\n");
         }
 
         block.push_str("### File Summary Cache\n");
@@ -304,7 +377,11 @@ impl Session {
         block.push_str("If fresh it returns the summary; if stale/missing it gives you the mtime + capped raw content and tells you to call store_summary after analysis. ");
         block.push_str("This keeps token usage low even on long tasks.\n\n");
 
-        block.push_str("---\nUse the structure and goal above to stay on track. Call update_goal(...) if the user's intent clearly shifts.\n");
+        let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
+        let no_goal_tool = std::env::var("RAVEN_EVAL_DISABLE_UPDATE_GOAL").is_ok() || std::env::var("RAVEN_NO_GOAL").is_ok();
+        if goal_tracking && !no_goal_tool {
+            block.push_str("---\nUse the structure and goal above to stay on track. Call update_goal(...) if the user's intent clearly shifts.\n");
+        }
         block
     }
 
@@ -463,7 +540,11 @@ pub fn current_file_mtime_for_agent(path: &Path) -> i64 {
 }
 
 fn make_session_id(workspace: &Path) -> String {
-    // Stable, human-friendly id derived from the workspace.
+    make_session_id_with_name(workspace, None)
+}
+
+fn make_session_id_with_name(workspace: &Path, explicit_name: Option<&str>) -> String {
+    // Stable, human-friendly id derived from the workspace (plus optional name).
     // We prefer the leaf directory name + a short hash of the full path.
     let leaf = workspace
         .file_name()
@@ -473,6 +554,16 @@ fn make_session_id(workspace: &Path) -> String {
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '_' })
         .collect::<String>();
+
+    let name_part = if let Some(name) = explicit_name {
+        let clean = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .collect::<String>();
+        format!("{}-", clean.trim_matches('-'))
+    } else {
+        String::new()
+    };
 
     // Simple non-crypto hash of the absolute path for uniqueness
     let abs = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
@@ -484,7 +575,7 @@ fn make_session_id(workspace: &Path) -> String {
     }
     let short = format!("{:x}", hash)[..8].to_string();
 
-    format!("{}-{}", leaf, short)
+    format!("{}{}-{}", name_part, leaf, short)
 }
 
 fn now_iso() -> String {

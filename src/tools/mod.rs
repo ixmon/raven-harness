@@ -37,8 +37,16 @@ pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 use crate::llm::ToolDef;
 
 /// Returns the complete list of tools the agent can use, in OpenAI function format.
+/// For experiments (e.g. testing harness without goal machinery) you can disable
+/// update_goal via env RAVEN_EVAL_DISABLE_UPDATE_GOAL=1 (or RAVEN_NO_GOAL=1).
+/// Goal tracking is off by default; enable with RAVEN_GOAL_TRACKING=1 (which enables the tool).
 pub fn all_tools() -> Vec<ToolDef> {
-    vec![
+    let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
+    let disable_update_goal = std::env::var("RAVEN_EVAL_DISABLE_UPDATE_GOAL").is_ok()
+        || std::env::var("RAVEN_NO_GOAL").is_ok()
+        || !goal_tracking;
+
+    let mut tools = vec![
         ToolDef {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
@@ -183,6 +191,20 @@ pub fn all_tools() -> Vec<ToolDef> {
         ToolDef {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
+                name: "define_done".into(),
+                description: "Define what 'done' looks like for this task (set once, early, derived from the *initial user request*). The judge uses this to decide completion and clears it when fulfilled. Only the agent can set it; only the judge clears it.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "definition": { "type": "string", "description": "Clear description of what success/completion looks like (e.g. 'the bug is fixed and all relevant tests pass')" }
+                    },
+                    "required": ["definition"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
                 name: "record_discovery".into(),
                 description: "Record an important finding, file, or insight so it is remembered across turns and restarts (goes into the session context block).".into(),
                 parameters: json!({
@@ -200,7 +222,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read_summary".into(),
-                description: "Check the mtime-matched summary cache first. Returns a fresh cached summary if the file has not changed since the summary was stored. If stale or missing, returns the current mtime plus a capped raw view and instructions to call store_summary after you analyze it. Always prefer this over raw 'read' for understanding code.".into(),
+                description: "Temporarily acts like normal 'read' (summary cache bypassed for SWE-bench testing).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -214,19 +236,24 @@ pub fn all_tools() -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "store_summary".into(),
-                description: "Cache a concise, factual summary you produced for a file. You must pass the exact mtime you observed when you analyzed the file. Future calls to read_summary for the same mtime will return this instead of the full source.".into(),
+                description: "No-op (summary cache bypassed for SWE-bench testing).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Path to the file (relative to workspace)" },
-                        "mtime": { "type": "integer", "description": "The mtime (unix seconds) of the file at the time you read/analyzed it" },
-                        "summary": { "type": "string", "description": "Concise summary (< ~500 tokens). Include purpose, key public items/signatures, core logic, dependencies, and any non-obvious behavior. Be factual." }
+                        "mtime": { "type": "integer", "description": "ignored" },
+                        "summary": { "type": "string", "description": "ignored" }
                     },
-                    "required": ["path", "mtime", "summary"]
+                    "required": ["path"]
                 }),
             },
         },
-    ]
+    ];
+
+    if disable_update_goal {
+        tools.retain(|t| t.function.name != "update_goal");
+    }
+    tools
 }
 
 /// Execute a tool call (name + JSON arguments string) and return the result as a string

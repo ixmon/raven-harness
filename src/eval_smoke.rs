@@ -134,9 +134,9 @@ pub fn load_smoke_scenario(name: &str) -> Result<SmokeScenario> {
     let raw: Value = serde_json::from_str(&data)
         .with_context(|| format!("parse smoke scenario {}", path.display()))?;
     let ty = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    if ty != "smoke" {
+    if ty != "smoke" && ty != "live" {
         bail!(
-            "scenario {} has type {:?}, expected \"smoke\"",
+            "scenario {} has type {:?}, expected \"smoke\" or \"live\"",
             path.display(),
             ty
         );
@@ -305,6 +305,9 @@ mod tests {
             "mock_churn_then_answer",
             "mock_huge_grep",
             "mock_secrets_in_read",
+            "empty_first_recovery",
+            "plan_narration_continues",
+            "minimal_end_to_end_patch",
         ] {
             assert!(names.iter().any(|n| n == want), "missing {want}");
         }

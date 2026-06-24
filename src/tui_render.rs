@@ -1281,11 +1281,21 @@ fn build_left_text(
 ) -> Text<'static> {
     let mut left_text = Text::default();
     let mut line_idx = 0usize;
+    let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
         let (prefix_style, body_style) = conversation_entry_styles(entry);
         let lines_iter: Vec<&str> = entry.lines().collect();
         for (li, line) in lines_iter.iter().enumerate() {
+            let is_blank = line.trim().is_empty();
+            if is_blank {
+                consecutive_blanks += 1;
+                if consecutive_blanks > 2 {
+                    continue; // collapse excessive blank lines in display
+                }
+            } else {
+                consecutive_blanks = 0;
+            }
             let style = if Some(line_idx) == highlight_line {
                 Style::default()
                     .fg(Color::Black)
@@ -1302,8 +1312,11 @@ fn build_left_text(
             line_idx += 1;
         }
         if i < left_committed.len() - 1 {
-            left_text.lines.push(Line::from(""));
-            line_idx += 1;
+            if consecutive_blanks < 2 {
+                left_text.lines.push(Line::from(""));
+                line_idx += 1;
+                consecutive_blanks += 1;
+            }
         }
     }
 
@@ -1325,6 +1338,15 @@ fn build_left_text(
         };
 
         for line in &lines[..complete_count] {
+            let is_blank = line.trim().is_empty();
+            if is_blank {
+                consecutive_blanks += 1;
+                if consecutive_blanks > 2 {
+                    continue;
+                }
+            } else {
+                consecutive_blanks = 0;
+            }
             let style = if Some(line_idx) == highlight_line {
                 Style::default()
                     .fg(Color::Black)

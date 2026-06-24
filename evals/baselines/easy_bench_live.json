@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "note": "Baseline for easy-bench-live series (functional + previously passing marshmallow SWE case). Checked in so we can detect regressions in pass status, turns, tool calls, and wall time as the agent/continuation logic is optimized. Update deliberately when a real improvement is made.",
+  "tests": {
+    "easy-hello-world": {
+      "pass": true,
+      "max_llm_rounds": 6,
+      "max_tool_calls": 8,
+      "max_duration_ms": 90000
+    },
+    "easy-fizzbuzz": {
+      "pass": true,
+      "max_llm_rounds": 10,
+      "max_tool_calls": 15,
+      "max_duration_ms": 180000
+    },
+    "marshmallow-code__marshmallow-1343": {
+      "pass": true,
+      "max_llm_rounds": 25,
+      "max_tool_calls": 40,
+      "max_duration_ms": 900000
+    }
+  }
+}

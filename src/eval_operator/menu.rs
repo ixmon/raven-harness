@@ -38,7 +38,13 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
         } else {
             println!(" 10) SWE-bench live            [unavailable — probe not ready]");
         }
-        println!(" 11) Run single test  pick a scenario by ID");
+        if llm.ready_for_agent {
+            println!(" 11) Easy-bench live   write fizzbuzz.py (harder live test)");
+            println!("     (basic variant was hello world)");
+        } else {
+            println!(" 11) Easy-bench live           [unavailable — probe not ready]");
+        }
+        println!(" 12) Run single test  pick a scenario by ID");
         println!("  q) Quit");
         println!();
         print!("Choice [1]: ");
@@ -117,6 +123,20 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
                 print_summary(&s);
             }
             "11" => {
+                if !llm.ready_for_agent {
+                    println!(
+                        "LLM probe not ready at {} — need /v1/models with resolvable model + n_ctx.",
+                        llm.base_url
+                    );
+                    if let Some(e) = &llm.error {
+                        println!("  ({e})");
+                    }
+                    continue;
+                }
+                let s = runner.run_profile("easy-bench-live", &mut state)?;
+                print_summary(&s);
+            }
+            "12" => {
                 let reg = load_registry()?;
                 print!("{}", list_text(&reg));
                 print!("\nTest ID to run: ");

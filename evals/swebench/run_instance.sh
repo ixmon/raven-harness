@@ -68,7 +68,11 @@ materialize_repo() {
   git -C "$REPO_DIR" reset --hard "$base_commit"
   git -C "$REPO_DIR" clean -fdx
 
-  # Session pollution is handled by --no-session flag on the raven-tui invocation below.
+  # We create a fresh dedicated session for this eval run using --fresh-session.
+  # This gives a completely clean history (no prior tests, no personal coding
+  # sessions, no self-modification of raven-tui) while still providing the full
+  # SESSION CONTEXT injection, last_user_request (for hard-safety), goals,
+  # summaries, judge, etc.
 }
 
 copy_session_artifacts() {
@@ -165,10 +169,16 @@ run_raven() {
     # Explicit PATH for the cargo invocation so the raven-tui process (and its exec tool children)
     # see the venv first. This should make bare `python` resolve to the project's venv python.
     # (The venv from `python3 -m venv` always creates a `python` symlink to python3.)
+    # Tell the agent exactly where the project's python lives for this eval.
+    # This is surfaced to the model via RAVEN_EVAL_* envs (see main.rs / system guidance).
+    export RAVEN_EVAL_PYTHON="$PROJ_VENV/bin/python"
+    export RAVEN_EVAL_PYTHON3="$PROJ_VENV/bin/python3"
+    export RAVEN_EVAL_PROJECT_VENV="$PROJ_VENV"
+
     PATH="$PROJ_VENV/bin:$PATH" cargo run --release --quiet --bin raven-tui -- \
       --workspace "$REPO_DIR" \
       --prompt-file "$RESULT_DIR/prompt.txt" \
-      --no-session \
+      --fresh-session \
       --max-rounds "${RAVEN_MAX_ROUNDS:-30}" \
       --max-tokens "${RAVEN_MAX_TOKENS:-16384}" \
       --temperature "${RAVEN_TEMPERATURE:-0}" \

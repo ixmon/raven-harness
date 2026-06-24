@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "note": "Easy-bench live series for quick functional testing of agent continuation, recovery, patch writing, and end-to-end flows. Includes a real previously-passing SWE-bench case (run in full agent mode, not verify-grade).",
+  "easy_tests": [
+    "easy-hello-world",
+    "easy-fizzbuzz",
+    "marshmallow-code__marshmallow-1343"
+  ]
+}

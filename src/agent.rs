@@ -83,11 +83,12 @@ pub enum TurnJudge {
 pub struct Agent {
     client: ChatBackend,
     config: Config,
-    /// Clean conversation turns only (user / assistant / tool). The rich session
-    /// context (repo tree, goal, pitfalls, recent summary) is injected fresh on
-    /// every prompt construction so it stays current.
+    /// Clean conversation turns only (user / assistant / tool). Latest user inputs
+    /// are pushed here (via record/on_new) so the model sees proper user turns.
+    /// The rich session context (repo tree, goal, pitfalls, recent summary, latest
+    /// user header) is injected fresh on every prompt construction.
     pub(crate) conversation: Vec<Message>,
-    /// Persistent session (goal tracking, repo cache, full log, meta.json under ~/.raven-hotel/)
+    /// Persistent session (goal tracking off by default via RAVEN_GOAL_TRACKING=1, repo cache, full log, meta.json under ~/.raven-hotel/)
     pub(crate) session: Option<crate::session::Session>,
     /// How many conversation messages have been written to full_log.jsonl.
     logged_message_count: usize,
@@ -103,8 +104,8 @@ impl Agent {
         let session = prebuilt;
         let mut conversation = vec![];
 
-        // Restore recent conversation from the persistent log so the model
-        // remembers what it was doing after a restart (Ctrl+C / crash).
+        // Restore recent conversation from the persistent log (now includes user
+        // turns) so the model remembers after a restart (Ctrl+C / crash).
         if let Some(s) = &session {
             let recent = s.load_recent_conversation(20);
             for (role, content) in recent {
@@ -282,11 +283,23 @@ impl Agent {
     /// Push a brief nudge into the conversation when the model pauses
     /// to narrate instead of continuing to call tools.
     pub fn push_continuation_nudge(&mut self) {
+        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+        let msg = if in_eval {
+            let mut m = crate::agent_driver::CONTINUATION_NUDGE.to_string();
+            // Gentle re-anchor to original goal (environment helping the model stay on task) -- eval only
+            if let Some(s) = &self.session {
+                if let Some(req) = &s.meta.last_user_request {
+                    let short = if req.len() > 300 { &req[..300] } else { req };
+                    m.push_str(&format!("\n\n(Original request reminder: {})", short));
+                }
+            }
+            m
+        } else {
+            crate::agent_driver::CONTINUATION_NUDGE.to_string()
+        };
         self.conversation.push(Message {
             role: "user".into(),
-            content: Some(
-                crate::agent_driver::CONTINUATION_NUDGE.to_string()
-            ),
+            content: Some(msg),
             tool_calls: None,
             tool_call_id: None,
         });
@@ -335,6 +348,44 @@ impl Agent {
             tool_calls: None,
             tool_call_id: None,
         });
+    }
+
+    /// Append a harness-internal diagnostic event directly to full_log.jsonl
+    /// *without* adding it to the model's conversation history.
+    ///
+    /// This keeps nudge/judge/trace info available for:
+    /// - Human debugging of harness behavior (in raven_log.jsonl etc.)
+    /// - The agent itself grepping its own full run log (when working from
+    ///   summarized recent_turns_summary + wanting to recover exact nudge/judge
+    ///   details).
+    ///
+    /// Use distinct "role": "system" (or event type) so that normal conversation
+    /// reconstruction and build_messages_for_model ignore these. The model is
+    /// instructed to ignore [DEBUG ...] / harness notes anyway.
+    pub fn log_harness_event(&self, event: &str, content: &str) {
+        if let Some(s) = &self.session {
+            let entry = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "role": "system",
+                "event": event,
+                "content": content,
+            });
+            let _ = s.append_log(&entry.to_string());
+        }
+    }
+
+    /// Convenience for harness events that also want the current LLM round.
+    pub fn log_harness_event_with_round(&self, event: &str, content: &str, round: u32) {
+        if let Some(s) = &self.session {
+            let entry = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "role": "system",
+                "event": event,
+                "round": round,
+                "content": content,
+            });
+            let _ = s.append_log(&entry.to_string());
+        }
     }
 
     /// Context management (evolved for sessions).
@@ -392,10 +443,41 @@ impl Agent {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let summary_prompt = format!(
-            "The following is older conversation history from an agent exploring/ working on a task in a codebase. Produce a concise, factual summary (bullet points or short paragraphs) of the key actions taken, files or information discovered, and current state of understanding. Omit low-value details. Focus on what would help the agent continue the original task effectively.\n\n{}",
-            history_dump
-        );
+        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+        let summary_prompt = if in_eval {
+            // Strong anti-rabbithole + task anchoring only for evals
+            let (goal, criteria) = if let Some(s) = &self.session {
+                (
+                    s.meta.current_goal.as_str(),
+                    s.meta.completion_criteria.as_deref().unwrap_or("")
+                )
+            } else { ("", "") };
+
+            let anchor = if !goal.is_empty() || !criteria.is_empty() {
+                format!("\n\nORIGINAL TASK ANCHOR (summarize ONLY in service of this):\nGoal: {}\nCompletion Criteria: {}\n", goal, criteria)
+            } else { String::new() };
+
+            format!(
+                r#"The following is older conversation history from an agent working on a coding bug fix task.{}
+
+CRITICAL RULES FOR THIS SUMMARY:
+- Produce ONLY a concise, factual record of concrete actions, files examined, code insights discovered, tool results, and measurable progress.
+- ALWAYS anchor to the ORIGINAL top-level task/bug report and any Agent-Defined Completion Criteria above.
+- DO NOT include, echo, or create: <command_context>, <task_description>, <user_query>, internal exploration plans, meta sub-tasks ("explore X to understand Y"), or new "user queries".
+- If the history drifted into narrow implementation details or planning, summarize only the factual outcomes that matter for the original goal. Omit the drift.
+- Output in short bullets or 1-2 tight paragraphs. Focus on what helps continue/finish the real bug fix.
+
+History:
+{}"#,
+                anchor, history_dump
+            )
+        } else {
+            // Original simple summary behavior for normal interactive use
+            format!(
+                "The following is older conversation history from an agent exploring/ working on a task in a codebase. Produce a concise, factual summary (bullet points or short paragraphs) of the key actions taken, files or information discovered, and current state of understanding. Omit low-value details. Focus on what would help the agent continue the original task effectively.\n\n{}",
+                history_dump
+            )
+        };
 
         let req = ChatRequest {
             messages: vec![Message {
@@ -410,7 +492,7 @@ impl Agent {
             stream: false,
         };
 
-        match self.client.chat(req).await {
+        let raw = match self.client.chat(req).await {
             Ok(resp) => resp.content.trim().to_string(),
             Err(_e) => {
                 // Better fallback: simple truncation instead of storing error string forever (glm.md review)
@@ -420,7 +502,16 @@ impl Agent {
                 let fallback = tools::safe_truncate(&combined, 400).to_string();
                 format!("(summarization failed, using truncated fallback) {}", fallback)
             }
-        }
+        };
+
+        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+        let cleaned = if in_eval {
+            // Post-process only in eval to strip meta-task structures
+            strip_command_context_blocks(&raw)
+        } else {
+            raw
+        };
+        cleaned
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -428,22 +519,38 @@ impl Agent {
     // ─────────────────────────────────────────────────────────────────
 
     /// Record a user request for metadata (last_user_request, goal seeding) and
-    /// trace logging. Does *not* push into the conversation history. Used for the
-    /// initial top-level prompt so that the (potentially very long) raw task text
-    /// is not appended into chat turns — the system injection block already
-    /// includes it under "Latest User Request" on every model call.
+    /// trace logging. Also pushes the (latest) user message into `conversation`
+    /// as a normal user turn. This ensures the model receives fresh user inputs
+    /// in proper alternating history (not only via the "Latest User Message"
+    /// header in the injection block).
     pub fn record_user_request(&mut self, user_input: &str) {
         if let Some(s) = &mut self.session {
             let _ = s.set_last_user_request(user_input);
-            // Seed an initial goal from the first real request if we don't have one yet
-            if s.meta.current_goal.contains("not yet established") || s.meta.current_goal.trim().is_empty() {
-                let g = tools::safe_truncate(user_input, GOAL_TRUNCATE);
-                let _ = s.update_goal(&format!("Initial goal from user: {}", g), None, None);
+            let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
+            if goal_tracking {
+                let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+                if in_eval {
+                    // Eval-specific goal seeding with heuristic to avoid chat fixation
+                    let no_initial_goal = std::env::var("RAVEN_NO_GOAL").is_ok()
+                        || std::env::var("RAVEN_EVAL_NO_INITIAL_GOAL").is_ok();
+                    if !no_initial_goal && (s.meta.current_goal.trim().is_empty() || s.meta.current_goal.contains("not yet established")) {
+                        let lower = user_input.trim().to_lowercase();
+                        if user_input.len() > 25 && !lower.starts_with("hello") && !lower.starts_with("hi") && !lower.starts_with("hey") && !lower.contains("joke") && !lower.contains("tool") {
+                            let g = tools::safe_truncate(user_input, GOAL_TRUNCATE);
+                            let _ = s.update_goal(&format!("Initial goal from user: {}", g), None, None);
+                        }
+                    }
+                } else {
+                    // For normal use with goal tracking enabled: seed from first
+                    if s.meta.current_goal.contains("not yet established") || s.meta.current_goal.trim().is_empty() {
+                        let g = tools::safe_truncate(user_input, GOAL_TRUNCATE);
+                        let _ = s.update_goal(&format!("Initial goal from user: {}", g), None, None);
+                    }
+                }
             }
         }
 
-        // Log the request event to persistent full_log (for traces, evals, raven_log.jsonl)
-        // even though we don't put the full raw text into conversation turns.
+        // Log the request event to persistent full_log (for traces, evals, raven_log.jsonl).
         if let Some(s) = &self.session {
             let entry = serde_json::json!({
                 "ts": chrono::Utc::now().to_rfc3339(),
@@ -453,19 +560,37 @@ impl Agent {
             });
             let _ = s.append_log(&entry.to_string());
         }
-    }
 
-    pub fn on_new_user_input(&mut self, user_input: &str) {
-        // For follow-ups / interjects / interactive turns we record + append as a
-        // conversation user message so the model sees the new instruction in context.
-        self.record_user_request(user_input);
-
+        // Push into conversation so the model sees the latest user input as a
+        // proper role:user turn in the messages array (fixes echo / missed follow-ups
+        // in session mode).
         self.conversation.push(Message {
             role: "user".into(),
             content: Some(user_input.to_string()),
             tool_calls: None,
             tool_call_id: None,
         });
+
+        // We directly logged the user entry. Advance so persist_turn (on tool-using
+        // paths) won't duplicate-log this user entry from the conversation vec.
+        if self.session.is_some() {
+            self.logged_message_count = self.conversation.len();
+        }
+
+        // Make the define_done instruction explicitly visible in the full log
+        // for debugging (e.g. "why didn't the agent call it?").
+        if user_input.contains("define_done") || user_input.contains("Early in the task, call the `define_done`") {
+            self.log_harness_event(
+                "define_done_instruction",
+                "Initial request contained explicit instruction to call define_done early (once, before heavy tool use / in first or second turn). This is critical for criteria-based judge nudging."
+            );
+        }
+    }
+
+    pub fn on_new_user_input(&mut self, user_input: &str) {
+        // Delegates to record_user_request which now handles meta, logging,
+        // and pushing the user message into conversation for all paths.
+        self.record_user_request(user_input);
     }
 
     /// Build the exact messages array we will send to the model this turn.
@@ -473,6 +598,23 @@ impl Agent {
     /// repo cache + goal + pitfalls + recent summary from the Session.
     fn build_messages_for_model(&self) -> Vec<Message> {
         let base = system_message(&self.config.workspace);
+
+        // Log the system prompt (including whether Core Loop was suppressed for evals)
+        // into full_log on the very first build so we can see exactly what the model
+        // was given for debugging (e.g. why define_done was or wasn't called).
+        if self.conversation.is_empty() {
+            if let Some(s) = &self.session {
+                if let Some(content) = &base.content {
+                    let entry = serde_json::json!({
+                        "ts": chrono::Utc::now().to_rfc3339(),
+                        "role": "system",
+                        "content": content,
+                        "note": "full system prompt used for this session (Core Loop omitted in RAVEN_EVAL mode)"
+                    });
+                    let _ = s.append_log(&entry.to_string());
+                }
+            }
+        }
 
         let mut msgs = vec![];
         if let Some(s) = &self.session {
@@ -494,10 +636,26 @@ impl Agent {
 
         // Append the actual conversation turns (already pruned)
         msgs.extend(self.conversation.iter().cloned());
+
+        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+        // Legacy synthetic user marker (eval-only) as a fallback if conversation is
+        // somehow empty on first build for a session (e.g. after reset + record edge).
+        // With user inputs now pushed to conversation, this is rarely reached.
+        // Kept to protect against local servers that dislike pure-system prompts.
+        if in_eval && self.session.is_some() && self.conversation.is_empty() {
+            msgs.push(Message {
+                role: "user".into(),
+                content: Some("Follow the Latest User Request in the SESSION CONTEXT above. Use tools now to explore and solve the task.".into()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+
         msgs
     }
 
     /// Handle session meta + file summary cache tools. Returns Some(ack) if handled.
+    /// NOTE: read_summary/store_summary are currently bypassed (see implementation) for SWE-bench testing.
     async fn handle_session_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
         let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
 
@@ -515,6 +673,22 @@ impl Agent {
             }
         }
 
+        if name == "define_done" {
+            if let Some(s) = &mut self.session {
+                if s.meta.completion_criteria.is_none() {
+                    let definition = args.get("definition").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if !definition.trim().is_empty() {
+                        s.meta.completion_criteria = Some(definition.clone());
+                        s.save_meta().ok();
+                        self.log_harness_event("define_done_called", &format!("Agent successfully called define_done. Criteria set to: {}", definition));
+                        return Some(format!("Completion criteria defined (set once). Judge will use this to decide when done and clear it on fulfillment: {}", definition));
+                    }
+                } else {
+                    return Some("Completion criteria already set (one-time only). Judge clears it on completion.".to_string());
+                }
+            }
+        }
+
         if name == "record_discovery" {
             if let Some(s) = &mut self.session {
                 let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -524,58 +698,32 @@ impl Agent {
         }
 
         if name == "read_summary" {
-            if let Some(s) = &self.session {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let rel = make_rel_path(path, &self.config.workspace);
-                let abs = self.config.workspace.join(&rel);
-
-                match s.get_file_summary(&rel) {
-                    Ok(Some((mtime, summary))) => {
-                        return Some(format!(
-                            "FRESH SUMMARY (path={}, mtime={} matched current file mtime):\n{}",
-                            rel, mtime, summary
-                        ));
-                    }
-                    _ => {
-                        // Stale or missing: give the model a capped raw view + the mtime to use when storing
-                        let cur_mtime = crate::session::current_file_mtime_for_agent(&abs); // helper exposed
-                        let raw = tools::read_file(path, None, &self.config.workspace, self.config.context_budget.read_line_limit);
-                        return Some(format!(
-                            "NO FRESH SUMMARY for {} (current on-disk mtime: {}).\n\nCapped raw view (analyze this, then call store_summary with the exact mtime above):\n{}\n\nAfter you understand the file, call store_summary with a concise summary.",
-                            rel, cur_mtime, raw
-                        ));
-                    }
-                }
-            }
+            // TEMPORARILY BYPASSED for SWE-bench debug: always return full (capped) raw content.
+            // This disables the mtime summary cache to test if it is causing issues in evals.
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let rel = make_rel_path(path, &self.config.workspace);
+            let raw = tools::read_file(path, None, &self.config.workspace, self.config.context_budget.read_line_limit);
+            return Some(format!(
+                "📄 {} (summary cache BYPASSED for test run):\n{}",
+                rel, raw
+            ));
         }
 
         if name == "store_summary" {
-            if let Some(s) = &mut self.session {
-                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let mtime = args.get("mtime").and_then(|v| v.as_i64()).unwrap_or(0);
-                let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
-                let rel = make_rel_path(path, &self.config.workspace);
-                let _ = s.store_file_summary(&rel, mtime, summary);
-                return Some(format!(
-                    "✅ Summary cached for {} at mtime {}. Future read_summary calls with matching mtime will return this instead of raw source.",
-                    rel, mtime
-                ));
-            }
+            // TEMPORARILY NO-OP (cache disabled)
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            return Some(format!("✅ store_summary ignored (summary cache disabled for test)"));
         }
 
         None
     }
 
     fn maybe_invalidate_summary(&mut self, name: &str, args: &serde_json::Value) {
+        // TEMPORARILY disabled along with summary cache for SWE-bench testing.
         if name != "write" && name != "patch" {
             return;
         }
-        if let Some(s) = &mut self.session {
-            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-                let rel = make_rel_path(p, &self.config.workspace);
-                let _ = s.invalidate_file_summary(&rel);
-            }
-        }
+        // (cache off — no-op)
     }
 
     async fn persist_turn(&mut self) {
@@ -704,7 +852,10 @@ impl Agent {
         let m = &s.meta;
 
         if m.current_goal.trim().is_empty() || m.current_goal.contains("not yet established") {
-            return TurnJudge::Continue;
+            // In no-goal experiments, fall back to completion_criteria if the agent set one
+            if m.completion_criteria.as_ref().map_or(true, |c| c.trim().is_empty()) {
+                return TurnJudge::Continue;
+            }
         }
 
         // Build compact recent activity for loop detection
@@ -729,6 +880,12 @@ impl Agent {
             judge_prompt.push('\n');
         }
 
+        if let Some(criteria) = &m.completion_criteria {
+            judge_prompt.push_str("Agent-defined 'done' definition (what completion looks like):\n");
+            judge_prompt.push_str(criteria);
+            judge_prompt.push_str("\n(Answer FULFILLED only if recent actions clearly satisfy this definition.)\n\n");
+        }
+
         // Explicitly include the original user request so the judge knows the full intent
         if let Some(req) = &m.last_user_request {
             judge_prompt.push_str(&format!("Original user request:\n{}\n\n", req));
@@ -747,6 +904,7 @@ impl Agent {
              - If the request asked to 'write AND run AND show output', there must be an 'exec' action with matching output in the recent actions.\n\
              - A write alone is never enough for a 'run it' request.\n\
              - For bug report / code fix requests (no explicit 'run' language): FULFILLED requires at least one successful `write` or `patch` action on a main source file in the library (e.g. under src/, the package dir), not merely on a temp diagnostic script the agent created. The edit must address the reported issue.\n\
+             - If the agent defined a completion_criteria via define_done (ideally derived from the *initial* user request), FULFILLED only if actions clearly satisfy that exact definition. The definition should have been set early from the first message.\n\
              - If the model is claiming success without evidence in actions, treat as not fulfilled.\n\n\
              Reply with the first line being exactly one of:\n\
              FULFILLED\n\
@@ -801,16 +959,103 @@ fn message_byte_size(m: &Message) -> usize {
     content_len + tc_len + id_len + m.role.len() + 16
 }
 
+/// Strip <command_context> ... </command_context> (and similar nested planning blocks)
+/// from summary text. Prevents the rolling recent_turns_summary from turning
+/// the agent's internal exploration plans or sub-queries into persistent goals
+/// that get re-injected every turn (a major source of rabbitholes).
+fn strip_command_context_blocks(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_block = false;
+    let mut depth = 0;
+    for line in s.lines() {
+        let l = line.trim_start();
+        if l.starts_with("<command_context") || l.starts_with("<task_description") || l.starts_with("<user_query") {
+            in_block = true;
+            depth += 1;
+            continue;
+        }
+        if in_block {
+            if l.starts_with("</command_context") || l.starts_with("</task_description") || l.starts_with("</user_query") || l.contains("</command_context>") {
+                depth -= 1;
+                if depth <= 0 {
+                    in_block = false;
+                    depth = 0;
+                }
+                continue;
+            }
+            if l.starts_with('<') && !l.starts_with("</") {
+                depth += 1;
+            }
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
 fn system_message(workspace: &std::path::Path) -> Message {
-    let sys = format!(
-r#"You are a sharp, practical coding agent running in a terminal-based agentic environment.
+    let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
 
-Workspace root: {}
-
+    let core_loop = if in_eval {
+        // For evals we often want the model to follow explicit "call define_done first"
+        // instructions rather than the general THINK/ACT loop. The core loop is
+        // omitted (and the fact that it was omitted is logged to full_log) so we
+        // can observe whether the agent obeys the eval-specific instructions.
+        "".to_string()
+    } else {
+        r#"
 ## Core Loop (follow this every turn)
 1. THINK — Understand the request. What do I already know? What files or information do I need?
 2. ACT — Use the smallest number of tools possible. Prefer reading before writing.
 3. REPORT — Clearly describe what actually happened based on tool output.
+"#.to_string()
+    };
+
+    let bug_fixes_section = if in_eval {
+        r#"
+## Bug fixes (SWE-bench style tasks)
+- User requests are often bug reports. Goal: locate the root cause then apply the minimal correct edit to the library source using `patch` (strongly preferred) or `write`.
+- From the *initial task description*, call `define_done` **once early** (before heavy tool use) to declare exactly what "done" means for this bug (e.g. "the reported crash no longer occurs and the fix is in the main source"). The judge will use this definition and only clear it on true fulfillment.
+- After reading the buggy code and relevant tests, edit the actual source file under src/ (or equivalent package dir) rather than only writing separate diagnostic scripts. When explicitly told to produce the patch, call the tool right away.
+- In evaluation harnesses (and many minimal envs), a project-specific Python is provided. Check for RAVEN_EVAL_PYTHON / RAVEN_EVAL_PYTHON3 env vars or use the python from your launch PATH. When in doubt use the full path to the harness venv's python (or python3).
+- Prefer `python3 -m pytest ...` or the project's documented test command. Exploratory scripts are allowed but must not prevent you from shipping the source fix.
+"#
+    } else {
+        r#"
+"#
+    };
+
+    let define_done_usage = if in_eval {
+        r#"
+Use `define_done` early (once, derived from the initial task) so the judge has an objective definition of success. Use `update_goal` (when intent shifts) and `record_discovery` for high-value facts.
+"#
+    } else {
+        r#"
+Use `update_goal` (when intent shifts) and `record_discovery` for high-value facts.
+"#
+    };
+
+    let execution_define_done = if in_eval {
+        r#"- From the *initial user request* (the first message describing the task or bug), proactively call `define_done` **once, early** (ideally in your first or second turn, before deep work) to declare a precise definition of what "done" or success looks like for *this specific task*. Derive it directly from the user's description. Only the judge can clear it on fulfillment. Do not call it again. This is especially important in no-goal or self-directed runs.
+"#
+    } else {
+        ""
+    };
+
+    let sys = format!(
+r#"You are a sharp, practical coding agent running in a terminal-based agentic environment.
+
+Workspace root: {}{}
+
+## Interactive / Chat Use
+This is an interactive chat with a user. Treat it primarily as a normal conversation unless the user clearly gives a coding or file task.
+- For greetings like "hello", just respond friendly and conversationally. Do not invent a task or say anything is "done".
+- If the user asks to list your tools, describe the available tools listed below. Answer directly — do not refuse.
+- The user can ask for jokes, explanations, or side tasks at any time — respond helpfully with text. Only use tools when genuinely needed for the request.
+- Do not get fixated on specific files or previous messages unless the user explicitly asks about them in the current request.
+- If the user gives a clear coding or workspace task, then switch to task mode and follow the Core Loop and Execution Style below.
+- You are allowed (and encouraged) to respond with text only for conversational or meta requests. Do not force tool use or claim tasks are "done" when the user is just chatting.
 
 ## Tool Discipline (critical)
 - NEVER claim a file was read/written/edited unless a tool call just confirmed it.
@@ -820,17 +1065,12 @@ Workspace root: {}
 - Use `exec` for building, testing, git, cargo, etc. Keep commands focused.
 - `web_search` finds candidate pages. `browse` reads them. Use search → browse for research.
 - If a tool fails, report the exact error and adapt. Do not pretend it succeeded.
-
-## Bug fixes (SWE-bench style tasks)
-- User requests are often bug reports. Goal: locate the root cause then apply the minimal correct edit to the library source using `patch` (strongly preferred) or `write`.
-- After reading the buggy code and relevant tests, edit the actual source file under src/ (or equivalent package dir) rather than only writing separate diagnostic scripts.
-- Use `python3` explicitly for python commands when `python` is unavailable (common in minimal envs). Prefer `python3 -m pytest ...` or the project's documented test command for verification.
-- Exploratory scripts are allowed but must not prevent you from shipping the source fix.
+{}{}
 
 ## Available Tools
-exec, read, write, patch, grep, list, web_search, browse, update_goal, record_discovery, read_summary, store_summary
+exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
 
-read_summary and store_summary manage the mtime-matched file summary cache (see Context Management section below). update_goal and record_discovery update the persistent session meta (goal, tests, pitfalls, discoveries) that is injected into every prompt under "SESSION CONTEXT". Use the session tools when the user's request evolves or you learn something important.
+(Note: read_summary / store_summary are currently BYPASSED for testing — they act like normal reads / no-ops. Treat them as regular read for now.)
 
 ## Output Style
 - Be concise but complete.
@@ -841,25 +1081,22 @@ read_summary and store_summary manage the mtime-matched file summary cache (see 
 ## Context Management (important for local models)
 A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important files, current goal + achievement tests + pitfalls to avoid, key discoveries, and a summary of recent turns) is prepended to your system prompt on every turn. It comes from the persistent ~/.raven-hotel/ session for this workspace.
 
-There is also a per-file summary cache (SQLite `context.db` in the session dir, keyed by relative path + mtime of the source file).
-
-**Mandatory workflow to avoid getting stuck in read loops and to keep context small:**
-1. Use the injected repo tree + "important_paths" to identify files worth looking at.
-2. **Call read_summary(path) first** (never start with raw `read` for source files).
-   - On "FRESH SUMMARY (mtime matched)": great, use the short version.
-   - On "NO FRESH SUMMARY": you get the current mtime + a capped raw view. Analyze it, then **call store_summary(path, mtime=the_exact_number, summary="your concise factual summary")** right away so future turns get the cache hit.
-3. Only fall back to raw `read` (ideally with a `lines="..."` range) when the summary is inadequate for the precise change you need to make.
-4. `write` / `patch` automatically invalidate cached summaries for that path.
-
-Also use `update_goal` (when intent shifts) and `record_discovery` for high-value facts.
+(Note: per-file summary cache is temporarily disabled for SWE-bench testing. Just use normal `read` (with optional lines= range) as needed. No need to call read_summary/store_summary.)
 
 You have access to the full workspace. You can run commands and modify files.
 
 ## Execution Style (critical — read carefully)
 - **Keep calling tools until the task is actually done.** Do NOT stop to narrate plans or summarize progress mid-task. If there is more work to do, call the next tool immediately.
 - Only stop calling tools when: (a) the goal is fully achieved and verified, or (b) you are genuinely blocked and need user input.
-- When you ARE done, give a brief summary of what changed and any commands the user should run."#,
-        workspace.display()
+- When you ARE done, give a brief summary of what changed and any commands the user should run.
+- If the user explicitly asks you to "produce a patch", "make the fix", or similar, immediately call the `patch` tool (or `write`) with the edit. Do not output explanatory text first — the tool call *is* the response.
+{}
+"#,
+        workspace.display(),
+        core_loop,
+        bug_fixes_section,
+        define_done_usage,
+        execution_define_done
     );
 
     Message {

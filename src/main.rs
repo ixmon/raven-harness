@@ -81,8 +81,35 @@ struct Args {
     /// Run without any persistent session. No conversation history is loaded,
     /// no goal/discovery tracking, no session injection block. Each invocation
     /// is a completely clean slate — ideal for evals and benchmarks.
+    ///
+    /// For clean evals you will usually want --fresh-session instead (see below).
+    /// --no-session completely disables the rich SESSION CONTEXT, last_user_request
+    /// (used for hard-safety "implies run" checks), goal tracking, file summaries,
+    /// and the judge. The new session flags keep those benefits while giving you
+    /// a dedicated clean history.
     #[arg(long)]
     no_session: bool,
+
+    /// Use or create a named session (instead of the default one derived solely
+    /// from the workspace path). This enables multiple resumable sessions for
+    /// the same workspace, e.g. one for daily work and separate clean ones for
+    /// evals. The session remains associated with the workspace for repo
+    /// indexing and summaries.
+    #[arg(long, value_name = "NAME")]
+    session: Option<String>,
+
+    /// Create a fresh unique session for this run (recommended for evals and
+    /// benchmarks). Equivalent to --session with a generated unique name.
+    /// This guarantees no history from previous runs, your personal coding,
+    /// or self-modification of raven-tui leaks into the eval.
+    #[arg(long)]
+    fresh_session: bool,
+
+    /// Execution approval mode for tools (writes, exec, etc.).
+    /// One of: babysitter, springbreak, vegas, thunderdome (or via RAVEN_APPROVAL env).
+    /// Thunderdome = eternal yolo (no prompts). SpringBreak = yolo for this session.
+    #[arg(long, value_name = "MODE", env = "RAVEN_APPROVAL")]
+    approval: Option<String>,
 }
 
 #[tokio::main]
@@ -144,13 +171,31 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("OPENROUTER_API_KEY").ok());
 
     // === New session / context management ( ~/.raven-hotel/ ) ===
-    // One persistent session per workspace. Supports goal tracking, repo cache,
+    // One persistent session per workspace. Supports goal tracking (off by default; set RAVEN_GOAL_TRACKING=1 to enable), repo cache,
     // safe discovery, and a compact injection block for the model.
-    // When --no-session is set, no session is created at all — the agent runs
-    // with a completely clean slate (no history, no goal tracking).
+    //
+    // By default the session id is derived from the workspace path (so the same
+    // workspace always resumes the same session). For evals and to support
+    // multiple resumable sessions, you can use --session NAME or --fresh-session.
+    //
+    // --no-session disables the session entirely (no injection block etc.).
+    // For clean evals it is usually better to use --fresh-session so you still
+    // get last_user_request (hard safety), goal tracking (if RAVEN_GOAL_TRACKING), summaries, the
+    // SESSION CONTEXT injection, judge, etc., but with a brand new history.
     let no_session = args.no_session;
+    let explicit_session = if args.fresh_session {
+        Some(format!(
+            "fresh-{}",
+            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+        ))
+    } else {
+        args.session.clone()
+    };
+
     let mut sess = if no_session {
         None
+    } else if let Some(name) = &explicit_session {
+        Some(session::Session::init_named(&workspace, name)?)
     } else {
         Some(session::Session::init(&workspace)?)
     };
@@ -169,7 +214,14 @@ async fn main() -> Result<()> {
     }
 
     if let Some(ref mut s) = sess {
-        if approval_env_thunderdome() {
+        if let Some(mode_str) = &args.approval {
+            if let Some(mode) = parse_approval_mode(mode_str) {
+                s.meta.exec_approval_mode = mode;
+                s.save_meta()?;
+            } else {
+                eprintln!("warning: unknown approval mode {:?}, falling back to env/default", mode_str);
+            }
+        } else if approval_env_thunderdome() {
             s.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
             s.save_meta()?;
         }
@@ -191,7 +243,11 @@ async fn main() -> Result<()> {
             eprintln!(
                 "raven session: {} | goal: {} | repo files: {} | trusted: {}",
                 s.id,
-                { let g = &s.meta.current_goal; let end = g.len().min(60); let end = (0..=end).rev().find(|&i| g.is_char_boundary(i)).unwrap_or(0); &g[..end] },
+                if std::env::var("RAVEN_GOAL_TRACKING").is_ok() {
+                    let g = &s.meta.current_goal; let end = g.len().min(60); let end = (0..=end).rev().find(|&i| g.is_char_boundary(i)).unwrap_or(0); &g[..end]
+                } else {
+                    "none"
+                },
                 s.meta.repo_cache.total_files_considered,
                 s.meta.trusted
             );
@@ -308,6 +364,33 @@ async fn main() -> Result<()> {
         if let Some(ref mut s) = sess {
             let _ = s.set_last_user_request(&prompt);
         }
+
+        // For evals (SWE-bench etc.) the launcher can tell us exactly where
+        // the project python lives via these env vars. We surface a small
+        // "stock" eval context so the agent doesn't waste turns on "python not
+        // found" or wrong interpreter.
+        let eval_python = std::env::var("RAVEN_EVAL_PYTHON").ok();
+        let eval_python3 = std::env::var("RAVEN_EVAL_PYTHON3").ok();
+        let effective_prompt = if eval_python.is_some() || eval_python3.is_some() {
+            let mut note = String::from("## Evaluation Harness Context\n");
+            if let Some(p) = &eval_python {
+                // note.push_str(&format!("Use this exact Python interpreter for the project under test: {}\n", p));
+            }
+            if let Some(p) = &eval_python3 {
+                // note.push_str(&format!("python3 equivalent (if needed): {}\n", p));
+            }
+            /*
+            note.push_str("Prefer the python from the environment the harness launched you in. ");
+            note.push_str("Bare `python` or `python3` should resolve correctly because of PATH, but use the full path above if in doubt.\n\n");
+            */
+            note.push_str("You are an expert software developer, keep working until you have fixed the bug described below.\n");
+            note.push_str("Early in the task, call the `define_done` tool **once** with a clear, precise definition of what \"done\" / success looks like, derived directly from the task description below. Only the judge will clear it when fulfilled.\n\n");
+            note.push_str("## Task / Bug Report\n");
+            note.push_str(&prompt);
+            note
+        } else {
+            prompt.clone()
+        };
         let tools_enabled = !smoke_scenario
             .as_ref()
             .is_some_and(|s| s.disable_tools);
@@ -337,17 +420,20 @@ async fn main() -> Result<()> {
 
         // Each --prompt / --prompt-file invocation (swebench, smoke evals, direct headless use)
         // is an independent task against a freshly checked-out workspace (run_instance.sh etc.
-        // do `git reset --hard $base + clean -fdx`). Do not append the full raw prompt (or any
-        // prior attempt's history) on top of restored conversation from a previous run on the
-        // same workspace dir. Keep the persistent session (goal, repo cache, last_user_request)
-        // but start the message history fresh for this attempt.
+        // do `git reset --hard $base + clean -fdx`).
+        //
+        // Use --fresh-session (or explicit --session NAME) to get a dedicated clean
+        // session for the run. This prevents pollution from prior tests, your
+        // personal coding, or raven-tui self-modification, while still giving the
+        // model the full SESSION CONTEXT, last_user_request (hard safety),
+        // summaries, judge, etc.
         app.reset();
 
         let turn_started = std::time::Instant::now();
 
         // Use drive_turn with HeadlessObserver — same loop as TUI
         let mut observer = agent_driver::HeadlessObserver;
-        let result = agent_driver::drive_turn(&mut app, &prompt, &mut observer).await?;
+        let result = agent_driver::drive_turn(&mut app, &effective_prompt, &mut observer).await?;
 
         if let Ok(out) = std::env::var("RAVEN_METRICS_OUT") {
             let _ = eval_metrics::write_turn_metrics(
@@ -404,6 +490,16 @@ fn approval_env_thunderdome() -> bool {
                 .ok()
                 .is_some_and(|v| v.eq_ignore_ascii_case("thunderdome"))
         })
+}
+
+fn parse_approval_mode(s: &str) -> Option<session::ExecApprovalMode> {
+    match s.to_ascii_lowercase().as_str() {
+        "babysitter" | "ask" | "default" => Some(session::ExecApprovalMode::Babysitter),
+        "springbreak" | "spring-break" | "spring_break" | "yolo-session" => Some(session::ExecApprovalMode::SpringBreak),
+        "vegas" => Some(session::ExecApprovalMode::Vegas),
+        "thunderdome" | "yolo" | "eternal" | "full-yolo" => Some(session::ExecApprovalMode::Thunderdome),
+        _ => None,
+    }
 }
 
 /// Get home directory (simple fallback).

@@ -1,0 +1,27 @@
+{
+  "name": "minimal_end_to_end_patch",
+  "type": "smoke",
+  "description": "Very simple flow: list, then write a small file. Tests full turn + patch action without complex bug.",
+  "prompt": "Create a file called hello.txt containing the text 'hello world' in the root.",
+  "max_rounds": 5,
+  "mock_tools": {
+    "list": { ".": "" },
+    "write": { "hello.txt": "wrote it" }
+  },
+  "llm_turns": [
+    {
+      "tool_calls": [ { "name": "list", "arguments": { "path": "." } } ]
+    },
+    {
+      "tool_calls": [ { "name": "write", "arguments": { "path": "hello.txt", "content": "hello world" } } ]
+    },
+    {
+      "content": "Done, created hello.txt with the greeting."
+    }
+  ],
+  "expect": {
+    "stdout_contains": ["hello.txt", "greeting"],
+    "min_tool_calls": 2,
+    "tools_used": ["list", "write"]
+  }
+}

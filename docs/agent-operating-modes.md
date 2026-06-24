@@ -97,9 +97,16 @@ See also: existing goal injection, judge_turn, last_user_request safety checks, 
 
 Next steps (as of this note):
 - Documented here.
-- Collect current baseline eval results (with goals + update_goal enabled).
-- Experiment: disable update_goal tool + default to no goal (empty), rerun evals, compare.
-- Implement user `/goal` + `/stance` commands + mode modulation in driver.
-- Update git / baselines with clean before/after.
+- **Baseline collected**: ran `./evals/run_replay.sh` (deterministic mocks) with goals + `update_goal` enabled. Saved to /tmp/baseline_with_goal.txt. Git updated with `docs/agent-operating-modes.md` commit.
+- **Experiment run**: re-ran with `RAVEN_EVAL_DISABLE_UPDATE_GOAL=1 RAVEN_EVAL_NO_INITIAL_GOAL=1`. Replays still PASS (as expected for scripted cases). Outputs in /tmp/experiment_no_goal.txt.
+- To evaluate real impact: launch full easy_bench / swebench evals (or interactive `launch_interactive`) under the two envs and compare scorecard (turns, tool calls, resolve rate, recovery success).
+- Next: wire `/goal` user command + `/stance` (or `/mode` extension), modulate driver/judge/nudges per mode, filter tool schema when disabled.
+- Update baselines/metrics + git after real comparison runs.
+
+Use the envs for clean experiments:
+- `RAVEN_EVAL_DISABLE_UPDATE_GOAL=1` (or `RAVEN_NO_GOAL=1`) — removes `update_goal` from tool list.
+- `RAVEN_EVAL_NO_INITIAL_GOAL=1` — prevents auto-seeding goal from first request; sessions start with empty `current_goal`.
+
+This lets us measure how much the *rest of the harness* (nudges, judge on actions/malformed, last_user_request anchoring, raw task in prompt, log tail recovery) can carry without explicit goal tracking.
 
 This should be general harness improvement, not test-specific.

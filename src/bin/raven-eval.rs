@@ -15,13 +15,22 @@ use raven_tui::eval_operator::{
     about = "Raven harness eval operator — deterministic menus, optional local LLM"
 )]
 struct Args {
-    /// Non-interactive profile: quick | local | full | swebench-smoke | swebench-live
+    /// Non-interactive profile: quick | local | full | swebench-smoke | swebench-live | easy-bench-live
+    /// (single tests: use --test <name> [--interactive] [--live])
     #[arg(long)]
     profile: Option<String>,
 
-    /// Live Raven agent for a single SWE-bench instance (--run <instance_id> only)
+    // Note: --test <name> --interactive will set up the workspace + prompt and launch the full interactive TUI
+    // (with --temperature 1 by default for these runs).
+
+    /// Live Raven agent for a single SWE-bench instance (--run / --test <instance_id> only)
     #[arg(long)]
     live: bool,
+
+    /// Launch interactive TUI for the test with the prompt (env context + test prompt) pre-filled in the input box.
+    /// Press Enter to start the agent. Example: raven-eval --test marshmallow-code__marshmallow-1343 --interactive
+    #[arg(long)]
+    interactive: bool,
 
     /// List registry and exit
     #[arg(long)]
@@ -35,9 +44,10 @@ struct Args {
     #[arg(long)]
     explain: bool,
 
-    /// Run a single test/scenario id
-    #[arg(long)]
-    run: Option<String>,
+    /// Run or launch a single test/scenario id (e.g. easy-hello-world, marshmallow-code__marshmallow-1343).
+    /// Use --test or --run (alias).
+    #[arg(long, alias = "run")]
+    test: Option<String>,
 
     /// OpenAI-compatible base URL for AI features and live smoke
     #[arg(long, env = "LLM_BASE_URL", default_value = "http://127.0.0.1:8080/v1")]
@@ -56,19 +66,29 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if let Some(id) = args.run {
+    if let Some(id) = args.test.clone() {
+        // --test (or --run via alias) was provided
         let mut state = load_state()?;
         let is_swebench = raven_tui::eval_operator::swebench::is_instance_id(
             &runner.manifest_dir,
             &id,
         );
-        if args.live && !is_swebench {
-            anyhow::bail!("--live requires a SWE-bench instance id (see evals/swebench/instances/)");
+        let is_easy = id.starts_with("easy-");
+        if args.live && !is_swebench && !is_easy {
+            anyhow::bail!("--live requires a SWE-bench instance id (see evals/swebench/instances/) or easy-* id");
         }
+
+        if args.interactive {
+            runner.launch_interactive(&id)?;
+            return Ok(());
+        }
+
         let profile = if args.live {
-            "swebench-live".into()
+            if is_easy { "easy-bench-live".into() } else { "swebench-live".into() }
         } else if is_swebench {
             "swebench-smoke".into()
+        } else if is_easy {
+            "easy-bench-live".into()
         } else {
             format!("single:{id}")
         };
@@ -93,7 +113,7 @@ fn main() -> Result<()> {
     if let Some(profile) = args.profile {
         if profile_ids(&profile).is_err() {
             anyhow::bail!(
-                "unknown profile {profile:?} (use quick, local, full, swebench-smoke, or swebench-live)"
+                "unknown profile {profile:?} (use quick, local, full, swebench-smoke, swebench-live, or easy-bench-live). For single tests use --test <name> [--interactive]"
             );
         }
         let mut state = load_state()?;
