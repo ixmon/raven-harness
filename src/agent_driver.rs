@@ -390,7 +390,8 @@ pub async fn drive_turn(
                     let last_req = agent.session.as_ref()
                         .and_then(|s| s.meta.last_user_request.as_deref())
                         .unwrap_or("");
-                    let expects_define = last_req.contains("define_done") || last_req.contains("Early in the task, call the `define_done`");
+                    let has_eval_python = std::env::var("RAVEN_EVAL_PYTHON").is_ok() || std::env::var("RAVEN_EVAL_PYTHON3").is_ok();
+                    let expects_define = has_eval_python || last_req.contains("define_done") || last_req.contains("Early in the task, call the `define_done`");
                     if expects_define && judge_nudges < NUDGE_BUDGET {
                         judge_nudges += 1;
                         observer.on_nudge(judge_nudges, NUDGE_BUDGET);
