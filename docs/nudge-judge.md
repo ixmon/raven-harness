@@ -1,8 +1,12 @@
 # Nudge and Judge System — Nudge-v1 (Current Behavior)
 
-This document first describes the **current** nudge/judge system (referred to as "nudge-v1" on this branch). The goal is to have a clear, accurate baseline before experimenting with "nudge-v2" changes.
+**This document describes the current baseline behavior, referred to as "nudge-v1".**
 
-Later sections can capture proposed v2 designs, experiments, and results.
+All test and eval results captured while this document is the active description (including the baselines below) were obtained using this Nudge-v1 implementation. Nudge-v2 has not yet been implemented.
+
+The goal of this document is to provide a clear, accurate record of the starting point before any changes for "nudge-v2".
+
+Later sections will capture proposed v2 designs, experiments, and comparative results.
 
 ## Overview
 
@@ -17,6 +21,23 @@ The central implementation lives in:
 - `src/agent.rs`: `judge_turn()`, `push_continuation_nudge()`, `define_done` / `completion_criteria` handling, and harness event logging.
 
 The system is used for both interactive TUI runs and headless `--prompt` / eval runs.
+
+### Behavior in Normal Interactive Mode (vs. Eval)
+
+In **normal interactive use** of `raven-tui` (no `RAVEN_EVAL` or `RAVEN_EVAL_MOCK_LLM` environment variables):
+
+- The aggressive criteria-based nudging path is **mostly inactive**.
+- The system prompt does **not** strongly instruct the agent to call `define_done()` early (this instruction is suppressed outside eval mode).
+- As a result, `completion_criteria` is rarely set by the agent, so the "judge on every no-tool round while criteria is active" logic does not trigger.
+- Most nudging that occurs is from the **hardcoded heuristic paths** (plan-narration detection, empty-response recovery, length recovery, etc.).
+- The LLM `judge_turn` can still be called in limited situations:
+  - On the 3rd empty response recovery.
+  - In the general "rich inference judge" path after the model has used tools (or produced malformed tool syntax) and `finish_reason != "stop"`.
+- Goal tracking is off by default (no `RAVEN_GOAL_TRACKING`), which further reduces judge activity.
+
+In contrast, under `RAVEN_EVAL` (or when the agent explicitly calls `define_done`), the full judge + aggressive nudging (with 999 limit) becomes active.
+
+This distinction is intentional: strong define_done / criteria-driven judging behavior is primarily intended for evaluation harnesses.
 
 ## Key Constants
 
@@ -148,6 +169,10 @@ After executing tools, the loop continues until a no-tool decision or outer limi
 
 ## Baseline for Nudge-v2 Experiments
 
+**All baselines below (and any runs taken while this document describes the active implementation) were measured using the current Nudge-v1 behavior.**
+
+Nudge-v2 changes have not been implemented yet.
+
 A useful recent reference run on easy-bench-live (full agent mode) is:
 
 **run_id: 20260624T212842Z**
@@ -156,7 +181,9 @@ A useful recent reference run on easy-bench-live (full agent mode) is:
 - easy-fizzbuzz: passed (4 turns, 3 tool calls, ~20s wall)
 - marshmallow-code__marshmallow-1343: resolved ("swebench:full resolved") (37 turns, 33 tool calls, ~16 min wall)
 
-To lock a fresh baseline on the `nudge-v2` branch:
+These scores (and any other runs taken while this document describes the active behavior) represent the Nudge-v1 baseline.
+
+To lock a fresh baseline on the `nudge-v2` branch before implementing changes:
 
 ```bash
 cd tui
