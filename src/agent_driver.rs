@@ -489,7 +489,10 @@ pub async fn drive_turn(
                 // Force a continuation nudge so it acts instead of completing the turn with text only.
                 let text_lower = effective_text.to_lowercase();
                 let looks_like_plan_narration = tool_calls.is_empty() &&
-                    (text_lower.contains("let me ") ||
+                    (text_lower.contains("let me implement") ||
+                     text_lower.contains("let me fix") ||
+                     text_lower.contains("let me patch") ||
+                     text_lower.contains("let me edit") ||
                      text_lower.contains("i will ") ||
                      text_lower.contains("the fix is") ||
                      text_lower.contains("implement this") ||
