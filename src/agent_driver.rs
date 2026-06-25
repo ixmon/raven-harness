@@ -207,7 +207,7 @@ pub async fn drive_turn(
                 loop {
                     let stream = match agent.send_streaming_request(tools_for_request.clone()).await {
                         Ok(s) => s,
-                        Err(e) if attempt < MAX_STREAM_RETRIES => {
+                        Err(_) if attempt < MAX_STREAM_RETRIES => {
                             attempt += 1;
                             continue;
                         }
