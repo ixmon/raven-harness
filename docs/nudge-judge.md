@@ -204,6 +204,8 @@ After implementing the Nudge-v2 algorithm (budgeted nudges at NUDGE_BUDGET=3, pr
 
 These are the first measured results with the Nudge-v2 logic on the branch. The easy cases "pay a small tax" for the new proactive behavior, while the longer SWE case shows a small net win in turn/call count.
 
+**Recommendation going forward:** While continuing to run occasional full SWE-bench live for visibility, focus primary testing on harness-specific capabilities using custom scenarios (see existing ones like `plan_narration_continues.json`, `empty_first_recovery.json`, and the easy-* tests). These let us directly assert on judge behavior, nudge budgets, define_done usage, session persistence, etc., independent of whether the produced patch matches the official grader's expectations.
+
 To lock a fresh baseline on the `nudge-v2` branch before implementing changes:
 
 ```bash
