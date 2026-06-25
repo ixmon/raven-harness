@@ -16,6 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 
+#[allow(unused_imports)]
 pub use crate::server_probe::{extract_context_tokens, resolve_server_probe, ProbeMatch, ServerProbeResult};
 pub use crate::server_probe::probe_server;
 

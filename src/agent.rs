@@ -25,7 +25,7 @@ fn make_rel_path(p: &str, workspace: &Path) -> String {
     }
 }
 
-const MAX_TOOL_ROUNDS: u32 = 12;
+
 
 // Summary and truncation limits (from glm review cleanup)
 const SUMMARY_CHAR_LIMIT: usize = 1600;
@@ -160,6 +160,7 @@ impl Agent {
     /// This delegates to `agent_driver::drive_turn()` with a `SilentObserver`,
     /// so it uses the exact same driving loop as the interactive TUI (nudges,
     /// auto-continue, streaming, etc.).
+    #[allow(dead_code)]
     pub async fn run_turn(&mut self, user_input: &str) -> Result<TurnResult> {
         let mut observer = crate::agent_driver::SilentObserver;
         crate::agent_driver::drive_turn(self, user_input, &mut observer).await
@@ -167,6 +168,7 @@ impl Agent {
 
     /// Get a streaming turn. The caller is responsible for consuming chunks and
     /// calling `feed_tool_result` when tool calls are completed.
+    #[allow(dead_code)]
     pub async fn run_turn_streaming(
         &mut self,
         user_input: &str,
@@ -308,6 +310,7 @@ impl Agent {
     /// Continue with another streaming inference using the *current* conversation
     /// (no extra user message is pushed). This is used after tool results have
     /// already been appended.
+    #[allow(dead_code)]
     pub async fn continue_turn_streaming(&mut self) -> Result<mpsc::Receiver<StreamChunk>> {
         self.prune_history().await;
         let messages = self.build_messages_for_model();
@@ -348,6 +351,18 @@ impl Agent {
             tool_calls: None,
             tool_call_id: None,
         });
+        // Log immediately (with current ts) so full_log order matches conversation order.
+        // Advance count so persist_turn won't duplicate.
+        if let Some(s) = &self.session {
+            let entry = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "role": role,
+                "content": content,
+                "has_tool_calls": false,
+            });
+            let _ = s.append_log(&entry.to_string());
+            self.logged_message_count = self.conversation.len();
+        }
     }
 
     /// Append a harness-internal diagnostic event directly to full_log.jsonl
@@ -505,13 +520,12 @@ History:
         };
 
         let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
-        let cleaned = if in_eval {
+        if in_eval {
             // Post-process only in eval to strip meta-task structures
             strip_command_context_blocks(&raw)
         } else {
             raw
-        };
-        cleaned
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -711,19 +725,18 @@ History:
 
         if name == "store_summary" {
             // TEMPORARILY NO-OP (cache disabled)
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            return Some(format!("✅ store_summary ignored (summary cache disabled for test)"));
+            let _path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            return Some("✅ store_summary ignored (summary cache disabled for test)".to_string());
         }
 
         None
     }
 
-    fn maybe_invalidate_summary(&mut self, name: &str, args: &serde_json::Value) {
+    fn maybe_invalidate_summary(&mut self, name: &str, _args: &serde_json::Value) {
         // TEMPORARILY disabled along with summary cache for SWE-bench testing.
-        if name != "write" && name != "patch" {
-            return;
+        if name == "write" || name == "patch" {
+            // (cache off — no-op)
         }
-        // (cache off — no-op)
     }
 
     async fn persist_turn(&mut self) {
@@ -752,7 +765,7 @@ History:
             // scripted response queue). The heavy prune_history at 48 messages
             // handles full compression.
             if self.conversation.len() >= 24
-                && self.conversation.len() % 12 == 0
+                && self.conversation.len().is_multiple_of(12)
                 && !matches!(self.client, ChatBackend::Mock(_))
             {
                 let last_few: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
@@ -825,16 +838,23 @@ History:
         &self.config
     }
 
+    pub fn enable_judge(&self) -> bool {
+        self.config.enable_judge
+    }
+
     /// Number of messages in the live conversation (for test assertions).
+    #[allow(dead_code)]
     pub fn conversation_len(&self) -> usize {
         self.conversation.len()
     }
 
     /// Read-only access to the session (for test assertions on meta, log, etc.).
+    #[allow(dead_code)]
     pub fn session_ref(&self) -> Option<&crate::session::Session> {
         self.session.as_ref()
     }
 
+    #[allow(dead_code)]
     pub fn has_session(&self) -> bool {
         self.session.is_some()
     }
@@ -853,7 +873,7 @@ History:
 
         if m.current_goal.trim().is_empty() || m.current_goal.contains("not yet established") {
             // In no-goal experiments, fall back to completion_criteria if the agent set one
-            if m.completion_criteria.as_ref().map_or(true, |c| c.trim().is_empty()) {
+            if m.completion_criteria.as_ref().is_none_or(|c| c.trim().is_empty()) {
                 return TurnJudge::Continue;
             }
         }
@@ -1149,6 +1169,7 @@ mod integration_tests {
                 }),
             )),
             tools_enabled: true,
+            enable_judge: false,
         }
     }
 

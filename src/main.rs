@@ -110,6 +110,11 @@ struct Args {
     /// Thunderdome = eternal yolo (no prompts). SpringBreak = yolo for this session.
     #[arg(long, value_name = "MODE", env = "RAVEN_APPROVAL")]
     approval: Option<String>,
+
+    /// Enable the full V2 nudge/judge/criteria logic (define_done + budgeted progress continues).
+    /// Set automatically from scenario tests; can be disabled per-scenario with "disable_judge": true (or 1).
+    #[arg(long)]
+    enable_judge: bool,
 }
 
 #[tokio::main]
@@ -373,11 +378,11 @@ async fn main() -> Result<()> {
         let eval_python3 = std::env::var("RAVEN_EVAL_PYTHON3").ok();
         let effective_prompt = if eval_python.is_some() || eval_python3.is_some() {
             let mut note = String::from("## Evaluation Harness Context\n");
-            if let Some(p) = &eval_python {
-                // note.push_str(&format!("Use this exact Python interpreter for the project under test: {}\n", p));
+            if let Some(_p) = &eval_python {
+                // note.push_str(&format!("Use this exact Python interpreter for the project under test: {}\n", _p));
             }
-            if let Some(p) = &eval_python3 {
-                // note.push_str(&format!("python3 equivalent (if needed): {}\n", p));
+            if let Some(_p) = &eval_python3 {
+                // note.push_str(&format!("python3 equivalent (if needed): {}\n", _p));
             }
             /*
             note.push_str("Prefer the python from the environment the harness launched you in. ");
@@ -407,6 +412,7 @@ async fn main() -> Result<()> {
             context_budget: context_budget.clone(),
             tool_backend,
             tools_enabled,
+            enable_judge: args.enable_judge,
         };
         let chat_backend = if use_mock_llm {
             let scenario = smoke_scenario
@@ -473,6 +479,7 @@ async fn main() -> Result<()> {
         context_budget,
         tool_backend,
         tools_enabled: true,
+        enable_judge: args.enable_judge,
     };
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.

@@ -308,8 +308,7 @@ impl Runner {
         }
         println!("Equivalent command: cargo run --release --bin raven-tui -- --workspace {} --fresh-session --temperature 1 --approval thunderdome --context-size 65536 --base-url {}", 
             workspace.display(), &self.llm_base_url);
-        let mut cmd = Command::new("cargo");
-        cmd.args([
+        let mut tui_args = vec![
             "run", "--release", "--quiet", "--bin", "raven-tui", "--",
             "--workspace", workspace.to_str().unwrap(),
             "--fresh-session",
@@ -317,7 +316,12 @@ impl Runner {
             "--approval", "thunderdome",
             "--context-size", "65536",
             "--base-url", &self.llm_base_url,
-        ]);
+        ];
+        if self.should_enable_judge_for_scenario(id) {
+            tui_args.push("--enable-judge");
+        }
+        let mut cmd = Command::new("cargo");
+        cmd.args(tui_args);
         cmd.current_dir(manifest);
         // Pass the prompt file so TUI can prefill the input with the test prompt
         cmd.env("RAVEN_EVAL_INITIAL_PROMPT_FILE", prompt_file.to_str().unwrap());
@@ -450,11 +454,15 @@ impl Runner {
 
     fn run_mock_scenario(&self, id: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
         let prompt_file = self.write_scenario_prompt_file(id, log_path)?;
+        let mut tui_args = vec![
+            "run", "--release", "--quiet", "--bin", "raven-tui", "--",
+            "--prompt-file", prompt_file.to_str().unwrap(),
+        ];
+        if self.should_enable_judge_for_scenario(id) {
+            tui_args.push("--enable-judge");
+        }
         let output = Command::new("cargo")
-            .args([
-                "run", "--release", "--quiet", "--bin", "raven-tui", "--",
-                "--prompt-file", prompt_file.to_str().unwrap(),
-            ])
+            .args(tui_args)
             .current_dir(&self.manifest_dir)
             .env("RAVEN_EVAL", "1")
             .env("RAVEN_EVAL_MOCK_LLM", "1")
@@ -521,22 +529,26 @@ impl Runner {
 
         let prompt_file = self.write_scenario_prompt_file(id, log_path)?;
 
+        let mut tui_args = vec![
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--base-url",
+            &self.llm_base_url,
+            "--temperature",
+            "0",
+            "--fresh-session",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+        ];
+        if self.should_enable_judge_for_scenario(id) {
+            tui_args.push("--enable-judge");
+        }
         let output = Command::new("cargo")
-            .args([
-                "run",
-                "--release",
-                "--quiet",
-                "--bin",
-                "raven-tui",
-                "--",
-                "--base-url",
-                &self.llm_base_url,
-                "--temperature",
-                "0",
-                "--fresh-session",
-                "--prompt-file",
-                prompt_file.to_str().unwrap(),
-            ])
+            .args(tui_args)
             .current_dir(&self.manifest_dir)
             .env("RAVEN_EVAL", "1")
             .env("RAVEN_EVAL_SCENARIO", id)
@@ -569,26 +581,30 @@ impl Runner {
         let prompt_file = self.write_scenario_prompt_file("easy-hello-world", log_path)?;
 
         let metrics_out = log_path.with_file_name("easy-hello-world_harness_turn.json");
+        let mut tui_args = vec![
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--base-url",
+            &self.llm_base_url,
+            "--temperature",
+            "0",
+            "--fresh-session",
+            "--max-rounds",
+            "8",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+        ];
+        if self.should_enable_judge_for_scenario("easy-hello-world") {
+            tui_args.push("--enable-judge");
+        }
         let output = Command::new("cargo")
-            .args([
-                "run",
-                "--release",
-                "--quiet",
-                "--bin",
-                "raven-tui",
-                "--",
-                "--workspace",
-                workspace.to_str().unwrap(),
-                "--base-url",
-                &self.llm_base_url,
-                "--temperature",
-                "0",
-                "--fresh-session",
-                "--max-rounds",
-                "8",
-                "--prompt-file",
-                prompt_file.to_str().unwrap(),
-            ])
+            .args(tui_args)
             .current_dir(&self.manifest_dir)
             .env("RAVEN_APPROVAL", "thunderdome")
             .env("RAVEN_METRICS_OUT", metrics_out.to_string_lossy().as_ref())
@@ -693,26 +709,30 @@ impl Runner {
         let prompt_file = self.write_scenario_prompt_file("easy-fizzbuzz", log_path)?;
 
         let metrics_out = log_path.with_file_name("easy-fizzbuzz_harness_turn.json");
+        let mut tui_args = vec![
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--base-url",
+            &self.llm_base_url,
+            "--temperature",
+            "0",
+            "--fresh-session",
+            "--max-rounds",
+            "8",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+        ];
+        if self.should_enable_judge_for_scenario("easy-fizzbuzz") {
+            tui_args.push("--enable-judge");
+        }
         let output = Command::new("cargo")
-            .args([
-                "run",
-                "--release",
-                "--quiet",
-                "--bin",
-                "raven-tui",
-                "--",
-                "--workspace",
-                workspace.to_str().unwrap(),
-                "--base-url",
-                &self.llm_base_url,
-                "--temperature",
-                "0",
-                "--fresh-session",
-                "--max-rounds",
-                "8",
-                "--prompt-file",
-                prompt_file.to_str().unwrap(),
-            ])
+            .args(tui_args)
             .current_dir(&self.manifest_dir)
             .env("RAVEN_APPROVAL", "thunderdome")
             .env("RAVEN_METRICS_OUT", metrics_out.to_string_lossy().as_ref())
@@ -792,7 +812,7 @@ impl Runner {
         Ok((status, label))
     }
 
-    fn write_scenario_prompt_file(&self, id: &str, log_path: &PathBuf) -> Result<PathBuf> {
+    fn write_scenario_prompt_file(&self, id: &str, log_path: &Path) -> Result<PathBuf> {
         let scenario_path = self.evals_dir().join("scenarios").join(format!("{}.json", id));
         let data = std::fs::read_to_string(&scenario_path)
             .with_context(|| format!("read scenario {}", scenario_path.display()))?;
@@ -806,6 +826,19 @@ impl Runner {
         std::fs::write(&prompt_file, prompt)
             .with_context(|| format!("write prompt file for {}", id))?;
         Ok(prompt_file)
+    }
+
+    fn should_enable_judge_for_scenario(&self, id: &str) -> bool {
+        let scenario_path = self.evals_dir().join("scenarios").join(format!("{}.json", id));
+        if let Ok(data) = std::fs::read_to_string(&scenario_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                let dj = v.get("disable_judge");
+                if dj.and_then(|x| x.as_bool()) == Some(true) || dj.and_then(|x| x.as_u64()) == Some(1) {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
@@ -970,7 +1003,7 @@ fn harness_stats_line(log_dir: &Path) -> Option<String> {
     if let Ok(rd) = std::fs::read_dir(log_dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().map_or(false, |x| x == "json") {
+            if p.extension().is_some_and(|x| x == "json") {
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     if name.ends_with("_harness_turn.json") || name == "harness_turn.json" {
                         if let Ok(data) = std::fs::read_to_string(&p) {

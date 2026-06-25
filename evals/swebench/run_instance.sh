@@ -179,6 +179,7 @@ run_raven() {
       --workspace "$REPO_DIR" \
       --prompt-file "$RESULT_DIR/prompt.txt" \
       --fresh-session \
+      --enable-judge \
       --max-rounds "${RAVEN_MAX_ROUNDS:-30}" \
       --max-tokens "${RAVEN_MAX_TOKENS:-16384}" \
       --temperature "${RAVEN_TEMPERATURE:-0}" \

@@ -84,6 +84,8 @@ pub struct Config {
     pub tool_backend: crate::tools::ToolBackend,
     /// When false, tool schemas are omitted from LLM requests (connectivity-only evals).
     pub tools_enabled: bool,
+    /// Enable the full V2 nudge/judge/criteria logic (define_done + progress-based continues, no hard budget cap on judge Continue).
+    pub enable_judge: bool,
 }
 
 impl Config {

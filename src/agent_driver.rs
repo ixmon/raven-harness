@@ -25,6 +25,9 @@ use crate::tools;
 /// before accepting a text-only response.
 pub const MAX_TEXT_NUDGES: u32 = 3;
 
+/// Default budget for nudges driven by the judge between user interactions.
+pub const NUDGE_BUDGET: u32 = 3;
+
 /// Safety limit on auto-continuing when the inner round budget is exhausted
 /// but the model was still actively calling tools.
 pub const MAX_AUTO_CONTINUES: u32 = 3;
@@ -105,6 +108,7 @@ pub trait TurnObserver: Send {
 // ── Built-in observers ───────────────────────────────────────────────────────
 
 /// Silent observer for integration tests and `Agent::run_turn()` backward compat.
+#[allow(dead_code)]
 pub struct SilentObserver;
 impl TurnObserver for SilentObserver {
     fn on_stuck(&mut self, _reason: &str, _suggested: &str) {
@@ -181,6 +185,7 @@ pub async fn drive_turn(
     let mut completion_tokens: u64 = 0;
     let mut total_llm_rounds: u32 = 0;
     let mut text_nudges: u32 = 0;
+    let mut judge_nudges: u32 = 0;
     let mut tools_used_this_turn: usize = 0;
 
     // Outer auto-continue loop (mirrors TUI 'auto_continue label)
@@ -202,7 +207,7 @@ pub async fn drive_turn(
                 loop {
                     let stream = match agent.send_streaming_request(tools_for_request.clone()).await {
                         Ok(s) => s,
-                        Err(e) if attempt < MAX_STREAM_RETRIES => {
+                        Err(_) if attempt < MAX_STREAM_RETRIES => {
                             attempt += 1;
                             continue;
                         }
@@ -320,13 +325,10 @@ pub async fn drive_turn(
                     continue;
                 }
 
-                // If completion criteria (from define_done) is set, ALWAYS let the judge decide
-                // on a no-tool round (empty or text response). Follow its decision:
-                // - Fulfilled: accept done, clear criteria
-                // - Stuck: stop and surface guidance
-                // - Continue: nudge (with criteria reminder) and keep going.
-                // This way the judge keeps nudging on every round where criteria is not met,
-                // not only on the 3rd call and not gated behind "no repair yet".
+                // Nudge-v2 criteria logic: judge only on no-tool rounds.
+                // Use NUDGE_BUDGET. If no criteria yet, proactively remind to call define_done.
+                // When criteria set, judge checks; on Continue offer suggestion and nudge (budgeted).
+                // If budget consumed but judge sees progress, allow one more.
                 if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
                     if !c.trim().is_empty() {
                         let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
@@ -359,16 +361,51 @@ pub async fn drive_turn(
                                 break;
                             }
                             TurnJudge::Continue => {
-                                if total_llm_rounds < max_rounds {
-                                    text_nudges += 1;
-                                    observer.on_nudge(text_nudges, 999); // criteria path intentionally exceeds MAX_TEXT_NUDGES
-                                    let nudge_text = format!("[You defined done as: {}. Now use tools to satisfy the criteria (read the files and patch the source).]", c);
-                                    agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/999: {}", text_nudges, nudge_text), total_llm_rounds);
+                                if agent.enable_judge() {
+                                    // Trust the judge: if it returns Continue (making progress) we keep going
+                                    // forever (unbounded). Churn risk accepted; future duration caps can monitor.
+                                    // No hard NUDGE_BUDGET cap in the enabled case.
+                                    judge_nudges += 1;
+                                    observer.on_nudge(judge_nudges, 999);
+                                    // V2: offer suggestion for achieving the criteria
+                                    let nudge_text = format!(
+                                        "[You defined done as: {}. Suggestion: focus on minimal source changes that directly address the root cause in the original bug report. Now use tools to satisfy the criteria (read files and patch).]",
+                                        c
+                                    );
+                                    agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/inf: {}", judge_nudges, nudge_text), total_llm_rounds);
                                     agent.push_message("user", &nudge_text);
                                     continue;
+                                } else if total_llm_rounds < max_rounds {
+                                    let nudge_limit = if judge_nudges < NUDGE_BUDGET { NUDGE_BUDGET } else { NUDGE_BUDGET + 1 };
+                                    if judge_nudges < nudge_limit {
+                                        judge_nudges += 1;
+                                        observer.on_nudge(judge_nudges, nudge_limit);
+                                        // V2: offer suggestion for achieving the criteria
+                                        let nudge_text = format!(
+                                            "[You defined done as: {}. Suggestion: focus on minimal source changes that directly address the root cause in the original bug report. Now use tools to satisfy the criteria (read files and patch).]",
+                                            c
+                                        );
+                                        agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/{}: {}", judge_nudges, nudge_limit, nudge_text), total_llm_rounds);
+                                        agent.push_message("user", &nudge_text);
+                                        continue;
+                                    }
+                                    // budget exhausted and judge still Continue -> progress? allow one, else stop nudging
+                                    // for now, if here and Continue, we already incremented above in if, but to stop if pointless
+                                    // (judge said Continue so assume not pointless; V2 would have judge decide pointless)
                                 }
                             }
                         }
+                    }
+                } else if total_llm_rounds > 1 && agent.session.is_some() && agent.enable_judge() {
+                    // V2 proactive define_done reminder (to ensure criteria for judge).
+                    // Gated behind --enable-judge (set for scenario tests that want the full nudge/judge).
+                    if judge_nudges < NUDGE_BUDGET {
+                        judge_nudges += 1;
+                        observer.on_nudge(judge_nudges, NUDGE_BUDGET);
+                        let msg = "[You have not called define_done() yet to declare what 'done' looks like for this task. Please call it now with a clear, precise definition so progress can be judged.]";
+                        agent.log_harness_event_with_round("nudge", &format!("define-done-reminder nudge {}/{}", judge_nudges, NUDGE_BUDGET), total_llm_rounds);
+                        agent.push_message("user", msg);
+                        continue;
                     }
                 }
 
@@ -377,6 +414,7 @@ pub async fn drive_turn(
                 // and zero tool calls on the opening turn (pure system message + injection,
                 // reasoning-only deltas, or transient generation). Do not treat this as
                 // natural completion — nudge once and retry while budget allows.
+                #[allow(clippy::collapsible_if)]
                 if effective_text.trim().is_empty() && !is_llm_error {
                     if total_llm_rounds < max_rounds {
                         if text_nudges < MAX_TEXT_NUDGES {
@@ -464,14 +502,12 @@ pub async fn drive_turn(
                      text_lower.contains("implement this") ||
                      text_lower.contains("re-read the code") ||
                      (text_lower.contains("implement") && text_lower.contains("fix")));
-                if looks_like_plan_narration && !is_llm_error {
-                    if text_nudges < MAX_TEXT_NUDGES {
-                        text_nudges += 1;
-                        observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
-                        agent.log_harness_event_with_round("nudge", &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES), total_llm_rounds);
-                        agent.push_continuation_nudge();
-                        continue;
-                    }
+                if looks_like_plan_narration && !is_llm_error && text_nudges < MAX_TEXT_NUDGES {
+                    text_nudges += 1;
+                    observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                    agent.log_harness_event_with_round("nudge", &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES), total_llm_rounds);
+                    agent.push_continuation_nudge();
+                    continue;
                 }
 
                 // Detect malformed/partial tool call syntax in the (post-strip) text even if parse failed to extract tool_calls.
@@ -546,13 +582,11 @@ pub async fn drive_turn(
                     // implies a run/show and we still haven't done an exec, nudge once.
                     // Uses the same (clean) implies_run from last_user_request only.
                     let did_write = recent.iter().any(|a| a.tool == "write" || a.tool == "patch");
-                    if did_write && implies_run && !has_exec {
-                        if text_nudges < MAX_TEXT_NUDGES {
-                            text_nudges += 1;
-                            observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
-                            agent.push_continuation_nudge();
-                            continue;
-                        }
+                    if did_write && implies_run && !has_exec && text_nudges < MAX_TEXT_NUDGES {
+                        text_nudges += 1;
+                        observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                        agent.push_continuation_nudge();
+                        continue;
                     }
 
                     let decision = agent.judge_turn(&effective_text, &recent).await;
@@ -607,12 +641,25 @@ pub async fn drive_turn(
                         TurnJudge::Continue => {
                             let criteria_active = agent.session.as_ref()
                                 .and_then(|s| s.meta.completion_criteria.as_ref())
-                                .map_or(false, |c| !c.trim().is_empty());
-                            if criteria_active || text_nudges < MAX_TEXT_NUDGES {
-                                text_nudges += 1;
-                                let display_max = if criteria_active { 999 } else { MAX_TEXT_NUDGES };
-                                observer.on_nudge(text_nudges, display_max);
-                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/{}", text_nudges, display_max), total_llm_rounds);
+                                .is_some_and(|c| !c.trim().is_empty());
+                            if agent.enable_judge() && criteria_active {
+                                // Trust judge for progress when --enable-judge: continue (nudge) unbounded.
+                                judge_nudges += 1;
+                                observer.on_nudge(judge_nudges, 999);
+                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/inf (criteria)", judge_nudges), total_llm_rounds);
+                                agent.push_continuation_nudge();
+                                continue;
+                            }
+                            let use_judge_budget = criteria_active || judge_nudges < NUDGE_BUDGET;
+                            if use_judge_budget {
+                                if criteria_active {
+                                    judge_nudges += 1;
+                                } else {
+                                    text_nudges += 1;
+                                }
+                                let display_max = if criteria_active { NUDGE_BUDGET } else { MAX_TEXT_NUDGES };
+                                observer.on_nudge(if criteria_active { judge_nudges } else { text_nudges }, display_max);
+                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/{}", if criteria_active { judge_nudges } else { text_nudges }, display_max), total_llm_rounds);
                                 agent.push_continuation_nudge();
                                 continue;
                             }

@@ -1311,12 +1311,10 @@ fn build_left_text(
                 .push(Line::from(Span::styled(line.to_string(), style)));
             line_idx += 1;
         }
-        if i < left_committed.len() - 1 {
-            if consecutive_blanks < 2 {
-                left_text.lines.push(Line::from(""));
-                line_idx += 1;
-                consecutive_blanks += 1;
-            }
+        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
+            left_text.lines.push(Line::from(""));
+            line_idx += 1;
+            consecutive_blanks += 1;
         }
     }
 
