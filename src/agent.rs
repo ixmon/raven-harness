@@ -351,6 +351,18 @@ impl Agent {
             tool_calls: None,
             tool_call_id: None,
         });
+        // Log immediately (with current ts) so full_log order matches conversation order.
+        // Advance count so persist_turn won't duplicate.
+        if let Some(s) = &self.session {
+            let entry = serde_json::json!({
+                "ts": chrono::Utc::now().to_rfc3339(),
+                "role": role,
+                "content": content,
+                "has_tool_calls": false,
+            });
+            let _ = s.append_log(&entry.to_string());
+            self.logged_message_count = self.conversation.len();
+        }
     }
 
     /// Append a harness-internal diagnostic event directly to full_log.jsonl
