@@ -33,6 +33,7 @@ fn eval_config(scenario: &raven_tui::eval_smoke::SmokeScenario, tool_backend: To
         context_budget: ContextBudget::from_context_tokens(ctx_tokens, max_rounds),
         tool_backend,
         tools_enabled: !scenario.disable_tools,
+        enable_judge: !scenario.disable_judge,
     }
 }
 

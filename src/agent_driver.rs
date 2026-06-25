@@ -361,7 +361,21 @@ pub async fn drive_turn(
                                 break;
                             }
                             TurnJudge::Continue => {
-                                if total_llm_rounds < max_rounds {
+                                if agent.enable_judge() {
+                                    // Trust the judge: if it returns Continue (making progress) we keep going
+                                    // forever (unbounded). Churn risk accepted; future duration caps can monitor.
+                                    // No hard NUDGE_BUDGET cap in the enabled case.
+                                    judge_nudges += 1;
+                                    observer.on_nudge(judge_nudges, 999);
+                                    // V2: offer suggestion for achieving the criteria
+                                    let nudge_text = format!(
+                                        "[You defined done as: {}. Suggestion: focus on minimal source changes that directly address the root cause in the original bug report. Now use tools to satisfy the criteria (read files and patch).]",
+                                        c
+                                    );
+                                    agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/inf: {}", judge_nudges, nudge_text), total_llm_rounds);
+                                    agent.push_message("user", &nudge_text);
+                                    continue;
+                                } else if total_llm_rounds < max_rounds {
                                     let nudge_limit = if judge_nudges < NUDGE_BUDGET { NUDGE_BUDGET } else { NUDGE_BUDGET + 1 };
                                     if judge_nudges < nudge_limit {
                                         judge_nudges += 1;
@@ -382,10 +396,9 @@ pub async fn drive_turn(
                             }
                         }
                     }
-                } else if total_llm_rounds > 1 && agent.session.is_some() {
-                    // V2 proactive: no define_done yet, remind the agent (limited by budget).
-                    // The session check protects the unit test (no session).
-                    // Smokes may get extra turns; their scenarios can be updated if needed.
+                } else if total_llm_rounds > 1 && agent.session.is_some() && agent.enable_judge() {
+                    // V2 proactive define_done reminder (to ensure criteria for judge).
+                    // Gated behind --enable-judge (set for scenario tests that want the full nudge/judge).
                     if judge_nudges < NUDGE_BUDGET {
                         judge_nudges += 1;
                         observer.on_nudge(judge_nudges, NUDGE_BUDGET);
@@ -629,6 +642,14 @@ pub async fn drive_turn(
                             let criteria_active = agent.session.as_ref()
                                 .and_then(|s| s.meta.completion_criteria.as_ref())
                                 .is_some_and(|c| !c.trim().is_empty());
+                            if agent.enable_judge() && criteria_active {
+                                // Trust judge for progress when --enable-judge: continue (nudge) unbounded.
+                                judge_nudges += 1;
+                                observer.on_nudge(judge_nudges, 999);
+                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/inf (criteria)", judge_nudges), total_llm_rounds);
+                                agent.push_continuation_nudge();
+                                continue;
+                            }
                             let use_judge_budget = criteria_active || judge_nudges < NUDGE_BUDGET;
                             if use_judge_budget {
                                 if criteria_active {

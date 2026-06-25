@@ -399,6 +399,7 @@ mod tests {
             context_budget: ContextBudget::from_context_tokens(8192, 10),
             tool_backend: crate::tools::ToolBackend::default(),
             tools_enabled: true,
+            enable_judge: false,
         };
         let agent = Arc::new(Mutex::new(Agent::new(
             config.clone(),

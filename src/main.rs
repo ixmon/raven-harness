@@ -110,6 +110,11 @@ struct Args {
     /// Thunderdome = eternal yolo (no prompts). SpringBreak = yolo for this session.
     #[arg(long, value_name = "MODE", env = "RAVEN_APPROVAL")]
     approval: Option<String>,
+
+    /// Enable the full V2 nudge/judge/criteria logic (define_done + budgeted progress continues).
+    /// Set automatically from scenario tests; can be disabled per-scenario with "disable_judge": true (or 1).
+    #[arg(long)]
+    enable_judge: bool,
 }
 
 #[tokio::main]
@@ -407,6 +412,7 @@ async fn main() -> Result<()> {
             context_budget: context_budget.clone(),
             tool_backend,
             tools_enabled,
+            enable_judge: args.enable_judge,
         };
         let chat_backend = if use_mock_llm {
             let scenario = smoke_scenario
@@ -473,6 +479,7 @@ async fn main() -> Result<()> {
         context_budget,
         tool_backend,
         tools_enabled: true,
+        enable_judge: args.enable_judge,
     };
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.

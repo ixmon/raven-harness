@@ -64,6 +64,10 @@ pub struct SmokeScenario {
     /// Omit tool schemas from the LLM request (e.g. smoke_ping connectivity check).
     #[serde(default)]
     pub disable_tools: bool,
+    /// If true (or 1), do not pass --enable-judge; disables the full V2 criteria/judge/nudge path for this scenario.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub disable_judge: bool,
     #[serde(default)]
     pub expect: SmokeExpect,
 }

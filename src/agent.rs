@@ -695,7 +695,7 @@ History:
                         s.meta.completion_criteria = Some(definition.clone());
                         s.save_meta().ok();
                         self.log_harness_event("define_done_called", &format!("Agent successfully called define_done. Criteria set to: {}", definition));
-                        return Some(format!("Completion criteria defined (set once, this is valid even if after some initial exploration). The judge will use this definition going forward and clear it only on fulfillment: {}", definition));
+                        return Some(format!("Completion criteria defined (set once). Judge will use this to decide when done and clear it on fulfillment: {}", definition));
                     }
                 } else {
                     return Some("Completion criteria already set (one-time only). Judge clears it on completion.".to_string());
@@ -836,6 +836,10 @@ History:
     /// Read-only access to the current config (for UI to display active endpoint).
     pub fn current_config(&self) -> &Config {
         &self.config
+    }
+
+    pub fn enable_judge(&self) -> bool {
+        self.config.enable_judge
     }
 
     /// Number of messages in the live conversation (for test assertions).
@@ -1165,6 +1169,7 @@ mod integration_tests {
                 }),
             )),
             tools_enabled: true,
+            enable_judge: false,
         }
     }
 
