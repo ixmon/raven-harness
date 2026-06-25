@@ -94,3 +94,48 @@ async fn huge_grep_truncates_output() {
         "output to model should be smaller than raw output"
     );
 }
+
+#[tokio::test]
+async fn empty_first_recovery_continues() {
+    let scenario = load_smoke_scenario("empty_first_recovery").expect("load scenario");
+    let tools = ToolBackend::Mock(mock_backend_for(&scenario));
+    let chat = ChatBackend::Mock(mock_chat_backend_for(&scenario));
+    let config = eval_config(&scenario, tools);
+
+    let mut agent = Agent::new(config, chat);
+    let result = agent.run_turn(&scenario.prompt).await.expect("run_turn");
+
+    assert_smoke_result(&scenario, &result).expect("smoke assertions");
+    // Should have recovered from empty first response and still done useful work
+    assert!(result.actions.len() >= 1, "should have performed at least the list after recovery");
+}
+
+#[tokio::test]
+async fn plan_narration_triggers_continuation() {
+    let scenario = load_smoke_scenario("plan_narration_continues").expect("load scenario");
+    let tools = ToolBackend::Mock(mock_backend_for(&scenario));
+    let chat = ChatBackend::Mock(mock_chat_backend_for(&scenario));
+    let config = eval_config(&scenario, tools);
+
+    let mut agent = Agent::new(config, chat);
+    let result = agent.run_turn(&scenario.prompt).await.expect("run_turn");
+
+    assert_smoke_result(&scenario, &result).expect("smoke assertions");
+    // Narration first turn should have caused a nudge + continued to actual tools
+    assert!(result.actions.len() >= 2, "should have list + read after narration nudge");
+}
+
+#[tokio::test]
+async fn minimal_end_to_end_patch_flow() {
+    let scenario = load_smoke_scenario("minimal_end_to_end_patch").expect("load scenario");
+    let tools = ToolBackend::Mock(mock_backend_for(&scenario));
+    let chat = ChatBackend::Mock(mock_chat_backend_for(&scenario));
+    let config = eval_config(&scenario, tools);
+
+    let mut agent = Agent::new(config, chat);
+    let result = agent.run_turn(&scenario.prompt).await.expect("run_turn");
+
+    assert_smoke_result(&scenario, &result).expect("smoke assertions");
+    // End-to-end: list then write (simulates patch creation)
+    assert!(result.actions.iter().any(|a| a.tool == "write"), "should have performed a write/patch action");
+}

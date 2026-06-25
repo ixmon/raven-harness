@@ -171,9 +171,7 @@ After executing tools, the loop continues until a no-tool decision or outer limi
 
 **All baselines below (and any runs taken while this document describes the active implementation) were measured using the current Nudge-v1 behavior.**
 
-Nudge-v2 changes have not been implemented yet.
-
-A useful recent reference run on easy-bench-live (full agent mode) is:
+**Nudge-v1 baseline** (before V2 changes):
 
 **run_id: 20260624T212842Z**
 
@@ -181,7 +179,30 @@ A useful recent reference run on easy-bench-live (full agent mode) is:
 - easy-fizzbuzz: passed (4 turns, 3 tool calls, ~20s wall)
 - marshmallow-code__marshmallow-1343: resolved ("swebench:full resolved") (37 turns, 33 tool calls, ~16 min wall)
 
-These scores (and any other runs taken while this document describes the active behavior) represent the Nudge-v1 baseline.
+## First Nudge-v2 Measurement
+
+After implementing the Nudge-v2 algorithm (budgeted nudges at NUDGE_BUDGET=3, proactive `define_done` reminders when criteria not yet set, and helpful suggestions in criteria nudges):
+
+**run_id: 20260625T020220Z**
+
+- easy-hello-world: passed (6 turns, 4 tool calls, ~28s wall)
+- easy-fizzbuzz: passed (8 turns, 4 tool calls, ~44s wall)
+- marshmallow-code__marshmallow-1343: resolved ("swebench:full resolved") (36 turns, 30 tool calls, ~11.75 min wall)
+
+**Comparison to Nudge-v1 baseline:**
+
+- Marshmallow: 37 → 36 turns (-1), 33 → 30 calls (-3). Modest improvement in efficiency while still fully resolving the task.
+- Easy cases show modestly higher turn counts. This is expected: the proactive reminders now cause the agent to call `define_done()` (which V1 runs often skipped or did later), and the agent receives a couple of budgeted suggestion nudges.
+
+**Observed V2 behaviors in the marshmallow run:**
+- Early `[nudge 1/3]` followed by the agent calling `define_done()` (the reminder worked).
+- Nudges respected the budget (stayed at /3 instead of the old 999 on the criteria path).
+- Multiple `JUDGE (criteria active): Continue` + nudge cycles.
+- Eventually reached `JUDGE (criteria active): Fulfilled`.
+- Only one `define_done` call (as intended).
+- The agent produced a working patch that resolved the bug (and all PASS_TO_PASS tests).
+
+These are the first measured results with the Nudge-v2 logic on the branch. The easy cases "pay a small tax" for the new proactive behavior, while the longer SWE case shows a small net win in turn/call count.
 
 To lock a fresh baseline on the `nudge-v2` branch before implementing changes:
 
@@ -198,7 +219,69 @@ If broader swebench smoke/live numbers are desired for the branch, capture those
 
 ---
 
-## Nudge V2 Ideas (to be filled in)
+## Nudge V1 algorithm
+
+High-level pseudocode for current behavior (inside `drive_turn`, no-tool responses):
+
+```
+after model response with no tool calls:
+
+if LLM error:
+    push recovery nudge (limited retries)
+    continue
+
+if response truncated (length):
+    push recovery nudge
+    continue
+
+if completion_criteria set (from define_done):
+    decision = judge_turn(...)          // LLM judge
+    if Fulfilled:
+        clear criteria
+        stop
+    if Stuck:
+        push guidance
+        stop
+    if Continue:
+        nudge with criteria reminder (count → 999)
+        continue
+
+if early empty response:
+    if under MAX_TEXT_NUDGES (3):
+        push "start working" nudge
+    else:
+        decision = judge_turn(...)
+        ... (Fulfilled/Stuck/Continue handling)
+    continue
+
+if text looks like planning ("let me", "I will", "the fix is"...):
+    if under 3 nudges:
+        push_continuation_nudge()
+        continue
+
+if after tools or malformed syntax, and not explicit stop:
+    if request implies "run/exec" but no exec yet:
+        force nudge (hard safety)
+    decision = judge_turn(...)
+    if Fulfilled: stop (clear criteria if set)
+    if Stuck: push guidance (optional nudge)
+    if Continue:
+        nudge (up to 3, or 999 if criteria)
+        continue
+
+stop (accept completion)
+```
+
+After inner round budget exhausted: auto-continue a few times if still active.
+
+**Key traits of V1:**
+- Mix of hardcoded triggers + occasional judge.
+- When criteria active → very persistent nudging (999 limit).
+- Nudges are mostly "keep going" or repeat the criteria.
+- Almost no proactive suggestions.
+- Limited reminders to call `define_done`.
+
+## Nudge V2 algorithm
 
 (Original stub content preserved / to be expanded here as experiments are designed.)
 
@@ -209,3 +292,4 @@ The judge will by default consider nudging the agent up to NUDGE_BUDGET times be
 If the agent has not used define_done() to come up with a possible measurement for completion of their work the judge may reprompt them and ask them to call define_done()
 
 When the judge checks on the agent, if they have called define_done() it checks on their progress. if it appears to have met the define_done() criteria, it clears the define_done() and does not nudge the agent. The round is over. If the agent has not met the define_done() criteria it encourages the agent to continue reinforcing the definition of done and making helpful suggestions.
+If the NUDGE_BUDGET has been consumed but the judge thinks the agent is making progress it will increment it by 1 and nudge the agent to continue. If the judge thinks it is pointless it will log that and not nudge the agent again until the next external stimulus.
