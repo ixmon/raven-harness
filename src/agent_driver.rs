@@ -384,15 +384,9 @@ pub async fn drive_turn(
                     }
                 } else if total_llm_rounds > 1 && agent.session.is_some() {
                     // V2 proactive: no define_done yet, remind the agent (limited by budget).
-                    // Only for runs where the original request included the define_done
-                    // instruction (real evals / swebench-style); smoke scenarios and the
-                    // plain integration test do not script extra turns for this reminder.
-                    let last_req = agent.session.as_ref()
-                        .and_then(|s| s.meta.last_user_request.as_deref())
-                        .unwrap_or("");
-                    let has_eval_python = std::env::var("RAVEN_EVAL_PYTHON").is_ok() || std::env::var("RAVEN_EVAL_PYTHON3").is_ok();
-                    let expects_define = has_eval_python || last_req.contains("define_done") || last_req.contains("Early in the task, call the `define_done`");
-                    if expects_define && judge_nudges < NUDGE_BUDGET {
+                    // The session check protects the unit test (no session).
+                    // Smokes may get extra turns; their scenarios can be updated if needed.
+                    if judge_nudges < NUDGE_BUDGET {
                         judge_nudges += 1;
                         observer.on_nudge(judge_nudges, NUDGE_BUDGET);
                         let msg = "[You have not called define_done() yet to declare what 'done' looks like for this task. Please call it now with a clear, precise definition so progress can be judged.]";
@@ -489,10 +483,7 @@ pub async fn drive_turn(
                 // Force a continuation nudge so it acts instead of completing the turn with text only.
                 let text_lower = effective_text.to_lowercase();
                 let looks_like_plan_narration = tool_calls.is_empty() &&
-                    (text_lower.contains("let me implement") ||
-                     text_lower.contains("let me fix") ||
-                     text_lower.contains("let me patch") ||
-                     text_lower.contains("let me edit") ||
+                    (text_lower.contains("let me ") ||
                      text_lower.contains("i will ") ||
                      text_lower.contains("the fix is") ||
                      text_lower.contains("implement this") ||
