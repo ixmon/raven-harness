@@ -108,6 +108,7 @@ pub trait TurnObserver: Send {
 // ── Built-in observers ───────────────────────────────────────────────────────
 
 /// Silent observer for integration tests and `Agent::run_turn()` backward compat.
+#[allow(dead_code)]
 pub struct SilentObserver;
 impl TurnObserver for SilentObserver {
     fn on_stuck(&mut self, _reason: &str, _suggested: &str) {
@@ -405,6 +406,7 @@ pub async fn drive_turn(
                 // and zero tool calls on the opening turn (pure system message + injection,
                 // reasoning-only deltas, or transient generation). Do not treat this as
                 // natural completion — nudge once and retry while budget allows.
+                #[allow(clippy::collapsible_if)]
                 if effective_text.trim().is_empty() && !is_llm_error {
                     if total_llm_rounds < max_rounds {
                         if text_nudges < MAX_TEXT_NUDGES {
@@ -492,14 +494,12 @@ pub async fn drive_turn(
                      text_lower.contains("implement this") ||
                      text_lower.contains("re-read the code") ||
                      (text_lower.contains("implement") && text_lower.contains("fix")));
-                if looks_like_plan_narration && !is_llm_error {
-                    if text_nudges < MAX_TEXT_NUDGES {
-                        text_nudges += 1;
-                        observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
-                        agent.log_harness_event_with_round("nudge", &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES), total_llm_rounds);
-                        agent.push_continuation_nudge();
-                        continue;
-                    }
+                if looks_like_plan_narration && !is_llm_error && text_nudges < MAX_TEXT_NUDGES {
+                    text_nudges += 1;
+                    observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                    agent.log_harness_event_with_round("nudge", &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES), total_llm_rounds);
+                    agent.push_continuation_nudge();
+                    continue;
                 }
 
                 // Detect malformed/partial tool call syntax in the (post-strip) text even if parse failed to extract tool_calls.
@@ -574,13 +574,11 @@ pub async fn drive_turn(
                     // implies a run/show and we still haven't done an exec, nudge once.
                     // Uses the same (clean) implies_run from last_user_request only.
                     let did_write = recent.iter().any(|a| a.tool == "write" || a.tool == "patch");
-                    if did_write && implies_run && !has_exec {
-                        if text_nudges < MAX_TEXT_NUDGES {
-                            text_nudges += 1;
-                            observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
-                            agent.push_continuation_nudge();
-                            continue;
-                        }
+                    if did_write && implies_run && !has_exec && text_nudges < MAX_TEXT_NUDGES {
+                        text_nudges += 1;
+                        observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
+                        agent.push_continuation_nudge();
+                        continue;
                     }
 
                     let decision = agent.judge_turn(&effective_text, &recent).await;
@@ -635,7 +633,7 @@ pub async fn drive_turn(
                         TurnJudge::Continue => {
                             let criteria_active = agent.session.as_ref()
                                 .and_then(|s| s.meta.completion_criteria.as_ref())
-                                .map_or(false, |c| !c.trim().is_empty());
+                                .is_some_and(|c| !c.trim().is_empty());
                             let use_judge_budget = criteria_active || judge_nudges < NUDGE_BUDGET;
                             if use_judge_budget {
                                 if criteria_active {

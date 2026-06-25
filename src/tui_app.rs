@@ -1825,11 +1825,7 @@ impl TurnObserver for TuiObserver {
     }
 
     fn on_tool_result(&mut self, record: &crate::agent::ActionRecord) {
-        let summary = if record.tool == "system" && record.summary.contains("JUDGE") {
-            record.summary.clone()  // already has ⭐ from driver
-        } else {
-            record.summary.clone()
-        };
+        let summary = record.summary.clone();  // judge summaries already include ⭐ from driver
         let _ = self.tx.try_send(UiUpdate::ToolResult {
             name: record.tool.clone(),
             summary,

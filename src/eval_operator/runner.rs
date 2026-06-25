@@ -792,7 +792,7 @@ impl Runner {
         Ok((status, label))
     }
 
-    fn write_scenario_prompt_file(&self, id: &str, log_path: &PathBuf) -> Result<PathBuf> {
+    fn write_scenario_prompt_file(&self, id: &str, log_path: &Path) -> Result<PathBuf> {
         let scenario_path = self.evals_dir().join("scenarios").join(format!("{}.json", id));
         let data = std::fs::read_to_string(&scenario_path)
             .with_context(|| format!("read scenario {}", scenario_path.display()))?;
@@ -970,7 +970,7 @@ fn harness_stats_line(log_dir: &Path) -> Option<String> {
     if let Ok(rd) = std::fs::read_dir(log_dir) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.extension().map_or(false, |x| x == "json") {
+            if p.extension().is_some_and(|x| x == "json") {
                 if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
                     if name.ends_with("_harness_turn.json") || name == "harness_turn.json" {
                         if let Ok(data) = std::fs::read_to_string(&p) {

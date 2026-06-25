@@ -22,7 +22,8 @@ pub enum ProbeMatch {
 }
 
 impl ProbeMatch {
-    pub fn as_str(self) -> &'static str {
+    #[allow(dead_code)]
+pub fn as_str(self) -> &'static str {
         match self {
             ProbeMatch::Exact => "exact",
             ProbeMatch::Alias => "alias",
@@ -130,6 +131,7 @@ pub fn resolve_server_probe(body: &Value, model_hint: &str) -> Option<ServerProb
     None
 }
 
+#[allow(dead_code)]
 fn fetch_models_body(
     base_url: &str,
     api_key: Option<&str>,
@@ -153,6 +155,7 @@ fn fetch_models_body(
 }
 
 /// Blocking probe for `raven-eval` and other sync callers.
+#[allow(dead_code)]
 pub fn probe_server_blocking(
     base_url: &str,
     model_hint: &str,
