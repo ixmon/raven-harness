@@ -217,6 +217,25 @@ Record the new `run_id` from the generated `summary.json` (and any scorecard) in
 
 If broader swebench smoke/live numbers are desired for the branch, capture those as well (e.g. via `swebench-smoke` or `swebench-live` profiles) and note the relevant scorecard or per-instance resolved/unresolved status + turn counts.
 
+### Recent Swebench-Live Observation (post V2 changes)
+
+**run_id: 20260625T031624Z** (swebench-live profile)
+
+- All 3 instances (marshmallow, sqlfluff, pvlib) reported **official unresolved** (exit 1 from grading).
+
+- Internal judge (`define_done` + criteria + `JUDGE (criteria active): Fulfilled`):
+  - pvlib__pvlib-python-1707: judge passed (Fulfilled)
+  - marshmallow-code__marshmallow-1343: judge passed (Fulfilled)
+  - sqlfluff__sqlfluff-1625: no Fulfilled observed in log (0)
+
+- Easy cases (when run in the same or similar profiles): all passed.
+
+This illustrates the current distinction:
+- The agent's internal "done" signal (via define_done + judge) can fire and accept completion.
+- The external SWE-bench official grading can still fail if the produced patch does not make the FAIL_TO_PASS tests pass in the benchmark harness.
+
+This run used the Nudge-v2 logic (budgeted nudges + proactive define_done reminders).
+
 ---
 
 ## Nudge V1 algorithm
