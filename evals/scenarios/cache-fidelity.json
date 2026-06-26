@@ -1,0 +1,11 @@
+{
+  "name": "cache-fidelity",
+  "type": "live",
+  "description": "Easy-bench cache test: verify no staleness after edit (patch invalidates summary, re-read_summary gets fresh data) and no over-summarization",
+  "prompt": "There is config.py with CONFIG dict, get_setting and process_value.\n\nInstructions:\n1. Use read_summary on config.py then immediately store_summary with your analysis of current settings.\n2. Write main.py that uses the functions to process values [10, 3, 7] and print results based on current config.\n3. Then, use patch tool to update the config.py: change threshold to 5 and mode to 'loose'. This must trigger invalidation.\n4. Re-use read_summary (should now see the change because of mtime/invalidate) + store new summary if needed.\n5. Re-run or update logic and produce final output that clearly shows the *new* values (threshold 5, loose mode) were used.\n\nCorrect final output must demonstrate the post-patch behavior. Using a stale cached summary would cause incorrect output.",
+  "disable_tools": false,
+  "disable_judge": true,
+  "expect": {
+    "stdout_contains": ["loose", "threshold"]
+  }
+}

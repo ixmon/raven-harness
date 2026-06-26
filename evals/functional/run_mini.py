@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-TUI_DIR = ROOT / "tui"
+TUI_DIR = ROOT
 FUNCTIONAL_DIR = ROOT / "evals" / "functional"
 
 def run_task(task_name: str, max_rounds: int = 10) -> bool:
@@ -44,6 +44,8 @@ def run_task(task_name: str, max_rounds: int = 10) -> bool:
         print(f"==> Running agent on {task_name} in {ws}")
         env = os.environ.copy()
         env["RAVEN_APPROVAL"] = "thunderdome"
+        metrics_out = ws / "harness_turn.json"
+        env["RAVEN_METRICS_OUT"] = str(metrics_out)
         # No venv here; assume python in PATH for any exec the agent does.
         # For real runs they'd set RAVEN_EVAL_PYTHON etc.
 
@@ -57,7 +59,6 @@ def run_task(task_name: str, max_rounds: int = 10) -> bool:
             "--max-rounds", str(max_rounds),
             "--max-tokens", "4096",
         ]
-
         print("  $", " ".join(cmd))
         proc = subprocess.run(cmd, cwd=TUI_DIR, env=env, capture_output=True, text=True, timeout=120)
         print("Agent stdout tail:")
@@ -68,11 +69,33 @@ def run_task(task_name: str, max_rounds: int = 10) -> bool:
 
         # Now verify: run the test in the workspace
         print("==> Verifying fix by running test")
-        verify_cmd = [sys.executable, "-m", "pytest", str(ws / "test_add_one.py"), "-q", "--tb=line"]
+        # Support both pytest (old) and direct python for cache tests
+        test_files = list(ws.glob("test_*.py"))
+        if test_files:
+            test_file = test_files[0]
+            if "add_one" in test_file.name:
+                verify_cmd = [sys.executable, "-m", "pytest", str(test_file), "-q", "--tb=line"]
+            else:
+                verify_cmd = [sys.executable, str(test_file)]
+        else:
+            verify_cmd = [sys.executable, "-m", "pytest", str(ws / "test_add_one.py"), "-q", "--tb=line"]
         vproc = subprocess.run(verify_cmd, cwd=ws, capture_output=True, text=True)
         print(vproc.stdout)
         print(vproc.stderr)
         success = vproc.returncode == 0
+
+        # For cache tests, also report token metrics from harness_turn
+        if (ws / "harness_turn.json").exists():
+            import json
+            with open(ws / "harness_turn.json") as f:
+                turn = json.load(f)
+            print("Cache metrics from turn:", {
+                'llm_rounds': turn.get('llm_rounds'),
+                'estimated_tool_tokens': turn.get('estimated_tool_tokens'),
+                'cache_summary_hits': turn.get('cache_summary_hits'),
+                'estimated_summary_tokens': turn.get('estimated_summary_tokens'),
+            })
+
         print("Verify:", "PASSED" if success else "FAILED")
         return success
 

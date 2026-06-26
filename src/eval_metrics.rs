@@ -102,6 +102,9 @@ pub fn write_turn_metrics(
         "prompt_tokens": result.metrics.prompt_tokens,
         "completion_tokens": result.metrics.completion_tokens,
         "total_tokens": result.metrics.total_tokens,
+        "estimated_tool_tokens": result.metrics.estimated_tool_tokens,
+        "cache_summary_hits": result.metrics.cache_summary_hits,
+        "estimated_summary_tokens": result.metrics.estimated_summary_tokens,
         "tool_counts": tool_counts,
         "tools_used": result.actions.iter().map(|a| &a.tool).collect::<Vec<_>>(),
     });

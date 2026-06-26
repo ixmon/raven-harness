@@ -183,6 +183,9 @@ pub async fn drive_turn(
     let mut last_assistant_text = String::new();
     let mut prompt_tokens: u64 = 0;
     let mut completion_tokens: u64 = 0;
+    let mut estimated_tool_tokens: u64 = 0;
+    let mut cache_summary_hits: u32 = 0;
+    let mut estimated_summary_tokens: u64 = 0;
     let mut total_llm_rounds: u32 = 0;
     let mut text_nudges: u32 = 0;
     let mut judge_nudges: u32 = 0;
@@ -341,6 +344,7 @@ pub async fn drive_turn(
                             output_to_model: "".into(),
                             raw_bytes: 0,
                             truncated: false,
+                            estimated_tokens: 0,
                         });
                         agent.log_harness_event_with_round("judge", &summary, total_llm_rounds);
                         match decision {
@@ -448,6 +452,7 @@ pub async fn drive_turn(
                                     output_to_model: "".into(),
                                     raw_bytes: 0,
                                     truncated: false,
+                                    estimated_tokens: 0,
                                 });
                                 agent.log_harness_event("judge", &summary);
                                 match decision {
@@ -563,6 +568,7 @@ pub async fn drive_turn(
                             output_to_model: "".into(),
                             raw_bytes: 0,
                             truncated: false,
+                            estimated_tokens: 0,
                         });
                         agent.log_harness_event("judge", &summary);
                         // Do not push the debug into the conversation history for the model.
@@ -598,6 +604,7 @@ pub async fn drive_turn(
                         output_to_model: "".into(),
                         raw_bytes: 0,
                         truncated: false,
+                        estimated_tokens: 0,
                     });
                     agent.log_harness_event_with_round("judge", &summary, total_llm_rounds);
                     // Note: we no longer push judge decisions as user messages (they
@@ -702,6 +709,11 @@ pub async fn drive_turn(
             let records = agent.execute_and_record_tool_calls(&to_execute).await;
             for r in &records {
                 observer.on_tool_result(r);
+                estimated_tool_tokens += r.estimated_tokens as u64;
+                if r.tool == "read_summary" && r.output_to_model.contains("(fresh summary)") {
+                    cache_summary_hits += 1;
+                    estimated_summary_tokens += r.estimated_tokens as u64;
+                }
             }
             all_actions.extend(records);
 
@@ -756,6 +768,9 @@ pub async fn drive_turn(
             prompt_tokens,
             completion_tokens,
             total_tokens: prompt_tokens + completion_tokens,
+            estimated_tool_tokens,
+            cache_summary_hits,
+            estimated_summary_tokens,
             round_limit_hit: total_llm_rounds >= max_rounds,
         },
     };

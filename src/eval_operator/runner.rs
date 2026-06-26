@@ -89,11 +89,41 @@ impl Runner {
                 turns: None,
                 tool_calls: None,
                 agent_duration_ms: None,
+                estimated_tool_tokens: None,
+                cache_summary_hits: None,
+                estimated_summary_tokens: None,
             };
             if let Some((t, c, d)) = self.load_agent_metrics(id, &log_dir) {
                 res.turns = Some(t);
                 res.tool_calls = Some(c);
                 res.agent_duration_ms = Some(d);
+            }
+            // Pull cache-related metrics from harness_turn (for cache tests)
+            for cand in [
+                log_dir.join(format!("{}_harness_turn.json", id)),
+                log_dir.join(format!("{}.harness_turn.json", id)),
+                log_dir.join("harness_turn.json"),
+            ] {
+                if let Some(v) = load_json(&cand) {
+                    if let Some(tok) = v.get("estimated_tool_tokens").and_then(|x| x.as_u64()) {
+                        if tok > 0 {
+                            res.estimated_tool_tokens = Some(tok);
+                        }
+                    }
+                    if let Some(hits) = v.get("cache_summary_hits").and_then(|x| x.as_u64()) {
+                        if hits > 0 {
+                            res.cache_summary_hits = Some(hits as u32);
+                        }
+                    }
+                    if let Some(stok) = v.get("estimated_summary_tokens").and_then(|x| x.as_u64()) {
+                        if stok > 0 {
+                            res.estimated_summary_tokens = Some(stok);
+                        }
+                    }
+                    if res.estimated_tool_tokens.is_some() || res.cache_summary_hits.is_some() {
+                        break;
+                    }
+                }
             }
             results.push(res);
         }
@@ -406,6 +436,10 @@ impl Runner {
             self.run_easy_hello_world(&log_path)?
         } else if id == "easy-fizzbuzz" {
             self.run_easy_fizzbuzz(&log_path)?
+        } else if id == "cache-lift" {
+            self.run_cache_lift(&log_path)?
+        } else if id == "cache-fidelity" {
+            self.run_cache_fidelity(&log_path)?
         } else if let Some(entry) = super::registry::find_entry(&reg, id) {
             match entry.tier {
                 TestTier::Replay => {
@@ -810,6 +844,161 @@ impl Runner {
             "easy-fizzbuzz: verification failed (script missing or wrong output)".to_string()
         };
         Ok((status, label))
+    }
+
+    fn run_cache_lift(&self, log_path: &Path) -> Result<(std::process::ExitStatus, String)> {
+        let workspace = std::env::temp_dir().join(format!(
+            "raven-eval-cache-lift-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        ));
+        let _ = std::fs::create_dir_all(&workspace);
+
+        // Copy the analyzer source so agent can read_summary it
+        let src_analyzer = self.evals_dir().join("functional").join("cache-lift").join("analyzer.py");
+        std::fs::copy(&src_analyzer, workspace.join("analyzer.py"))
+            .with_context(|| format!("failed to copy analyzer.py from {}", src_analyzer.display()))?;
+
+        let prompt_file = self.write_scenario_prompt_file("cache-lift", log_path)?;
+
+        let metrics_out = log_path.with_file_name("cache-lift_harness_turn.json");
+        let mut tui_args = vec![
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--base-url",
+            &self.llm_base_url,
+            "--temperature",
+            "0",
+            "--fresh-session",
+            "--max-rounds",
+            "12",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+        ];
+        if self.should_enable_judge_for_scenario("cache-lift") {
+            tui_args.push("--enable-judge");
+        }
+        let output = Command::new("cargo")
+            .args(tui_args)
+            .current_dir(&self.manifest_dir)
+            .env("RAVEN_APPROVAL", "thunderdome")
+            .env("RAVEN_METRICS_OUT", metrics_out.to_string_lossy().as_ref())
+            .output()
+            .context("cache-lift live scenario")?;
+
+        // Verify
+        let test_script = workspace.join("test_cache_lift.py");
+        // Copy test script too? The verify is in functional, but for live we run in ws
+        // For simplicity, run python on the copied? Wait, test script not copied yet.
+        // Actually, since test is verification, copy it and run.
+        let src_test = self.evals_dir().join("functional").join("cache-lift").join("test_cache_lift.py");
+        std::fs::copy(&src_test, &test_script)
+            .with_context(|| format!("failed to copy test script from {}", src_test.display()))?;
+
+        let mut verified = false;
+        if test_script.exists() {
+            let vproc = Command::new("python3")
+                .arg(&test_script)
+                .current_dir(&workspace)
+                .output();
+            if let Ok(v) = vproc {
+                verified = v.status.success();
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        let label = if verified {
+            "cache-lift: verified with cache usage (summary hits + token reduction)".to_string()
+        } else {
+            "cache-lift: verification failed".to_string()
+        };
+        Ok((output.status, label))
+    }
+
+    fn run_cache_fidelity(&self, log_path: &Path) -> Result<(std::process::ExitStatus, String)> {
+        let workspace = std::env::temp_dir().join(format!(
+            "raven-eval-cache-fidelity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        ));
+        let _ = std::fs::create_dir_all(&workspace);
+
+        // Copy the config source
+        let src_config = self.evals_dir().join("functional").join("cache-fidelity").join("config.py");
+        std::fs::copy(&src_config, workspace.join("config.py"))
+            .with_context(|| format!("failed to copy config.py from {}", src_config.display()))?;
+
+        let prompt_file = self.write_scenario_prompt_file("cache-fidelity", log_path)?;
+
+        let metrics_out = log_path.with_file_name("cache-fidelity_harness_turn.json");
+        let mut tui_args = vec![
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--workspace",
+            workspace.to_str().unwrap(),
+            "--base-url",
+            &self.llm_base_url,
+            "--temperature",
+            "0",
+            "--fresh-session",
+            "--max-rounds",
+            "12",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+        ];
+        if self.should_enable_judge_for_scenario("cache-fidelity") {
+            tui_args.push("--enable-judge");
+        }
+        let output = Command::new("cargo")
+            .args(tui_args)
+            .current_dir(&self.manifest_dir)
+            .env("RAVEN_APPROVAL", "thunderdome")
+            .env("RAVEN_METRICS_OUT", metrics_out.to_string_lossy().as_ref())
+            .output()
+            .context("cache-fidelity live scenario")?;
+
+        // Verify
+        let test_script = workspace.join("test_cache_fidelity.py");
+        let src_test = self.evals_dir().join("functional").join("cache-fidelity").join("test_cache_fidelity.py");
+        std::fs::copy(&src_test, &test_script)
+            .with_context(|| format!("failed to copy test script from {}", src_test.display()))?;
+
+        let mut verified = false;
+        if test_script.exists() {
+            let vproc = Command::new("python3")
+                .arg(&test_script)
+                .current_dir(&workspace)
+                .output();
+            if let Ok(v) = vproc {
+                verified = v.status.success();
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        let label = if verified {
+            "cache-fidelity: verified (post-edit re-summary reflects changes, no stale data)".to_string()
+        } else {
+            "cache-fidelity: verification failed (possible stale summary)".to_string()
+        };
+        Ok((output.status, label))
     }
 
     fn write_scenario_prompt_file(&self, id: &str, log_path: &Path) -> Result<PathBuf> {
