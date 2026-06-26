@@ -846,7 +846,7 @@ impl Runner {
         Ok((status, label))
     }
 
-    fn run_cache_lift(&self, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+    fn run_cache_lift(&self, log_path: &Path) -> Result<(std::process::ExitStatus, String)> {
         let workspace = std::env::temp_dir().join(format!(
             "raven-eval-cache-lift-{}-{}",
             std::process::id(),
@@ -925,7 +925,7 @@ impl Runner {
         Ok((output.status, label))
     }
 
-    fn run_cache_fidelity(&self, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+    fn run_cache_fidelity(&self, log_path: &Path) -> Result<(std::process::ExitStatus, String)> {
         let workspace = std::env::temp_dir().join(format!(
             "raven-eval-cache-fidelity-{}-{}",
             std::process::id(),
