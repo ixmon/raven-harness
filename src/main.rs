@@ -116,6 +116,18 @@ struct Args {
     /// Set automatically from scenario tests; can be disabled per-scenario with "disable_judge": true (or 1).
     #[arg(long)]
     enable_judge: bool,
+
+    /// Hard wall-clock timeout for a single turn, in seconds.
+    /// When elapsed, the agent stops regardless of judge/nudge state.
+    /// No default for interactive mode (unlimited). Evals default to 600 (10 min).
+    /// Also settable per-scenario via "max_duration" in the scenario JSON.
+    #[arg(long, value_name = "SECS")]
+    max_duration: Option<u64>,
+
+    /// Print the full system prompt + injection block that the model would receive,
+    /// then exit. Useful for debugging prompt construction without running inference.
+    #[arg(long)]
+    dump_prompt: bool,
 }
 
 #[tokio::main]
@@ -127,6 +139,12 @@ async fn main() -> Result<()> {
     // Merge CLI overrides
     if args.enable_judge {
         flags.enable_judge = true;
+    }
+    if let Some(secs) = args.max_duration {
+        flags.max_duration_secs = Some(secs);
+    } else if flags.is_eval && flags.max_duration_secs.is_none() {
+        // Default safety timeout for evals: 10 minutes
+        flags.max_duration_secs = Some(600);
     }
     let harness = runtime::EvalHarness::from_env();
 
@@ -329,6 +347,10 @@ async fn main() -> Result<()> {
         .as_ref()
         .and_then(|s| s.max_rounds)
         .unwrap_or(args.max_rounds);
+    // Scenario can override the wall-clock timeout
+    if let Some(dur) = smoke_scenario.as_ref().and_then(|s| s.max_duration_secs) {
+        flags.max_duration_secs = Some(dur);
+    }
     let scenario_n_ctx = smoke_scenario.as_ref().and_then(|s| s.context_tokens);
 
     // === Context budget: probe the active endpoint (after launch override) ===
@@ -444,6 +466,27 @@ async fn main() -> Result<()> {
         // summaries, judge, etc.
         app.reset();
 
+        // --dump-prompt: print what the model would see and exit
+        if args.dump_prompt {
+            app.record_user_request(&effective_prompt);
+            let msgs = app.dump_prompt();
+            for (i, m) in msgs.iter().enumerate() {
+                let content = m.content.as_deref().unwrap_or("");
+                let tc = if let Some(tcs) = &m.tool_calls {
+                    format!(" [tool_calls: {}]", tcs.iter()
+                        .map(|t| t.function.name.as_str())
+                        .collect::<Vec<_>>().join(", "))
+                } else { String::new() };
+                println!("═══ Message {} ═══ role={}{}", i, m.role, tc);
+                println!("{}", content);
+                println!();
+            }
+            eprintln!("dump-prompt: {} messages, {} total bytes",
+                msgs.len(),
+                msgs.iter().map(|m| m.content.as_ref().map_or(0, |c| c.len())).sum::<usize>());
+            return Ok(());
+        }
+
         let turn_started = std::time::Instant::now();
 
         // Use drive_turn with HeadlessObserver — same loop as TUI
@@ -492,6 +535,22 @@ async fn main() -> Result<()> {
         flags: flags.clone(),
         harness,
     };
+
+    // --dump-prompt without --prompt: show the system prompt + injection block
+    if args.dump_prompt {
+        let chat_backend = chat_backend::ChatBackend::http(c.clone());
+        let app = agent::Agent::new(c, chat_backend);
+        let msgs = app.dump_prompt();
+        for (i, m) in msgs.iter().enumerate() {
+            let content = m.content.as_deref().unwrap_or("");
+            println!("═══ Message {} ═══ role={}", i, m.role);
+            println!("{}", content);
+            println!();
+        }
+        eprintln!("dump-prompt: {} messages (no user prompt — use --prompt to include one)",
+            msgs.len());
+        return Ok(());
+    }
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.
     // Trust prompt + any eprintln above already happened on the normal terminal.

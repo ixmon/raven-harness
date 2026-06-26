@@ -7,6 +7,8 @@
 //! - Headless provides one that auto-approves and logs to stdout
 //! - Tests provide a silent one
 
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -191,6 +193,10 @@ pub async fn drive_turn(
     let mut judge_nudges: u32 = 0;
     let mut tools_used_this_turn: usize = 0;
 
+    // Wall-clock deadline (belt-and-suspenders safety beyond judge/nudge limits)
+    let deadline = agent.current_config().flags.max_duration_secs
+        .map(|secs| Instant::now() + Duration::from_secs(secs));
+
     // Outer auto-continue loop (mirrors TUI 'auto_continue label)
     'auto_continue: for continuation in 0..=MAX_AUTO_CONTINUES {
         let mut completed_naturally = false;
@@ -199,6 +205,17 @@ pub async fn drive_turn(
         for _round in 0..max_rounds {
             if observer.should_stop() {
                 break 'auto_continue;
+            }
+            // Hard wall-clock timeout — stops the agent regardless of judge/nudge state
+            if let Some(dl) = deadline {
+                if Instant::now() >= dl {
+                    let secs = agent.current_config().flags.max_duration_secs.unwrap_or(0);
+                    let msg = format!("[system: wall-clock timeout after {}s — stopping]", secs);
+                    eprintln!("raven: {}", msg);
+                    agent.log_harness_event("timeout", &msg);
+                    last_assistant_text = format!("(timed out after {}s)", secs);
+                    break 'auto_continue;
+                }
             }
 
             // ── Send request (streaming) with limited transparent retry on

@@ -314,3 +314,7 @@ If the agent has not used define_done() to come up with a possible measurement f
 
 When the judge checks on the agent, if they have called define_done() it checks on their progress. if it appears to have met the define_done() criteria, it clears the define_done() and does not nudge the agent. The round is over. If the agent has not met the define_done() criteria it encourages the agent to continue reinforcing the definition of done and making helpful suggestions.
 If the NUDGE_BUDGET has been consumed but the judge thinks the agent is making progress it will increment it by 1 and nudge the agent to continue. If the judge thinks it is pointless it will log that and not nudge the agent again until the next external stimulus.
+
+## Nudge V3 algorithm
+
+This should work the same as V2, except the judge should never repeat itself, or at least never repeat a suggestion. I think it needs some language to say "show me" that the definition_done() has happened, noticing the agent in the fizz test, did it, says it's done but doesn't show... the judge should ask it to "show" the output of running it to the judge

@@ -881,6 +881,12 @@ History:
         self.session.is_some()
     }
 
+    /// Return the full messages array the model would receive on the next call.
+    /// Used by `--dump-prompt` for debugging prompt construction without running inference.
+    pub fn dump_prompt(&self) -> Vec<Message> {
+        self.build_messages_for_model()
+    }
+
     /// Uses a lightweight inference call to analyze the current state.
     /// It decides:
     /// - whether the request/goal has been fulfilled, or

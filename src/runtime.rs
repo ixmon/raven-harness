@@ -70,6 +70,14 @@ pub struct RuntimeFlags {
     /// profiles can set it too.
     pub enable_judge: bool,
 
+    // ── Safety limits ──────────────────────────────────────────────────
+
+    /// Hard wall-clock timeout for a single turn (seconds).
+    /// When elapsed, drive_turn() stops the agent regardless of judge/nudge state.
+    /// Set via --max-duration CLI, "max_duration" in scenario JSON, or default.
+    /// None = no timeout (interactive default). Evals default to 600 (10 min).
+    pub max_duration_secs: Option<u64>,
+
     // ── Presentation / terminal ────────────────────────────────────────
 
     /// Override terminal color depth (e.g. "256", "truecolor").
@@ -93,6 +101,7 @@ impl Default for RuntimeFlags {
             enable_judge: false,
             color_depth: None,
             vault_password: None,
+            max_duration_secs: None,
         }
     }
 }
@@ -122,6 +131,10 @@ impl RuntimeFlags {
         let color_depth = std::env::var("RAVEN_COLOR_DEPTH").ok();
         let vault_password = std::env::var("RAVEN_VAULT_PASSWORD").ok();
 
+        // max_duration: no env var — set by CLI or scenario JSON only.
+        // Default for evals (is_eval) is applied in main.rs after merge.
+        let max_duration_secs = None;
+
         Self {
             is_eval,
             goal_tracking,
@@ -130,6 +143,7 @@ impl RuntimeFlags {
             enable_judge,
             color_depth,
             vault_password,
+            max_duration_secs,
         }
     }
 }
