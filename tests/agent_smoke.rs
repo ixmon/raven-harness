@@ -8,7 +8,6 @@ use raven_tui::chat_backend::ChatBackend;
 use raven_tui::config::{Config, ContextBudget};
 use raven_tui::eval_smoke::{load_smoke_scenario, mock_backend_for, mock_chat_backend_for, assert_smoke_result};
 use raven_tui::tools::ToolBackend;
-use std::path::PathBuf;
 
 /// Build a minimal Config suitable for mock eval scenarios.
 /// Uses a unique temp directory to prevent session state from accumulating
