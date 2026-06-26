@@ -381,18 +381,20 @@ pub async fn drive_turn(
                                 completed_naturally = true;
                                 break;
                             }
-                            TurnJudge::Continue => {
+                            TurnJudge::Continue { suggestion } => {
                                 if agent.enable_judge() {
                                     // Trust the judge: if it returns Continue (making progress) we keep going
                                     // forever (unbounded). Churn risk accepted; future duration caps can monitor.
                                     // No hard NUDGE_BUDGET cap in the enabled case.
                                     judge_nudges += 1;
                                     observer.on_nudge(judge_nudges, 999);
-                                    // V2: offer suggestion for achieving the criteria
-                                    let nudge_text = format!(
-                                        "[You defined done as: {}. Suggestion: focus on minimal source changes that directly address the root cause in the original bug report. Now use tools to satisfy the criteria (read files and patch).]",
-                                        c
-                                    );
+                                    // Use suggestion produced by the judge inference when available.
+                                    // This makes the nudge criteria-specific: e.g. "run the script and show the output"
+                                    // instead of a generic patch instruction.
+                                    let base_sugg = suggestion.unwrap_or_else(|| {
+                                        "focus on minimal source changes that directly address the root cause. Now use tools to satisfy the criteria (read files and patch)".to_string()
+                                    });
+                                    let nudge_text = format!("[You defined done as: {}. Suggestion: {}]", c, base_sugg);
                                     agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/inf: {}", judge_nudges, nudge_text), total_llm_rounds);
                                     agent.push_message("user", &nudge_text);
                                     continue;
@@ -401,18 +403,14 @@ pub async fn drive_turn(
                                     if judge_nudges < nudge_limit {
                                         judge_nudges += 1;
                                         observer.on_nudge(judge_nudges, nudge_limit);
-                                        // V2: offer suggestion for achieving the criteria
-                                        let nudge_text = format!(
-                                            "[You defined done as: {}. Suggestion: focus on minimal source changes that directly address the root cause in the original bug report. Now use tools to satisfy the criteria (read files and patch).]",
-                                            c
-                                        );
+                                        let base_sugg = suggestion.unwrap_or_else(|| {
+                                            "focus on minimal source changes that directly address the root cause. Now use tools to satisfy the criteria (read files and patch)".to_string()
+                                        });
+                                        let nudge_text = format!("[You defined done as: {}. Suggestion: {}]", c, base_sugg);
                                         agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/{}: {}", judge_nudges, nudge_limit, nudge_text), total_llm_rounds);
                                         agent.push_message("user", &nudge_text);
                                         continue;
                                     }
-                                    // budget exhausted and judge still Continue -> progress? allow one, else stop nudging
-                                    // for now, if here and Continue, we already incremented above in if, but to stop if pointless
-                                    // (judge said Continue so assume not pointless; V2 would have judge decide pointless)
                                 }
                             }
                         }
@@ -496,7 +494,7 @@ pub async fn drive_turn(
                                         completed_naturally = true;
                                         break;
                                     }
-                                    TurnJudge::Continue => {
+                                    TurnJudge::Continue { .. } => {
                                         let criteria_reminder = if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
                                             format!(" You defined done as: {}. Now read the key files and patch to satisfy it.", c)
                                         } else { "".to_string() };
@@ -662,7 +660,7 @@ pub async fn drive_turn(
                             completed_naturally = true;
                             break;
                         }
-                        TurnJudge::Continue => {
+                        TurnJudge::Continue { suggestion } => {
                             let criteria_active = agent.session.as_ref()
                                 .and_then(|s| s.meta.completion_criteria.as_ref())
                                 .is_some_and(|c| !c.trim().is_empty());
@@ -671,7 +669,13 @@ pub async fn drive_turn(
                                 judge_nudges += 1;
                                 observer.on_nudge(judge_nudges, 999);
                                 agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/inf (criteria)", judge_nudges), total_llm_rounds);
-                                agent.push_continuation_nudge();
+                                // Prefer the inference-provided suggestion when we have one.
+                                if let Some(s) = suggestion {
+                                    let nudge_text = format!("[You defined done as the criteria. {}]", s);
+                                    agent.push_message("user", &nudge_text);
+                                } else {
+                                    agent.push_continuation_nudge();
+                                }
                                 continue;
                             }
                             let use_judge_budget = criteria_active || judge_nudges < NUDGE_BUDGET;
@@ -684,7 +688,12 @@ pub async fn drive_turn(
                                 let display_max = if criteria_active { NUDGE_BUDGET } else { MAX_TEXT_NUDGES };
                                 observer.on_nudge(if criteria_active { judge_nudges } else { text_nudges }, display_max);
                                 agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/{}", if criteria_active { judge_nudges } else { text_nudges }, display_max), total_llm_rounds);
-                                agent.push_continuation_nudge();
+                                if let Some(s) = suggestion {
+                                    let nudge_text = format!("[You defined done as the criteria. {}]", s);
+                                    agent.push_message("user", &nudge_text);
+                                } else {
+                                    agent.push_continuation_nudge();
+                                }
                                 continue;
                             }
                             completed_naturally = true;

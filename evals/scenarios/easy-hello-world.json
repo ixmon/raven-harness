@@ -1,8 +1,8 @@
 {
   "name": "easy-hello-world",
   "type": "live",
-  "description": "Easy-bench live test: write a Python script that outputs exactly 'hello world'",
-  "prompt": "In the current workspace, create a file named hello.py that contains a Python script which, when executed, prints exactly 'hello world' followed by a newline. You MUST use the `list` tool to explore, the `write` tool to create hello.py (do not just claim it), and the `exec` tool (e.g. `python3 hello.py`) to verify the output yourself. Do not use record_discovery or text claims to declare completion — actually perform and observe the write + run via tools. Once you have verified the exact output via exec, you are done.",
+  "description": "Easy bench: write a python script that outputs exactly 'hello world'",
+  "prompt": "Before doing this work, determine the criteria that should be used to determine if it is complete and set this with the define_done() tool. After that, in the current workspace, create a file named hello.py that prints 'hello world' when you run it with python3",
   "disable_tools": false,
   "expect": {
     "stdout_contains": ["hello world"]
