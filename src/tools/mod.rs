@@ -37,14 +37,9 @@ pub(crate) fn safe_truncate(s: &str, max_bytes: usize) -> &str {
 use crate::llm::ToolDef;
 
 /// Returns the complete list of tools the agent can use, in OpenAI function format.
-/// For experiments (e.g. testing harness without goal machinery) you can disable
-/// update_goal via env RAVEN_EVAL_DISABLE_UPDATE_GOAL=1 (or RAVEN_NO_GOAL=1).
-/// Goal tracking is off by default; enable with RAVEN_GOAL_TRACKING=1 (which enables the tool).
-pub fn all_tools() -> Vec<ToolDef> {
-    let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
-    let disable_update_goal = std::env::var("RAVEN_EVAL_DISABLE_UPDATE_GOAL").is_ok()
-        || std::env::var("RAVEN_NO_GOAL").is_ok()
-        || !goal_tracking;
+/// Goal tracking / update_goal availability is controlled via `RuntimeFlags`.
+pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
+    let disable_update_goal = flags.disable_goal_tool || !flags.goal_tracking;
 
     let mut tools = vec![
         ToolDef {

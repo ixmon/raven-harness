@@ -314,3 +314,22 @@ If the agent has not used define_done() to come up with a possible measurement f
 
 When the judge checks on the agent, if they have called define_done() it checks on their progress. if it appears to have met the define_done() criteria, it clears the define_done() and does not nudge the agent. The round is over. If the agent has not met the define_done() criteria it encourages the agent to continue reinforcing the definition of done and making helpful suggestions.
 If the NUDGE_BUDGET has been consumed but the judge thinks the agent is making progress it will increment it by 1 and nudge the agent to continue. If the judge thinks it is pointless it will log that and not nudge the agent again until the next external stimulus.
+
+## Nudge V3 algorithm
+
+This should work the same as V2, except the judge should never repeat itself, or at least never repeat a suggestion. I think it needs some language to say "show me" that the definition_done() has happened, noticing the agent in the fizz test, did it, says it's done but doesn't show... the judge should ask it to "show" the output of running it to the judge
+
+## Nudge V4 (super-judge with active tool use)
+
+Idea: instead of the (passive) judge relying only on the (potentially truncated or summarized) action history produced by the main agent, the judge itself can be given tool-calling ability.
+
+When the main agent claims it is done (via final text + no further tool calls) or the regular passive judge disagrees with the agent's completion claim, a "super judge" mode can activate. This version of the judge is given access to tools (exec, read, grep, list, etc.) and can actively run verification steps itself — e.g. re-executing the script to see the full stdout, inspecting files, or otherwise confirming the criteria directly rather than trusting the agent's reported output or the first-line summaries that currently appear in ActionRecord evidence.
+
+The super judge produces its own FULFILLED / CONTINUE / STUCK decision based on what it actually observed.
+
+Qualification / scoping: This is not the everyday path for every criteria check. It is intended as an escalation / "super judge" step used selectively to settle disputes:
+- when the model claims complete,
+- but the regular (evidence-only, passive) judge does not agree, or
+- when the history provided to the regular judge is known to be insufficient (e.g. long exec output where only the first line is visible in the summaries the judge sees).
+
+This keeps the common case cheap and purely observational while giving us a stronger, active verification mechanism for the hard / ambiguous cases. The super judge could have its own (small) turn budget and would log distinctly so it does not pollute main-agent metrics.

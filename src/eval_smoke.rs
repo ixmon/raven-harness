@@ -68,6 +68,9 @@ pub struct SmokeScenario {
     #[serde(default)]
     #[allow(dead_code)]
     pub disable_judge: bool,
+    /// Hard wall-clock timeout for this scenario (seconds). Overrides --max-duration CLI.
+    #[serde(default, alias = "max_duration")]
+    pub max_duration_secs: Option<u64>,
     #[serde(default)]
     pub expect: SmokeExpect,
 }

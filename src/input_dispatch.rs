@@ -400,6 +400,8 @@ mod tests {
             tool_backend: crate::tools::ToolBackend::default(),
             tools_enabled: true,
             enable_judge: false,
+            flags: crate::runtime::RuntimeFlags::default(),
+            harness: crate::runtime::EvalHarness::default(),
         };
         let agent = Arc::new(Mutex::new(Agent::new(
             config.clone(),

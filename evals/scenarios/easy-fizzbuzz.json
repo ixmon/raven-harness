@@ -2,6 +2,6 @@
   "name": "easy-fizzbuzz",
   "type": "live",
   "description": "Easy-bench live: write a Python script fizzbuzz.py that prints FizzBuzz for 1 to 20",
-  "prompt": "In the workspace, create a Python script named fizzbuzz.py. When executed with 'python fizzbuzz.py', it must print the FizzBuzz sequence for numbers 1 through 20, each on its own line. Rules: for multiples of 3 print 'Fizz', for multiples of 5 print 'Buzz', for multiples of both print 'FizzBuzz', otherwise print the number. Use tools to write the file and verify it has the correct output by running it and showing the result. ",
+  "prompt": "Before doing this work, determine the criteria that should be used to determine if it is complete and set this with the define_done() tool. In the workspace, create a Python script named fizzbuzz.py. When executed with 'python3 fizzbuzz.py', it must print the FizzBuzz sequence for numbers 1 through 20, each on its own line. Rules: for multiples of 3 print 'Fizz', for multiples of 5 print 'Buzz', for multiples of both print 'FizzBuzz', otherwise print the number. Use tools to write the file and verify it has the correct output by running it and showing the result. ",
   "disable_tools": false
 }

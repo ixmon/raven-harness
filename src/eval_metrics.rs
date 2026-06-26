@@ -15,18 +15,14 @@ struct MetricsFile {
     smoke: Option<Value>,
 }
 
-pub fn strict_assertions_enabled() -> bool {
-    std::env::var("RAVEN_EVAL_ASSERT_STRICT")
-        .ok()
-        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-}
+
 
 fn baselines_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/baselines/metrics.json")
 }
 
-pub fn assert_smoke_metrics(scenario: &SmokeScenario, result: &TurnResult) -> Result<()> {
-    if !strict_assertions_enabled() {
+pub fn assert_smoke_metrics(scenario: &SmokeScenario, result: &TurnResult, harness: &crate::runtime::EvalHarness) -> Result<()> {
+    if !harness.assert_strict {
         return Ok(());
     }
 
