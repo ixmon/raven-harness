@@ -4,6 +4,8 @@
   "easy_tests": [
     "easy-hello-world",
     "easy-fizzbuzz",
+    "cache-lift",
+    "cache-fidelity",
     "marshmallow-code__marshmallow-1343"
   ]
 }

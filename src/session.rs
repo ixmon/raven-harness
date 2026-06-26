@@ -444,12 +444,10 @@ impl Session {
     // The model is instructed to call read_summary first, then store_summary after
     // it has analyzed a stale/missing file.
 
-    #[allow(dead_code)]
     fn context_db_path(&self) -> PathBuf {
         self.dir.join("context.db")
     }
 
-    #[allow(dead_code)]
     fn open_context_db(&self) -> Result<Connection> {
         let db_path = self.context_db_path();
         let conn = Connection::open(&db_path)?;
@@ -470,7 +468,6 @@ impl Session {
 
     /// Returns Some((stored_mtime, summary)) only if the stored mtime exactly matches
     /// the *current* on-disk mtime of the file. This ensures the summary is still valid.
-    #[allow(dead_code)]
     pub fn get_file_summary(&self, rel_path: &str) -> Result<Option<(i64, String)>> {
         let abs_path = self.workspace.join(rel_path);
         let current_mtime = current_file_mtime(&abs_path)?;
@@ -497,7 +494,6 @@ impl Session {
 
     /// Store (or replace) a summary for a file at a specific mtime.
     /// The caller (the agent) is responsible for having observed that mtime.
-    #[allow(dead_code)]
     pub fn store_file_summary(&self, rel_path: &str, mtime: i64, summary: &str) -> Result<()> {
         let conn = self.open_context_db()?;
         let now = now_iso();
@@ -518,7 +514,6 @@ impl Session {
     }
 
     /// Invalidate any cached summary for a path (call this after write/patch).
-    #[allow(dead_code)]
     pub fn invalidate_file_summary(&self, rel_path: &str) -> Result<()> {
         let conn = self.open_context_db()?;
         conn.execute("DELETE FROM file_summaries WHERE path = ?1", params![rel_path])?;
@@ -526,7 +521,6 @@ impl Session {
     }
 }
 
-#[allow(dead_code)]
 pub fn current_file_mtime(path: &Path) -> Result<i64> {
     if !path.exists() {
         return Ok(0);
@@ -541,7 +535,6 @@ pub fn current_file_mtime(path: &Path) -> Result<i64> {
 }
 
 // Small wrapper usable from agent without importing private details
-#[allow(dead_code)]
 pub fn current_file_mtime_for_agent(path: &Path) -> i64 {
     current_file_mtime(path).unwrap_or(0)
 }

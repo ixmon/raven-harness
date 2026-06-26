@@ -237,6 +237,8 @@ pub fn profile_ids(profile: &str) -> Result<Vec<String>> {
         "easy-bench-live" => load_easy_bench_ids().unwrap_or_else(|_| vec!["easy-hello-world".into(), "easy-fizzbuzz".into()]),
         "easy-hello-world" => vec!["easy-hello-world".into()],
         "easy-fizzbuzz" => vec!["easy-fizzbuzz".into()],
+        "cache-lift" => vec!["cache-lift".into()],
+        "cache-fidelity" => vec!["cache-fidelity".into()],
         other => anyhow::bail!(
             "unknown profile {other:?} (use quick, local, full, swebench-smoke, swebench-live, or easy-bench-live)"
         ),

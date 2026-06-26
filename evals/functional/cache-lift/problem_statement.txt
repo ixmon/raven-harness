@@ -1,0 +1,9 @@
+In the current workspace there is analyzer.py with parse, filter, compute and report functions.
+
+Task:
+1. Use read_summary on analyzer.py (and store_summary) to analyze the code without dumping the full source repeatedly.
+2. Write a script main.py that imports the functions and runs them on sample data to produce a report.
+3. Later, you will need to revisit the code to add a new 'normalize' function and update the report. Use read_summary again to re-familiarize yourself efficiently.
+4. Implement the full flow, run it, and verify the output.
+
+Use the summary cache tools for the source file to keep context efficient across steps. Do not use full 'read' on analyzer.py after the first analysis unless necessary.

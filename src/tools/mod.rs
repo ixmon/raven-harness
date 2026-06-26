@@ -222,7 +222,7 @@ pub fn all_tools() -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read_summary".into(),
-                description: "Temporarily acts like normal 'read' (summary cache bypassed for SWE-bench testing).".into(),
+                description: "Read a cached summary for a file if its on-disk mtime has not changed since the summary was stored. On cache miss or stale mtime, returns the current mtime plus (capped) file content so you can produce and store a fresh summary.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -236,15 +236,15 @@ pub fn all_tools() -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "store_summary".into(),
-                description: "No-op (summary cache bypassed for SWE-bench testing).".into(),
+                description: "Persist a concise summary for a file at the exact mtime obtained from a prior read_summary cache-miss response.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Path to the file (relative to workspace)" },
-                        "mtime": { "type": "integer", "description": "ignored" },
-                        "summary": { "type": "string", "description": "ignored" }
+                        "mtime": { "type": "integer", "description": "The mtime value returned by the previous read_summary miss for this path" },
+                        "summary": { "type": "string", "description": "Your concise summary of the file content" }
                     },
-                    "required": ["path"]
+                    "required": ["path", "mtime", "summary"]
                 }),
             },
         },

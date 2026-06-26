@@ -43,6 +43,8 @@ pub struct ActionRecord {
     #[allow(dead_code)]
     pub raw_bytes: usize,
     pub truncated: bool,
+    /// Rough token estimate for the content sent to the model (for cache/efficiency metrics).
+    pub estimated_tokens: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -52,6 +54,13 @@ pub struct TurnMetrics {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    /// Rough sum of estimated tokens in tool outputs delivered to the model.
+    /// Useful for measuring cache effectiveness (e.g. summaries vs full reads).
+    pub estimated_tool_tokens: u64,
+    /// Number of times a cached file summary was served (read_summary hit).
+    pub cache_summary_hits: u32,
+    /// Estimated tokens delivered via fresh summaries (the "cached" cheap path).
+    pub estimated_summary_tokens: u64,
     pub round_limit_hit: bool,
 }
 
@@ -145,6 +154,7 @@ impl Agent {
         let budget = self.config.context_budget.tool_result_bytes;
         let truncated = sanitized.len() > budget;
         let to_model = self.truncate_for_context(&sanitized);
+        let estimated = estimate_tokens(&to_model);
         ActionRecord {
             tool: tool.to_string(),
             args: args.to_string(),
@@ -152,6 +162,7 @@ impl Agent {
             output_to_model: to_model,
             raw_bytes: raw_output.len(),
             truncated,
+            estimated_tokens: estimated,
         }
     }
 
@@ -669,7 +680,6 @@ History:
     }
 
     /// Handle session meta + file summary cache tools. Returns Some(ack) if handled.
-    /// NOTE: read_summary/store_summary are currently bypassed (see implementation) for SWE-bench testing.
     async fn handle_session_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
         let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
 
@@ -712,30 +722,49 @@ History:
         }
 
         if name == "read_summary" {
-            // TEMPORARILY BYPASSED for SWE-bench debug: always return full (capped) raw content.
-            // This disables the mtime summary cache to test if it is causing issues in evals.
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let rel = make_rel_path(path, &self.config.workspace);
+            if let Some(s) = &self.session {
+                if let Ok(Some((_, summary))) = s.get_file_summary(&rel) {
+                    return Some(format!("📄 {} (fresh summary):\n{}", rel, summary));
+                }
+                // Cache miss or stale: deliver (capped) raw content + current mtime so the
+                // caller can analyze and later call store_summary(path, mtime, summary).
+                let raw = tools::read_file(path, None, &self.config.workspace, self.config.context_budget.read_line_limit);
+                let mtime = crate::session::current_file_mtime_for_agent(&self.config.workspace.join(&rel));
+                return Some(format!(
+                    "📄 {} (mtime={}, stale/missing - analyze below then call store_summary(path=\"{}\", mtime={}, summary=\"your concise summary\")):\n{}",
+                    rel, mtime, path, mtime, raw
+                ));
+            }
+            // Fallback (no session): just do a normal read
             let raw = tools::read_file(path, None, &self.config.workspace, self.config.context_budget.read_line_limit);
-            return Some(format!(
-                "📄 {} (summary cache BYPASSED for test run):\n{}",
-                rel, raw
-            ));
+            return Some(format!("📄 {}:\n{}", rel, raw));
         }
 
         if name == "store_summary" {
-            // TEMPORARILY NO-OP (cache disabled)
-            let _path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            return Some("✅ store_summary ignored (summary cache disabled for test)".to_string());
+            if let Some(s) = &self.session {
+                let p = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let rel = make_rel_path(p, &self.config.workspace);
+                let mtime = args.get("mtime").and_then(|v| v.as_i64()).unwrap_or(0);
+                let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+                let _ = s.store_file_summary(&rel, mtime, summary);
+                return Some(format!("✅ summary stored for {} @ mtime={}", rel, mtime));
+            }
+            return Some("✅ store_summary (no session)".to_string());
         }
 
         None
     }
 
-    fn maybe_invalidate_summary(&mut self, name: &str, _args: &serde_json::Value) {
-        // TEMPORARILY disabled along with summary cache for SWE-bench testing.
+    fn maybe_invalidate_summary(&mut self, name: &str, args: &serde_json::Value) {
         if name == "write" || name == "patch" {
-            // (cache off — no-op)
+            if let Some(s) = &self.session {
+                if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                    let rel = make_rel_path(p, &self.config.workspace);
+                    let _ = s.invalidate_file_summary(&rel);
+                }
+            }
         }
     }
 
@@ -979,6 +1008,12 @@ fn message_byte_size(m: &Message) -> usize {
     content_len + tc_len + id_len + m.role.len() + 16
 }
 
+/// Rough token estimate. Matches the bytes_per_token heuristic used for budgets
+/// (3.5 bytes/token is conservative for code-heavy content).
+pub(crate) fn estimate_tokens(s: &str) -> u32 {
+    (s.len() as f64 / 3.5) as u32
+}
+
 /// Strip <command_context> ... </command_context> (and similar nested planning blocks)
 /// from summary text. Prevents the rolling recent_turns_summary from turning
 /// the agent's internal exploration plans or sub-queries into persistent goals
@@ -1090,8 +1125,6 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 ## Available Tools
 exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
 
-(Note: read_summary / store_summary are currently BYPASSED for testing — they act like normal reads / no-ops. Treat them as regular read for now.)
-
 ## Output Style
 - Be concise but complete.
 - When you finish a meaningful chunk of work, give a short summary of what you did + the actual results (e.g. after running a script to show output, clearly state "The output is \"hello\"." or similar).
@@ -1100,8 +1133,6 @@ exec, read, write, patch, grep, list, web_search, browse, update_goal, define_do
 
 ## Context Management (important for local models)
 A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important files, current goal + achievement tests + pitfalls to avoid, key discoveries, and a summary of recent turns) is prepended to your system prompt on every turn. It comes from the persistent ~/.raven-hotel/ session for this workspace.
-
-(Note: per-file summary cache is temporarily disabled for SWE-bench testing. Just use normal `read` (with optional lines= range) as needed. No need to call read_summary/store_summary.)
 
 You have access to the full workspace. You can run commands and modify files.
 

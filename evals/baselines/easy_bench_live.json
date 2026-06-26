@@ -14,6 +14,18 @@
       "max_tool_calls": 15,
       "max_duration_ms": 180000
     },
+    "cache-lift": {
+      "pass": true,
+      "max_llm_rounds": 12,
+      "max_tool_calls": 8,
+      "max_duration_ms": 120000
+    },
+    "cache-fidelity": {
+      "pass": true,
+      "max_llm_rounds": 12,
+      "max_tool_calls": 8,
+      "max_duration_ms": 120000
+    },
     "marshmallow-code__marshmallow-1343": {
       "pass": true,
       "max_llm_rounds": 25,

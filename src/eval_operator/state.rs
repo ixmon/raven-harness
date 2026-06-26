@@ -15,6 +15,9 @@ pub struct ScenarioResult {
     pub turns: Option<u32>,
     pub tool_calls: Option<u32>,
     pub agent_duration_ms: Option<u64>,
+    pub estimated_tool_tokens: Option<u64>,
+    pub cache_summary_hits: Option<u32>,
+    pub estimated_summary_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
