@@ -101,6 +101,7 @@ impl Config {
     }
 
     /// Convenience: are we running under the eval harness?
+    #[allow(dead_code)]
     pub fn is_eval(&self) -> bool {
         self.flags.is_eval
     }

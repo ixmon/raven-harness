@@ -26,7 +26,7 @@ use std::path::PathBuf;
 ///
 /// Constructed once in `main.rs` from CLI flags + env vars, then stored
 /// in `Config` and queried structurally everywhere.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeFlags {
     // ── Eval mode ──────────────────────────────────────────────────────
 
@@ -82,6 +82,7 @@ pub struct RuntimeFlags {
 
     /// Override terminal color depth (e.g. "256", "truecolor").
     /// Replaces RAVEN_COLOR_DEPTH.
+    #[allow(dead_code)]
     pub color_depth: Option<String>,
 
     // ── Secrets ────────────────────────────────────────────────────────
@@ -89,21 +90,6 @@ pub struct RuntimeFlags {
     /// Vault password for encrypted keystore.
     /// From RAVEN_VAULT_PASSWORD env var (secrets never on CLI).
     pub vault_password: Option<String>,
-}
-
-impl Default for RuntimeFlags {
-    fn default() -> Self {
-        Self {
-            is_eval: false,
-            goal_tracking: false,
-            disable_goal_tool: false,
-            no_initial_goal: false,
-            enable_judge: false,
-            color_depth: None,
-            vault_password: None,
-            max_duration_secs: None,
-        }
-    }
 }
 
 impl RuntimeFlags {
@@ -162,12 +148,15 @@ pub struct EvalHarness {
     /// Full path to python3 in the project venv.
     pub eval_python3: Option<String>,
     /// Path to the project venv directory.
+    #[allow(dead_code)]
     pub eval_project_venv: Option<String>,
     /// Where to write harness turn metrics (JSON).
     pub metrics_out: Option<PathBuf>,
     /// Override workspace for eval (used by eval_smoke test harness).
+    #[allow(dead_code)]
     pub eval_workspace: Option<PathBuf>,
     /// Which scenario to run (used by eval_smoke test harness).
+    #[allow(dead_code)]
     pub eval_scenario: Option<String>,
     /// Initial prompt file (used by TUI eval mode).
     pub initial_prompt_file: Option<PathBuf>,
