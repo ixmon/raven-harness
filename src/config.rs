@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::runtime::{RuntimeFlags, EvalHarness};
+
 /// Computed budget limits derived from the server's actual context window size.
 /// All tool-result truncation limits, file-read line caps, etc. flow from this
 /// so the agent automatically adapts to any model / backend.
@@ -86,12 +88,21 @@ pub struct Config {
     pub tools_enabled: bool,
     /// Enable the full V2 nudge/judge/criteria logic (define_done + progress-based continues, no hard budget cap on judge Continue).
     pub enable_judge: bool,
+    /// Centralized behavioral flags — replaces all inline `std::env::var("RAVEN_*")` checks.
+    pub flags: RuntimeFlags,
+    /// Eval harness plumbing (python paths, metrics output, etc.). Empty in normal use.
+    pub harness: EvalHarness,
 }
 
 impl Config {
     pub fn chat_url(&self) -> String {
         let base = self.base_url.trim_end_matches('/');
         format!("{}/chat/completions", base)
+    }
+
+    /// Convenience: are we running under the eval harness?
+    pub fn is_eval(&self) -> bool {
+        self.flags.is_eval
     }
 }
 

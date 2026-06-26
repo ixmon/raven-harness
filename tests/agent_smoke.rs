@@ -33,6 +33,8 @@ fn eval_config(scenario: &raven_tui::eval_smoke::SmokeScenario, tool_backend: To
         tool_backend,
         tools_enabled: !scenario.disable_tools,
         enable_judge: !scenario.disable_judge,
+        flags: raven_tui::runtime::RuntimeFlags::default(),
+        harness: raven_tui::runtime::EvalHarness::default(),
     }
 }
 

@@ -176,7 +176,7 @@ pub async fn drive_turn(
     agent.on_new_user_input(prompt);
 
     let max_rounds = agent.current_config().max_rounds.clamp(1, MAX_TOOL_ROUNDS);
-    let tools_schema = tools::all_tools();
+    let tools_schema = tools::all_tools(&agent.current_config().flags);
     let tools_for_request = agent.current_config().tools_enabled.then(|| tools_schema.clone());
 
     let mut all_actions: Vec<ActionRecord> = vec![];

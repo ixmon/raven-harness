@@ -22,6 +22,7 @@ mod key_edit;
 mod keystore;
 mod llm;
 mod palette;
+mod runtime;
 mod search;
 mod server_probe;
 mod session;
@@ -120,6 +121,14 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // ── Resolve all env vars once ─────────────────────────────────────────
+    let mut flags = runtime::RuntimeFlags::from_env();
+    // Merge CLI overrides
+    if args.enable_judge {
+        flags.enable_judge = true;
+    }
+    let harness = runtime::EvalHarness::from_env();
 
     // Detect terminal color depth once. Downsample is applied centrally via
     // `PaletteBackend` in `tui_app::run`, so this just primes the cache.
@@ -248,7 +257,7 @@ async fn main() -> Result<()> {
             eprintln!(
                 "raven session: {} | goal: {} | repo files: {} | trusted: {}",
                 s.id,
-                if std::env::var("RAVEN_GOAL_TRACKING").is_ok() {
+                if flags.goal_tracking {
                     let g = &s.meta.current_goal; let end = g.len().min(60); let end = (0..=end).rev().find(|&i| g.is_char_boundary(i)).unwrap_or(0); &g[..end]
                 } else {
                     "none"
@@ -274,8 +283,8 @@ async fn main() -> Result<()> {
     // If any endpoints have encrypted keys, prompt for vault password
     // Supports RAVEN_VAULT_PASSWORD env var for non-interactive / testing use
     if ks.has_encrypted_keys() {
-        if let Ok(pw) = std::env::var("RAVEN_VAULT_PASSWORD") {
-            match ks.unlock(&pw) {
+        if let Some(pw) = &flags.vault_password {
+            match ks.unlock(pw) {
                 Ok(()) => eprintln!("Vault unlocked (from RAVEN_VAULT_PASSWORD)."),
                 Err(e) => eprintln!("RAVEN_VAULT_PASSWORD failed: {}. Encrypted endpoints unavailable.", e),
             }
@@ -374,14 +383,12 @@ async fn main() -> Result<()> {
         // the project python lives via these env vars. We surface a small
         // "stock" eval context so the agent doesn't waste turns on "python not
         // found" or wrong interpreter.
-        let eval_python = std::env::var("RAVEN_EVAL_PYTHON").ok();
-        let eval_python3 = std::env::var("RAVEN_EVAL_PYTHON3").ok();
-        let effective_prompt = if eval_python.is_some() || eval_python3.is_some() {
+        let effective_prompt = if harness.eval_python.is_some() || harness.eval_python3.is_some() {
             let mut note = String::from("## Evaluation Harness Context\n");
-            if let Some(_p) = &eval_python {
+            if let Some(_p) = &harness.eval_python {
                 // note.push_str(&format!("Use this exact Python interpreter for the project under test: {}\n", _p));
             }
-            if let Some(_p) = &eval_python3 {
+            if let Some(_p) = &harness.eval_python3 {
                 // note.push_str(&format!("python3 equivalent (if needed): {}\n", _p));
             }
             /*
@@ -412,7 +419,9 @@ async fn main() -> Result<()> {
             context_budget: context_budget.clone(),
             tool_backend,
             tools_enabled,
-            enable_judge: args.enable_judge,
+            enable_judge: flags.enable_judge,
+            flags: flags.clone(),
+            harness: harness.clone(),
         };
         let chat_backend = if use_mock_llm {
             let scenario = smoke_scenario
@@ -441,9 +450,9 @@ async fn main() -> Result<()> {
         let mut observer = agent_driver::HeadlessObserver;
         let result = agent_driver::drive_turn(&mut app, &effective_prompt, &mut observer).await?;
 
-        if let Ok(out) = std::env::var("RAVEN_METRICS_OUT") {
+        if let Some(out) = &harness.metrics_out {
             let _ = eval_metrics::write_turn_metrics(
-                std::path::Path::new(&out),
+                out.as_path(),
                 &result,
                 turn_started.elapsed().as_millis() as u64,
                 &model_label,
@@ -453,7 +462,7 @@ async fn main() -> Result<()> {
         if let Some(ref scenario) = smoke_scenario {
             eval_smoke::assert_smoke_result(scenario, &result)?;
             eval_smoke::assert_smoke_session_log(scenario, &workspace)?;
-            eval_metrics::assert_smoke_metrics(scenario, &result)?;
+            eval_metrics::assert_smoke_metrics(scenario, &result, &harness)?;
             eprintln!("eval: PASS {:?}", scenario.name);
         }
         println!("{}", result.final_text);
@@ -479,7 +488,9 @@ async fn main() -> Result<()> {
         context_budget,
         tool_backend,
         tools_enabled: true,
-        enable_judge: args.enable_judge,
+        enable_judge: flags.enable_judge,
+        flags: flags.clone(),
+        harness,
     };
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.

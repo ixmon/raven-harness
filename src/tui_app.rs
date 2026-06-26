@@ -851,8 +851,8 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     // Support for raven-eval --test ... --interactive : prefill the input with the test's prompt
     // so the user sees the TUI with the prompt ready and can press Enter to start.
-    if let Ok(pfile) = std::env::var("RAVEN_EVAL_INITIAL_PROMPT_FILE") {
-        if let Ok(text) = std::fs::read_to_string(&pfile) {
+    if let Some(pfile) = &config.harness.initial_prompt_file {
+        if let Ok(text) = std::fs::read_to_string(pfile) {
             let text = text.trim().to_string();
             if !text.is_empty() {
                 app.input = text;
@@ -922,7 +922,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         // On lock contention, reuse cached labels instead of showing "…" to avoid flicker.
         let (mode_label, goal_text) = if let Ok(ag) = agent.try_lock() {
             let mode = ag.current_exec_mode().label().to_string();
-            let goal = if std::env::var("RAVEN_GOAL_TRACKING").is_ok() {
+            let goal = if config.flags.goal_tracking {
                 ag.session.as_ref()
                     .and_then(|s| {
                         let g = s.meta.current_goal.as_str();

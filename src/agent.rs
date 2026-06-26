@@ -190,7 +190,7 @@ impl Agent {
         let messages = self.build_messages_for_model();
         let req = ChatRequest {
             messages,
-            tools: Some(tools::all_tools()),
+            tools: Some(tools::all_tools(&self.config.flags)),
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
@@ -296,8 +296,7 @@ impl Agent {
     /// Push a brief nudge into the conversation when the model pauses
     /// to narrate instead of continuing to call tools.
     pub fn push_continuation_nudge(&mut self) {
-        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
-        let msg = if in_eval {
+        let msg = if self.config.flags.is_eval {
             let mut m = crate::agent_driver::CONTINUATION_NUDGE.to_string();
             // Gentle re-anchor to original goal (environment helping the model stay on task) -- eval only
             if let Some(s) = &self.session {
@@ -325,7 +324,7 @@ impl Agent {
     pub async fn continue_turn_streaming(&mut self) -> Result<mpsc::Receiver<StreamChunk>> {
         self.prune_history().await;
         let messages = self.build_messages_for_model();
-        let tools_schema = tools::all_tools();
+        let tools_schema = tools::all_tools(&self.config.flags);
         let req = ChatRequest {
             messages,
             tools: Some(tools_schema),
@@ -469,8 +468,7 @@ impl Agent {
             .collect::<Vec<_>>()
             .join("\n\n");
 
-        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
-        let summary_prompt = if in_eval {
+        let summary_prompt = if self.config.flags.is_eval {
             // Strong anti-rabbithole + task anchoring only for evals
             let (goal, criteria) = if let Some(s) = &self.session {
                 (
@@ -530,8 +528,7 @@ History:
             }
         };
 
-        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
-        if in_eval {
+        if self.config.flags.is_eval {
             // Post-process only in eval to strip meta-task structures
             strip_command_context_blocks(&raw)
         } else {
@@ -551,13 +548,10 @@ History:
     pub fn record_user_request(&mut self, user_input: &str) {
         if let Some(s) = &mut self.session {
             let _ = s.set_last_user_request(user_input);
-            let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
-            if goal_tracking {
-                let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
-                if in_eval {
+            if self.config.flags.goal_tracking {
+                if self.config.flags.is_eval {
                     // Eval-specific goal seeding with heuristic to avoid chat fixation
-                    let no_initial_goal = std::env::var("RAVEN_NO_GOAL").is_ok()
-                        || std::env::var("RAVEN_EVAL_NO_INITIAL_GOAL").is_ok();
+                    let no_initial_goal = self.config.flags.no_initial_goal;
                     if !no_initial_goal && (s.meta.current_goal.trim().is_empty() || s.meta.current_goal.contains("not yet established")) {
                         let lower = user_input.trim().to_lowercase();
                         if user_input.len() > 25 && !lower.starts_with("hello") && !lower.starts_with("hi") && !lower.starts_with("hey") && !lower.contains("joke") && !lower.contains("tool") {
@@ -622,7 +616,7 @@ History:
     /// Always starts with a fresh system message containing the current
     /// repo cache + goal + pitfalls + recent summary from the Session.
     fn build_messages_for_model(&self) -> Vec<Message> {
-        let base = system_message(&self.config.workspace);
+        let base = system_message(&self.config.workspace, &self.config.flags);
 
         // Log the system prompt (including whether Core Loop was suppressed for evals)
         // into full_log on the very first build so we can see exactly what the model
@@ -643,7 +637,7 @@ History:
 
         let mut msgs = vec![];
         if let Some(s) = &self.session {
-            let injection = s.get_injection_block();
+            let injection = s.get_injection_block(&self.config.flags);
             let combined = if base.content.as_deref().unwrap_or("").is_empty() {
                 injection
             } else {
@@ -662,12 +656,11 @@ History:
         // Append the actual conversation turns (already pruned)
         msgs.extend(self.conversation.iter().cloned());
 
-        let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
         // Legacy synthetic user marker (eval-only) as a fallback if conversation is
         // somehow empty on first build for a session (e.g. after reset + record edge).
         // With user inputs now pushed to conversation, this is rarely reached.
         // Kept to protect against local servers that dislike pure-system prompts.
-        if in_eval && self.session.is_some() && self.conversation.is_empty() {
+        if self.config.flags.is_eval && self.session.is_some() && self.conversation.is_empty() {
             msgs.push(Message {
                 role: "user".into(),
                 content: Some("Follow the Latest User Request in the SESSION CONTEXT above. Use tools now to explore and solve the task.".into()),
@@ -1049,8 +1042,8 @@ fn strip_command_context_blocks(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn system_message(workspace: &std::path::Path) -> Message {
-    let in_eval = std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFlags) -> Message {
+    let in_eval = flags.is_eval;
 
     let core_loop = if in_eval {
         // For evals we often want the model to follow explicit "call define_done first"
@@ -1201,6 +1194,8 @@ mod integration_tests {
             )),
             tools_enabled: true,
             enable_judge: false,
+            flags: crate::runtime::RuntimeFlags::default(),
+            harness: crate::runtime::EvalHarness::default(),
         }
     }
 

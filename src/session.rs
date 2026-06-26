@@ -291,7 +291,7 @@ impl Session {
 
     /// Return the block that should be injected into the system prompt / early context.
     /// Keep this small and high-signal.
-    pub fn get_injection_block(&self) -> String {
+    pub fn get_injection_block(&self, flags: &crate::runtime::RuntimeFlags) -> String {
         let m = &self.meta;
         let rc = &m.repo_cache;
 
@@ -300,7 +300,7 @@ impl Session {
         block.push_str(&format!("Workspace: {}\n", m.workspace.display()));
         block.push_str(&format!("Session: {}\n\n", m.session_id));
 
-        if std::env::var("RAVEN_GOAL_TRACKING").is_ok() {
+        if flags.goal_tracking {
             block.push_str("### Current Goal\n");
             block.push_str(&m.current_goal);
             block.push_str("\n\n");
@@ -377,9 +377,7 @@ impl Session {
         block.push_str("If fresh it returns the summary; if stale/missing it gives you the mtime + capped raw content and tells you to call store_summary after analysis. ");
         block.push_str("This keeps token usage low even on long tasks.\n\n");
 
-        let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
-        let no_goal_tool = std::env::var("RAVEN_EVAL_DISABLE_UPDATE_GOAL").is_ok() || std::env::var("RAVEN_NO_GOAL").is_ok();
-        if goal_tracking && !no_goal_tool {
+        if flags.goal_tracking && !flags.disable_goal_tool {
             block.push_str("---\nUse the structure and goal above to stay on track. Call update_goal(...) if the user's intent clearly shifts.\n");
         }
         block

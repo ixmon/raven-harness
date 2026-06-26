@@ -8,6 +8,7 @@ pub mod eval_metrics;
 pub mod eval_operator;
 pub mod eval_smoke;
 pub mod llm;
+pub mod runtime;
 pub mod sanitize;
 pub mod server_probe;
 pub mod session;
