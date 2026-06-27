@@ -397,15 +397,15 @@ mod tests {
             max_rounds: 10,
             prebuilt_session: None,
             context_budget: ContextBudget::from_context_tokens(8192, 10),
-            tool_backend: crate::tools::ToolBackend::default(),
+            tool_backend: raven_tui::tools::ToolBackend::default(),
             tools_enabled: true,
             enable_judge: false,
-            flags: crate::runtime::RuntimeFlags::default(),
-            harness: crate::runtime::EvalHarness::default(),
+            flags: raven_tui::runtime::RuntimeFlags::default(),
+            harness: raven_tui::runtime::EvalHarness::default(),
         };
         let agent = Arc::new(Mutex::new(Agent::new(
             config.clone(),
-            crate::chat_backend::ChatBackend::http(config.clone()),
+            raven_tui::chat_backend::ChatBackend::http(config.clone()),
         )));
         let ks_path = std::env::temp_dir().join(format!(
             "raven_slash_test_{}.json",
