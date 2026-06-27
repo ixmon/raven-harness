@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::agent::TurnResult;
+use crate::agent::{TurnResult, TurnJudge};
 use crate::session::Session;
 use crate::chat_backend::{mock_tool_call, MockChatBackend};
 use crate::llm::ChatResponse;
@@ -43,6 +43,8 @@ pub struct SmokeExpect {
     pub output_must_not_contain: Vec<String>,
     #[serde(default)]
     pub log_must_not_contain: Vec<String>,
+    #[serde(default)]
+    pub judge_decision: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +75,9 @@ pub struct SmokeScenario {
     pub max_duration_secs: Option<u64>,
     #[serde(default)]
     pub expect: SmokeExpect,
+    /// Completion criteria for judge evaluation (optional).
+    #[serde(default)]
+    pub completion_criteria: Option<String>,
 }
 
 /// Offline smoke scenarios that ship scripted `llm_turns`.
@@ -185,10 +190,11 @@ pub fn mock_chat_backend_for(scenario: &SmokeScenario) -> MockChatBackend {
             }
         })
         .collect();
+    eprintln!("DEBUG: mock_chat_backend_for created {} turns", turns.len());
     MockChatBackend::new(turns)
 }
 
-pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult) -> Result<()> {
+pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult, workspace: &Path) -> Result<()> {
     let text = result.final_text.to_lowercase();
     for needle in &scenario.expect.stdout_contains {
         if !text.contains(&needle.to_lowercase()) {
@@ -264,6 +270,55 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult) -> Res
         }
     }
 
+    // Check for judge decision in result.judge or system actions
+    if let Some(ref want_decision) = scenario.expect.judge_decision {
+        eprintln!("DEBUG: checking for judge decision {:?} in result.judge", want_decision);
+        eprintln!("DEBUG: result.judge = {:?}", result.judge);
+        
+        // First check result.judge directly
+        let found_in_judge = result.judge.as_ref().is_some_and(|jd| {
+            let jd_str = match jd {
+                TurnJudge::Fulfilled { .. } => "FULFILLED",
+                TurnJudge::Continue { .. } => "CONTINUE",
+                TurnJudge::Stuck { .. } => "STUCK",
+            };
+            let want_str = want_decision.as_str();
+            eprintln!("DEBUG: judge match check: {:?} vs {:?} = {} (jd_str={})", jd, want_decision, jd_str == want_str, jd_str);
+            jd_str == want_str
+        });
+
+        // Also check session log for judge decisions (fallback for older tests)
+        let mut found_in_log = false;
+        if !found_in_judge {
+            if let Ok(session) = Session::init(workspace) {
+                if let Ok(log_content) = std::fs::read_to_string(&session.log_path) {
+                    for line in log_content.lines() {
+                        if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
+                            if json.get("event").and_then(|e| e.as_str()) == Some("judge") {
+                                if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
+                                    if content.to_uppercase().contains(&want_decision.to_uppercase()) {
+                                        found_in_log = true;
+                                        eprintln!("DEBUG: judge decision found in session log: {:?}", content);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let found = found_in_judge || found_in_log;
+        if !found {
+            bail!(
+                "smoke {:?}: expected judge decision {:?} not found in result.judge or session log",
+                scenario.name,
+                want_decision
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -328,7 +383,9 @@ mod tests {
             actions: vec![],
             rounds_used: 0,
             metrics: crate::agent::TurnMetrics::default(),
+            judge: None,
         };
-        assert_smoke_result(&s, &result).expect("assert");
+        let workspace = std::env::current_dir().expect("current dir");
+        assert_smoke_result(&s, &result, &workspace).expect("assert");
     }
 }

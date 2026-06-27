@@ -19,17 +19,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::agent::Agent;
-use crate::agent_driver::TurnObserver;
-use crate::config::Config;
+use raven_tui::agent::Agent;
+use raven_tui::agent_driver::TurnObserver;
+use raven_tui::config::Config;
 use crate::desktop::{load_raven_art, DesktopState, WorkspacePane};
 use crate::input_dispatch::{
     apply_settings_actions, default_slash_commands, dispatch_slash_command, SlashContext,
     SlashDispatch,
 };
 use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
-use crate::llm::{strip_xml_tool_call_blocks, ToolCall};
-use crate::session::ExecApprovalMode;
+use raven_tui::llm::{strip_xml_tool_call_blocks, ToolCall};
+use raven_tui::session::ExecApprovalMode;
 use async_trait::async_trait;
 use tokio::sync::oneshot;
 use crate::search::SearchState;
@@ -138,7 +138,7 @@ struct App {
 
     // Display state (updated on endpoint switch)
     display_model: String,
-    display_budget: crate::config::ContextBudget,
+    display_budget: raven_tui::config::ContextBudget,
     balance_label: String,
 
     // Settings modal (extracted module)
@@ -216,7 +216,7 @@ impl App {
             slash_selected: 0,
             display_model: config.model.clone(),
             display_budget: config.context_budget.clone(),
-            balance_label: if crate::llm::is_metered_endpoint(&config.base_url) {
+            balance_label: if raven_tui::llm::is_metered_endpoint(&config.base_url) {
                 "$…".to_string()
             } else {
                 "$∞".to_string()
@@ -308,7 +308,7 @@ async fn refresh_balance_label(
         let cfg = ag.current_config();
         (cfg.base_url.clone(), cfg.api_key.clone())
     };
-    let label = crate::llm::balance_label_for(&base_url, api_key.as_deref()).await;
+    let label = raven_tui::llm::balance_label_for(&base_url, api_key.as_deref()).await;
     let _ = tx.send(label).await;
 }
 
@@ -337,7 +337,7 @@ async fn apply_settings_key(
     );
     if endpoint_switched {
         if let Ok(ag) = agent.try_lock() {
-            app.balance_label = if crate::llm::is_metered_endpoint(&ag.current_config().base_url) {
+            app.balance_label = if raven_tui::llm::is_metered_endpoint(&ag.current_config().base_url) {
                 "$…".to_string()
             } else {
                 "$∞".to_string()
@@ -761,15 +761,15 @@ impl App {
                 self.left_scroll = 10_000;
 
                 let mode = match self.selected_mode_idx {
-                    0 => crate::session::ExecApprovalMode::Babysitter,
-                    1 => crate::session::ExecApprovalMode::SpringBreak,
-                    2 => crate::session::ExecApprovalMode::Vegas,
-                    3 => crate::session::ExecApprovalMode::Thunderdome,
+                    0 => raven_tui::session::ExecApprovalMode::Babysitter,
+                    1 => raven_tui::session::ExecApprovalMode::SpringBreak,
+                    2 => raven_tui::session::ExecApprovalMode::Vegas,
+                    3 => raven_tui::session::ExecApprovalMode::Thunderdome,
                     _ => return true,
                 };
                 if let Ok(mut ag) = agent.try_lock() {
                     ag.set_exec_approval_mode(mode);
-                    if let Some(s) = &mut ag.session {
+                    if let Some(s) = &mut ag.session_mut() {
                         let _ = s.save_meta();
                     }
                 }
@@ -792,7 +792,7 @@ impl App {
 
 pub async fn run(
     config: Config,
-    chat_backend: crate::chat_backend::ChatBackend,
+    chat_backend: raven_tui::chat_backend::ChatBackend,
     keystore: crate::keystore::Keystore,
 ) -> Result<()> {
     // Setup terminal cleanly.
@@ -836,7 +836,7 @@ pub async fn run(
 async fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     config: Config,
-    chat_backend: crate::chat_backend::ChatBackend,
+    chat_backend: raven_tui::chat_backend::ChatBackend,
     mut keystore: crate::keystore::Keystore,
 ) -> Result<()> {
     // Wrap agent in Arc<Mutex> so it persists across spawned turn tasks.
@@ -923,7 +923,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         let (mode_label, goal_text) = if let Ok(ag) = agent.try_lock() {
             let mode = ag.current_exec_mode().label().to_string();
             let goal = if config.flags.goal_tracking {
-                ag.session.as_ref()
+                ag.session().as_ref()
                     .and_then(|s| {
                         let g = s.meta.current_goal.as_str();
                         if g.is_empty() { None } else { Some(g.to_string()) }
@@ -1629,7 +1629,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     exec_mode: mode,
                                 };
 
-                                let result = crate::agent_driver::drive_turn(&mut agent, &prompt2, &mut observer).await;
+                                let result = raven_tui::agent_driver::drive_turn(&mut agent, &prompt2, &mut observer).await;
 
                                 match result {
                                     Ok(r) => {
@@ -1824,7 +1824,7 @@ impl TurnObserver for TuiObserver {
         });
     }
 
-    fn on_tool_result(&mut self, record: &crate::agent::ActionRecord) {
+    fn on_tool_result(&mut self, record: &raven_tui::agent::ActionRecord) {
         let summary = record.summary.clone();  // judge summaries already include ⭐ from driver
         let _ = self.tx.try_send(UiUpdate::ToolResult {
             name: record.tool.clone(),

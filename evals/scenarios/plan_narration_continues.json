@@ -3,6 +3,7 @@
   "type": "smoke",
   "description": "Model first narrates a plan without calling a tool. Should get continuation nudge and actually act next turn.",
   "prompt": "Summarize the project root.",
+  "disable_judge": true,
   "max_rounds": 5,
   "mock_tools": {
     "list": {

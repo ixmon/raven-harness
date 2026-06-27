@@ -349,7 +349,8 @@ pub async fn drive_turn(
                 // Use NUDGE_BUDGET. If no criteria yet, proactively remind to call define_done.
                 // When criteria set, judge checks; on Continue offer suggestion and nudge (budgeted).
                 // If budget consumed but judge sees progress, allow one more.
-                if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
+                let criteria_clone = agent.session.as_ref().and_then(|s| s.meta.completion_criteria.clone());
+                if let Some(ref c) = criteria_clone {
                     if !c.trim().is_empty() {
                         let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
                         let decision = agent.judge_turn(&effective_text, &recent).await;
@@ -364,6 +365,11 @@ pub async fn drive_turn(
                             estimated_tokens: 0,
                         });
                         agent.log_harness_event_with_round("judge", &summary, total_llm_rounds);
+                        // Store the judge decision in last_judge for quick access
+                        if let Some(s) = &mut agent.session {
+                            s.meta.last_judge = Some(summary.clone());
+                            let _ = s.save_meta();
+                        }
                         match decision {
                             TurnJudge::Fulfilled { .. } => {
                                 if let Some(s) = &mut agent.session {
@@ -784,10 +790,20 @@ pub async fn drive_turn(
     };
 
     let tool_call_count = all_actions.len() as u32;
+
+    // Get judge decision from last_judge field (stored when judge event is logged)
+    let judge = agent
+        .session
+        .as_ref()
+        .and_then(|s| {
+            s.meta.last_judge.as_deref().and_then(TurnJudge::from_log_content)
+        });
+
     let result = TurnResult {
         final_text,
         actions: all_actions,
         rounds_used: total_llm_rounds,
+        judge,
         metrics: TurnMetrics {
             llm_rounds: total_llm_rounds,
             tool_calls: tool_call_count,

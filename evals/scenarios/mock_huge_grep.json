@@ -3,6 +3,7 @@
   "type": "smoke",
   "description": "Oversized grep output is truncated before returning to the model",
   "prompt": "Grep for ERROR in logs and say how many matches you saw.",
+  "disable_judge": true,
   "context_tokens": 2048,
   "max_rounds": 4,
   "mock_tools": {

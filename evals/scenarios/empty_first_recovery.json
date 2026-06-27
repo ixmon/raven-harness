@@ -3,6 +3,7 @@
   "type": "smoke",
   "description": "First model response is completely empty (no content, no tools). Driver should recover with nudge and continue to do work.",
   "prompt": "List the files in the root.",
+  "disable_judge": true,
   "max_rounds": 5,
   "mock_tools": {
     "list": {

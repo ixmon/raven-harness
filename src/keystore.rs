@@ -205,7 +205,7 @@ impl Keystore {
     }
 
     /// Get all stored endpoints, decrypting API keys where present.
-    pub fn decrypt_all_endpoints(&self) -> Result<Vec<crate::config::InferenceEndpoint>> {
+    pub fn decrypt_all_endpoints(&self) -> Result<Vec<raven_tui::config::InferenceEndpoint>> {
         let mut out = Vec::new();
         for ep in &self.file.endpoints {
             let api_key = if let Some(ref enc) = ep.encrypted_key {
@@ -217,7 +217,7 @@ impl Keystore {
             } else {
                 None
             };
-            out.push(crate::config::InferenceEndpoint {
+            out.push(raven_tui::config::InferenceEndpoint {
                 label: ep.label.clone(),
                 base_url: ep.base_url.clone(),
                 model: ep.model.clone(),
@@ -266,7 +266,7 @@ impl Keystore {
     }
 
     /// Launch defaults for the session endpoint (settings index 0).
-    pub fn launch_endpoint(&self) -> Result<Option<crate::config::InferenceEndpoint>> {
+    pub fn launch_endpoint(&self) -> Result<Option<raven_tui::config::InferenceEndpoint>> {
         let Some(launch) = &self.file.launch else {
             return Ok(None);
         };
@@ -279,7 +279,7 @@ impl Keystore {
         } else {
             None
         };
-        Ok(Some(crate::config::InferenceEndpoint {
+        Ok(Some(raven_tui::config::InferenceEndpoint {
             label: launch.label.clone(),
             base_url: launch.base_url.clone(),
             model: launch.model.clone(),

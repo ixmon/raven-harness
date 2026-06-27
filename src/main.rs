@@ -7,27 +7,17 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use std::path::PathBuf;
 
-mod agent;
-mod agent_driver;
-mod config;
+extern crate raven_tui;
+
 mod desktop;
 #[cfg(test)]
 mod eval_scenarios;
-mod chat_backend;
-mod eval_metrics;
-mod eval_smoke;
-mod sanitize;
 mod input_dispatch;
 mod key_edit;
 mod keystore;
-mod llm;
 mod palette;
-mod runtime;
 mod search;
-mod server_probe;
-mod session;
 mod settings_modal;
-mod tools;
 mod tui_app;
 mod tui_render;
 
@@ -135,7 +125,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     // ── Resolve all env vars once ─────────────────────────────────────────
-    let mut flags = runtime::RuntimeFlags::from_env();
+    let mut flags = raven_tui::runtime::RuntimeFlags::from_env();
     // Merge CLI overrides
     if args.enable_judge {
         flags.enable_judge = true;
@@ -146,7 +136,7 @@ async fn main() -> Result<()> {
         // Default safety timeout for evals: 10 minutes
         flags.max_duration_secs = Some(600);
     }
-    let harness = runtime::EvalHarness::from_env();
+    let harness = raven_tui::runtime::EvalHarness::from_env();
 
     // Detect terminal color depth once. Downsample is applied centrally via
     // `PaletteBackend` in `tui_app::run`, so this just primes the cache.
@@ -155,16 +145,16 @@ async fn main() -> Result<()> {
         eprintln!("raven: terminal color depth detected as {:?} (RGB will be downsampled)", color_depth);
     }
 
-    let eval_mode = eval_smoke::eval_enabled();
+    let eval_mode = raven_tui::eval_smoke::eval_enabled();
     let smoke_scenario = if eval_mode {
-        let name = eval_smoke::scenario_name();
-        Some(eval_smoke::load_smoke_scenario(&name)?)
+        let name = raven_tui::eval_smoke::scenario_name();
+        Some(raven_tui::eval_smoke::load_smoke_scenario(&name)?)
     } else {
         None
     };
 
     let workspace = if eval_mode {
-        eval_smoke::resolve_eval_workspace()?
+        raven_tui::eval_smoke::resolve_eval_workspace()?
     } else {
         args.workspace
             .unwrap_or_else(|| std::env::current_dir().expect("cannot get current dir"))
@@ -172,9 +162,9 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&workspace)?;
 
     let tool_backend = if let Some(ref scenario) = smoke_scenario {
-        tools::ToolBackend::Mock(eval_smoke::mock_backend_for(scenario))
+        raven_tui::tools::ToolBackend::Mock(raven_tui::eval_smoke::mock_backend_for(scenario))
     } else {
-        tools::ToolBackend::Real
+        raven_tui::tools::ToolBackend::Real
     };
 
     let prompt = if let Some(p) = &args.prompt {
@@ -227,9 +217,9 @@ async fn main() -> Result<()> {
     let mut sess = if no_session {
         None
     } else if let Some(name) = &explicit_session {
-        Some(session::Session::init_named(&workspace, name)?)
+        Some(raven_tui::session::Session::init_named(&workspace, name)?)
     } else {
-        Some(session::Session::init(&workspace)?)
+        Some(raven_tui::session::Session::init(&workspace)?)
     };
 
     if eval_mode {
@@ -240,7 +230,7 @@ async fn main() -> Result<()> {
                 .map(|s| s.name.as_str())
                 .unwrap_or("?"),
             workspace.display(),
-            matches!(tool_backend, tools::ToolBackend::Mock(_)),
+            matches!(tool_backend, raven_tui::tools::ToolBackend::Mock(_)),
             no_session,
         );
     }
@@ -254,14 +244,14 @@ async fn main() -> Result<()> {
                 eprintln!("warning: unknown approval mode {:?}, falling back to env/default", mode_str);
             }
         } else if approval_env_thunderdome() {
-            s.meta.exec_approval_mode = session::ExecApprovalMode::Thunderdome;
+            s.meta.exec_approval_mode = raven_tui::session::ExecApprovalMode::Thunderdome;
             s.save_meta()?;
         }
 
         // For interactive use we offer the Cursor-style trust prompt.
         // This decides whether we do deep (but safe) indexing of the tree.
         if is_interactive_tui {
-            let _ = session::ensure_repo_cache(s);
+            let _ = raven_tui::session::ensure_repo_cache(s);
         } else if !s.meta.trusted {
             // Non-interactive: be conservative, do not index giant trees automatically.
             s.meta.trusted = false;
@@ -342,7 +332,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    let use_mock_llm = eval_mode && eval_smoke::mock_llm_enabled();
+    let use_mock_llm = eval_mode && raven_tui::eval_smoke::mock_llm_enabled();
     let max_rounds = smoke_scenario
         .as_ref()
         .and_then(|s| s.max_rounds)
@@ -357,13 +347,13 @@ async fn main() -> Result<()> {
     let context_budget = if use_mock_llm {
         let n_ctx = scenario_n_ctx.unwrap_or(8192);
         eprintln!("eval: mock LLM — skipping server probe (n_ctx={n_ctx})");
-        config::ContextBudget::from_context_tokens(n_ctx, max_rounds)
+        raven_tui::config::ContextBudget::from_context_tokens(n_ctx, max_rounds)
     } else if let Some(n_ctx) = args.context_size {
-        let mut b = config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds);
-        b.source = config::ContextSource::CliOverride;
+        let mut b = raven_tui::config::ContextBudget::from_context_tokens(n_ctx, args.max_rounds);
+        b.source = raven_tui::config::ContextSource::CliOverride;
         b
     } else {
-        match llm::probe_server(&base_url, &model, api_key.as_deref()).await {
+        match raven_tui::llm::probe_server(&base_url, &model, api_key.as_deref()).await {
             Some(probe) => {
                 if probe.model_id != model {
                     eprintln!(
@@ -372,7 +362,7 @@ async fn main() -> Result<()> {
                     );
                     model = probe.model_id;
                 }
-                config::ContextBudget::from_context_tokens(probe.context_tokens, args.max_rounds)
+                raven_tui::config::ContextBudget::from_context_tokens(probe.context_tokens, args.max_rounds)
             }
             None => {
                 eprintln!(
@@ -380,7 +370,7 @@ async fn main() -> Result<()> {
                     base_url.trim_end_matches('/'),
                     model
                 );
-                config::ContextBudget::default_fallback()
+                raven_tui::config::ContextBudget::default_fallback()
             }
         }
     };
@@ -429,7 +419,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .is_some_and(|s| s.disable_tools);
         let model_label = model.clone();
-        let c = config::Config {
+        let c = raven_tui::config::Config {
             base_url,
             model,
             api_key,
@@ -449,11 +439,11 @@ async fn main() -> Result<()> {
             let scenario = smoke_scenario
                 .as_ref()
                 .expect("RAVEN_EVAL_MOCK_LLM requires a smoke scenario");
-            chat_backend::ChatBackend::Mock(eval_smoke::mock_chat_backend_for(scenario))
+            raven_tui::chat_backend::ChatBackend::Mock(raven_tui::eval_smoke::mock_chat_backend_for(scenario))
         } else {
-            chat_backend::ChatBackend::http(c.clone())
+            raven_tui::chat_backend::ChatBackend::http(c.clone())
         };
-        let mut app = agent::Agent::new(c, chat_backend);
+        let mut app = raven_tui::agent::Agent::new(c, chat_backend);
 
         // Each --prompt / --prompt-file invocation (swebench, smoke evals, direct headless use)
         // is an independent task against a freshly checked-out workspace (run_instance.sh etc.
@@ -490,11 +480,11 @@ async fn main() -> Result<()> {
         let turn_started = std::time::Instant::now();
 
         // Use drive_turn with HeadlessObserver — same loop as TUI
-        let mut observer = agent_driver::HeadlessObserver;
-        let result = agent_driver::drive_turn(&mut app, &effective_prompt, &mut observer).await?;
+        let mut observer = raven_tui::agent_driver::HeadlessObserver;
+        let result = raven_tui::agent_driver::drive_turn(&mut app, &effective_prompt, &mut observer).await?;
 
         if let Some(out) = &harness.metrics_out {
-            let _ = eval_metrics::write_turn_metrics(
+            let _ = raven_tui::eval_metrics::write_turn_metrics(
                 out.as_path(),
                 &result,
                 turn_started.elapsed().as_millis() as u64,
@@ -503,9 +493,9 @@ async fn main() -> Result<()> {
             );
         }
         if let Some(ref scenario) = smoke_scenario {
-            eval_smoke::assert_smoke_result(scenario, &result)?;
-            eval_smoke::assert_smoke_session_log(scenario, &workspace)?;
-            eval_metrics::assert_smoke_metrics(scenario, &result, &harness)?;
+            raven_tui::eval_smoke::assert_smoke_result(scenario, &result, &workspace)?;
+            raven_tui::eval_smoke::assert_smoke_session_log(scenario, &workspace)?;
+            raven_tui::eval_metrics::assert_smoke_metrics(scenario, &result, &harness)?;
             eprintln!("eval: PASS {:?}", scenario.name);
         }
         println!("{}", result.final_text);
@@ -519,7 +509,7 @@ async fn main() -> Result<()> {
     }
 
     // Interactive TUI path
-    let c = config::Config {
+    let c = raven_tui::config::Config {
         base_url,
         model,
         api_key,
@@ -538,8 +528,8 @@ async fn main() -> Result<()> {
 
     // --dump-prompt without --prompt: show the system prompt + injection block
     if args.dump_prompt {
-        let chat_backend = chat_backend::ChatBackend::http(c.clone());
-        let app = agent::Agent::new(c, chat_backend);
+        let chat_backend = raven_tui::chat_backend::ChatBackend::http(c.clone());
+        let app = raven_tui::agent::Agent::new(c, chat_backend);
         let msgs = app.dump_prompt();
         for (i, m) in msgs.iter().enumerate() {
             let content = m.content.as_deref().unwrap_or("");
@@ -554,7 +544,7 @@ async fn main() -> Result<()> {
 
     // Interactive TUI: do not print anything to stdout before entering alternate screen.
     // Trust prompt + any eprintln above already happened on the normal terminal.
-    let chat_backend = chat_backend::ChatBackend::http(c.clone());
+    let chat_backend = raven_tui::chat_backend::ChatBackend::http(c.clone());
     tui_app::run(c, chat_backend, ks).await
 }
 
@@ -569,12 +559,12 @@ fn approval_env_thunderdome() -> bool {
         })
 }
 
-fn parse_approval_mode(s: &str) -> Option<session::ExecApprovalMode> {
+fn parse_approval_mode(s: &str) -> Option<raven_tui::session::ExecApprovalMode> {
     match s.to_ascii_lowercase().as_str() {
-        "babysitter" | "ask" | "default" => Some(session::ExecApprovalMode::Babysitter),
-        "springbreak" | "spring-break" | "spring_break" | "yolo-session" => Some(session::ExecApprovalMode::SpringBreak),
-        "vegas" => Some(session::ExecApprovalMode::Vegas),
-        "thunderdome" | "yolo" | "eternal" | "full-yolo" => Some(session::ExecApprovalMode::Thunderdome),
+        "babysitter" | "ask" | "default" => Some(raven_tui::session::ExecApprovalMode::Babysitter),
+        "springbreak" | "spring-break" | "spring_break" | "yolo-session" => Some(raven_tui::session::ExecApprovalMode::SpringBreak),
+        "vegas" => Some(raven_tui::session::ExecApprovalMode::Vegas),
+        "thunderdome" | "yolo" | "eternal" | "full-yolo" => Some(raven_tui::session::ExecApprovalMode::Thunderdome),
         _ => None,
     }
 }

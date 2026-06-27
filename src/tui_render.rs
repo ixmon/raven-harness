@@ -25,7 +25,7 @@ pub struct StatusBarData<'a> {
     pub display_model: &'a str,
     pub balance_label: &'a str,
     pub ctx_used_tokens: u32,
-    pub budget: &'a crate::config::ContextBudget,
+    pub budget: &'a raven_tui::config::ContextBudget,
     pub mode_label: &'a str,
     pub goal_text: &'a str,
     pub search_label: &'a str,

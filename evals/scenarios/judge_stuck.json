@@ -1,0 +1,16 @@
+{
+  "type": "smoke",
+  "name": "judge_stuck",
+  "prompt": "Fix the bug",
+  "mock_tools": {},
+  "llm_turns": [
+    {"content": "", "tool_calls": [{"name": "read", "arguments": "{\"path\":\"foo.py\"}"}]},
+    {"content": "Still trying", "tool_calls": []},
+    {"content": "STUCK\nRepeating the same approach without progress\nWhat specific error messages are you seeing?"}
+  ],
+  "completion_criteria": "The bug is fixed",
+  "expect": {
+    "judge_decision": "STUCK",
+    "tools_used": ["read"]
+  }
+}

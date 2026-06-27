@@ -124,6 +124,9 @@ pub struct SessionMeta {
     /// Optional summary of initial analysis done on first trust.
     #[serde(default)]
     pub initial_analysis: Option<String>,
+    /// The most recent judge decision from the agent run.
+    #[serde(default)]
+    pub last_judge: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +221,12 @@ impl Session {
         let data = serde_json::to_string_pretty(&self.meta)?;
         fs::write(&self.meta_path, data)?;
         Ok(())
+    }
+
+    /// Set completion criteria and persist to disk.
+    pub fn set_completion_criteria(&mut self, criteria: Option<String>) -> Result<()> {
+        self.meta.completion_criteria = criteria;
+        self.save_meta()
     }
 
     /// Append a raw line (usually a JSON object) to the full log.
