@@ -3,6 +3,7 @@
   "type": "smoke",
   "description": "Agent retries wrong reads then succeeds — churn / recovery path",
   "prompt": "Find the server port in config.toml and report it.",
+  "disable_judge": true,
   "max_rounds": 8,
   "mock_tools": {
     "read": {

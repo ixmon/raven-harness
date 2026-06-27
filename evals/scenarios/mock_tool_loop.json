@@ -3,6 +3,7 @@
   "type": "smoke",
   "description": "Fully offline agent loop: mock LLM calls list, mock tools return fixture",
   "prompt": "List the workspace root and summarize what this project is.",
+  "disable_judge": true,
   "mock_tools": {
     "list": {
       ".": "README.md\n"

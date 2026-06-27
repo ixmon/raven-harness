@@ -11,7 +11,10 @@ use crate::llm::{ChatRequest, Message, StreamChunk, ToolCall};
 use crate::tools;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
+use crate::judge::Judge;
 
 fn make_rel_path(p: &str, workspace: &Path) -> String {
     let abs = std::path::Path::new(p);
@@ -71,6 +74,7 @@ pub struct TurnResult {
     #[allow(dead_code)]
     pub rounds_used: u32,
     pub metrics: TurnMetrics,
+    pub judge: Option<TurnJudge>,
 }
 
 /// Outcome from the inference-based judge used by the driver loop.
@@ -93,8 +97,49 @@ pub enum TurnJudge {
     },
 }
 
+impl TurnJudge {
+    /// Parse a TurnJudge from the log content format: "⭐ JUDGE (criteria active): {:?}"
+    pub fn from_log_content(content: &str) -> Option<Self> {
+        // Expected format: "⭐ JUDGE (criteria active): Fulfilled { note: \"...\" }"
+        const PREFIX: &str = "⭐ JUDGE (criteria active): ";
+        let content = content.strip_prefix(PREFIX)?;
+
+        // Try to parse as Fulfilled { note: "..." }
+        if let Some(note) = extract_quoted(content, "Fulfilled { note: \"", "\" }") {
+            return Some(TurnJudge::Fulfilled { note: note.to_string() });
+        }
+
+        // Try to parse as Stuck { reason: "...", suggested_guidance: "..." }
+        if let (Some(reason), Some(suggested_guidance)) = (
+            extract_quoted(content, "Stuck { reason: \"", "\""),
+            extract_quoted(content, "suggested_guidance: \"", "\" }"),
+        ) {
+            return Some(TurnJudge::Stuck { reason: reason.to_string(), suggested_guidance: suggested_guidance.to_string() });
+        }
+
+        // Try to parse as Continue { suggestion: Some("...") } or Continue { suggestion: None }
+        if content.starts_with("Continue { suggestion: ") {
+            let suggestion = if content.contains("Some(\"") {
+                extract_quoted(content, "Some(\"", "\") }")
+            } else {
+                None
+            };
+            return Some(TurnJudge::Continue { suggestion: suggestion.map(|s| s.to_string()) });
+        }
+
+        None
+    }
+}
+
+fn extract_quoted<'a>(s: &'a str, prefix: &str, suffix: &str) -> Option<&'a str> {
+    let start = s.find(prefix)?;
+    let start = start + prefix.len();
+    let end = s[start..].find(suffix)?;
+    Some(&s[start..start + end])
+}
+
 pub struct Agent {
-    client: ChatBackend,
+    client: Arc<Mutex<ChatBackend>>,
     config: Config,
     /// Clean conversation turns only (user / assistant / tool). Latest user inputs
     /// are pushed here (via record/on_new) so the model sees proper user turns.
@@ -105,6 +150,8 @@ pub struct Agent {
     pub(crate) session: Option<crate::session::Session>,
     /// How many conversation messages have been written to full_log.jsonl.
     logged_message_count: usize,
+    /// Judge for inference-based task completion decisions
+    judge: Option<crate::judge::Judge>,
 }
 
 impl Agent {
@@ -132,13 +179,15 @@ impl Agent {
         }
 
         let logged_message_count = conversation.len();
+        let client_arc = Arc::new(Mutex::new(client));
 
         Self {
-            client,
+            client: client_arc.clone(),
             config,
             conversation,
             session,
             logged_message_count,
+            judge: Some(Judge::new(client_arc)),
         }
     }
 
@@ -146,6 +195,16 @@ impl Agent {
     pub fn reset(&mut self) {
         self.conversation.clear();
         self.logged_message_count = 0;
+    }
+
+    /// Get a reference to the session.
+    pub fn session(&self) -> &Option<crate::session::Session> {
+        &self.session
+    }
+
+    /// Get a mutable reference to the session.
+    pub fn session_mut(&mut self) -> &mut Option<crate::session::Session> {
+        &mut self.session
     }
 
     /// Truncate tool output to fit the context budget.
@@ -200,7 +259,7 @@ impl Agent {
             stream: true,
         };
 
-        self.client.chat_stream(req).await
+        self.client.lock().await.chat_stream(req).await
     }
 
     /// After a streaming turn produced tool calls, execute them and append the
@@ -336,7 +395,7 @@ impl Agent {
             max_tokens: self.config.max_tokens,
             stream: true,
         };
-        self.client.chat_stream(req).await
+        self.client.lock().await.chat_stream(req).await
     }
 
     /// Send a streaming request with optional tool schemas.
@@ -354,7 +413,7 @@ impl Agent {
             max_tokens: self.config.max_tokens,
             stream: true,
         };
-        self.client.chat_stream(req).await
+        self.client.lock().await.chat_stream(req).await
     }
 
     /// Push an arbitrary message into the conversation (for nudges, system notes, etc.).
@@ -520,7 +579,7 @@ History:
             stream: false,
         };
 
-        let raw = match self.client.chat(req).await {
+        let raw = match self.client.lock().await.chat(req).await {
             Ok(resp) => resp.content.trim().to_string(),
             Err(_e) => {
                 // Better fallback: simple truncation instead of storing error string forever (glm.md review)
@@ -792,7 +851,7 @@ History:
             // handles full compression.
             if self.conversation.len() >= 24
                 && self.conversation.len().is_multiple_of(12)
-                && !matches!(self.client, ChatBackend::Mock(_))
+                && !matches!(*self.client.lock().await, ChatBackend::Mock(_))
             {
                 let last_few: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
                 if !last_few.is_empty() {
@@ -847,7 +906,7 @@ History:
 
     /// Switch the inference backend without losing conversation history.
     /// Re-creates the LlmClient with the new endpoint config.
-    pub fn switch_endpoint(
+    pub async fn switch_endpoint(
         &mut self,
         endpoint: &crate::config::InferenceEndpoint,
         budget: crate::config::ContextBudget,
@@ -856,7 +915,7 @@ History:
         self.config.model = endpoint.model.clone();
         self.config.api_key = endpoint.api_key.clone();
         self.config.context_budget = budget;
-        self.client.reset_http(self.config.clone());
+        self.client.lock().await.reset_http(self.config.clone());
     }
 
     /// Read-only access to the current config (for UI to display active endpoint).
@@ -898,134 +957,14 @@ History:
     ///
     /// This replaces pure hardcoded nudge/continue counts with smarter judgment.
     pub async fn judge_turn(&self, last_assistant_text: &str, recent_actions: &[ActionRecord]) -> TurnJudge {
-        const JUDGE_MAX_TOKENS: u32 = 256; // enough for structured decision (FULFILLED/CONTINUE/STUCK + reason + one actionable suggestion) when the judge is given richer exec output (up to 48 lines)
-
-        let Some(s) = &self.session else {
-            return TurnJudge::Continue { suggestion: None };
-        };
-        let m = &s.meta;
-
-        if m.current_goal.trim().is_empty() || m.current_goal.contains("not yet established") {
-            // In no-goal experiments, fall back to completion_criteria if the agent set one
-            if m.completion_criteria.as_ref().is_none_or(|c| c.trim().is_empty()) {
-                return TurnJudge::Continue { suggestion: None };
+        if let Some(ref judge) = self.judge {
+            if let Some(ref s) = self.session {
+                judge.judge_turn(&s.meta, last_assistant_text, recent_actions).await
+            } else {
+                TurnJudge::Continue { suggestion: None }
             }
-        }
-
-        // Build compact recent activity for loop detection.
-        // For exec we now surface up to 48 lines of actual output so the judge
-        // can see real stdout instead of just the first line.
-        let activity: String = recent_actions
-            .iter()
-            .rev()
-            .take(6)
-            .map(|a| {
-                if a.tool == "exec" {
-                    let lines: Vec<&str> = a.output_to_model.lines().take(48).collect();
-                    let preview = if lines.is_empty() {
-                        "(no output)".to_string()
-                    } else {
-                        lines.join("\n")
-                    };
-                    format!("• {} →\n{}", a.tool, preview)
-                } else {
-                    format!("• {} → {}", a.tool, a.summary)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        let mut judge_prompt = format!(
-            "Current goal: {}\n\n",
-            m.current_goal
-        );
-
-        if !m.achievement_tests.is_empty() {
-            judge_prompt.push_str("Success criteria (only answer FULFILLED if these are clearly met):\n");
-            for test in &m.achievement_tests {
-                judge_prompt.push_str(&format!("- {}\n", test));
-            }
-            judge_prompt.push('\n');
-        }
-
-        if let Some(criteria) = &m.completion_criteria {
-            judge_prompt.push_str("Agent-defined 'done' definition (what completion looks like):\n");
-            judge_prompt.push_str(criteria);
-            judge_prompt.push_str("\n(Answer FULFILLED only if recent actions clearly satisfy this definition.)\n\n");
-        }
-
-        // Explicitly include the original user request so the judge knows the full intent
-        if let Some(req) = &m.last_user_request {
-            judge_prompt.push_str(&format!("Original user request:\n{}\n\n", req));
-        }
-
-        if !activity.is_empty() {
-            judge_prompt.push_str("Recent actions (most recent last):\n");
-            judge_prompt.push_str(&activity);
-            judge_prompt.push_str("\n\n");
-        }
-
-        judge_prompt.push_str(&format!(
-            "Latest model output:\n{}\n\n\
-             CRITICAL RULES FOR DECISION:\n\
-             - Only answer FULFILLED if the actions provide clear evidence that the ENTIRE request was completed (not just the model's claim).\n\
-             - If the request asked to 'write AND run AND show output', there must be an 'exec' action with matching output in the recent actions.\n\
-             - A write alone is never enough for a 'run it' request.\n\
-             - For bug report / code fix requests (no explicit 'run' language): FULFILLED requires at least one successful `write` or `patch` action on a main source file in the library (e.g. under src/, the package dir), not merely on a temp diagnostic script the agent created. The edit must address the reported issue.\n\
-             - If the agent defined a completion_criteria via define_done (ideally derived from the *initial* user request), FULFILLED only if actions clearly satisfy that exact definition. The definition should have been set early from the first message.\n\
-             - If the definition requires running/showing/printing/verifying output or proof, FULFILLED requires visible evidence of that (recent exec whose stdout is shown).\n\
-             - If the model is claiming success without evidence in actions, treat as not fulfilled.\n\n\
-             Reply format (first line exactly one of):\n\
-             FULFILLED\n\
-             <short note>\n\
-             or\n\
-             CONTINUE\n\
-             <short reason why not fulfilled yet>\n\
-             <one specific actionable suggestion: what the agent should do RIGHT NOW to satisfy the definition (e.g. \"run the script with exec and paste the exact output here so the proof is visible to the judge\")>\n\
-             or\n\
-             STUCK\n\
-             <reason>\n\
-             <specific question the agent should ask the user>",
-            last_assistant_text.trim()
-        ));
-
-        let req = crate::llm::ChatRequest {
-            messages: vec![crate::llm::Message {
-                role: "user".into(),
-                content: Some(judge_prompt),
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            tools: None,
-            temperature: 0.0,
-            max_tokens: JUDGE_MAX_TOKENS,
-            stream: false,
-        };
-
-        let response = match self.client.chat(req).await {
-            Ok(r) => r.content.trim().to_string(),
-            Err(_) => return TurnJudge::Continue { suggestion: None },
-        };
-
-        let upper = response.to_uppercase();
-        let lines: Vec<&str> = response.lines().collect();
-
-        if upper.contains("FULFILLED") {
-            TurnJudge::Fulfilled { note: response }
-        } else if upper.contains("STUCK") {
-            // crude extraction of reason + suggestion
-            let reason = lines.get(1).unwrap_or(&"Repeating similar actions without progress").to_string();
-            let suggested = lines.get(2).unwrap_or(&"What additional information or direction do you have?").to_string();
-            TurnJudge::Stuck { reason, suggested_guidance: suggested.to_string() }
         } else {
-            // For CONTINUE we extract an optional suggestion (lines after the first).
-            // The prompt asks the judge to give one concrete next action the agent
-            // should take to satisfy the define_done criteria (e.g. run + show output).
-            let suggestion = if lines.len() > 1 {
-                let rest = lines[1..].join(" ").trim().to_string();
-                if rest.is_empty() { None } else { Some(rest) }
-            } else { None };
-            TurnJudge::Continue { suggestion }
+            TurnJudge::Continue { suggestion: None }
         }
     }
 }

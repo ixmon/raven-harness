@@ -1,0 +1,16 @@
+{
+  "type": "smoke",
+  "name": "judge_fulfilled",
+  "prompt": "Write a hello world script",
+  "mock_tools": {},
+  "llm_turns": [
+    {"content": "", "tool_calls": [{"name": "write", "arguments": "{\"path\":\"hello.py\",\"content\":\"print('hello')\"}"}]},
+    {"content": "I wrote the file", "tool_calls": []},
+    {"content": "FULFILLED\nThe hello.py file exists and contains 'print'"}
+  ],
+  "completion_criteria": "The hello.py file exists and contains 'print'",
+  "expect": {
+    "judge_decision": "FULFILLED",
+    "tools_used": ["write"]
+  }
+}

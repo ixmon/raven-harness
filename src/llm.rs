@@ -104,6 +104,7 @@ pub enum StreamChunk {
 }
 
 /// Low-level OpenAI compatible client.
+#[derive(Clone)]
 pub struct LlmClient {
     http: Client,
     config: Config,
@@ -608,7 +609,7 @@ pub(crate) fn contains_tool_xml_syntax(text: &str) -> bool {
 /// We keep any real narrative the model produced before the tool syntax,
 /// but we do *not* want raw/partial tool XML or a dangling "}" stored in
 /// conversation history or treated as the model's "final text" / Agent output.
-pub(crate) fn strip_xml_tool_call_blocks(content: &str) -> String {
+pub fn strip_xml_tool_call_blocks(content: &str) -> String {
     if content.trim().is_empty() {
         return String::new();
     }

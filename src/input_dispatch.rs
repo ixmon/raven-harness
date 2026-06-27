@@ -1,7 +1,7 @@
 //! Slash-command dispatch and unified navigation key handling (glm.md refactor).
 
-use crate::agent::Agent;
-use crate::config::Config;
+use raven_tui::agent::Agent;
+use raven_tui::config::Config;
 use crate::keystore::Keystore;
 use crate::search::{run_search, SearchState};
 use crate::settings_modal::SettingsModal;
@@ -164,12 +164,12 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             *ctx.mode_menu_active = true;
             *ctx.selected_mode_idx = 0;
             if let Ok(ag) = ctx.agent.try_lock() {
-                if let Some(s) = &ag.session {
+                if let Some(s) = &ag.session() {
                     *ctx.selected_mode_idx = match s.meta.exec_approval_mode {
-                        crate::session::ExecApprovalMode::Babysitter => 0,
-                        crate::session::ExecApprovalMode::SpringBreak => 1,
-                        crate::session::ExecApprovalMode::Vegas => 2,
-                        crate::session::ExecApprovalMode::Thunderdome => 3,
+                        raven_tui::session::ExecApprovalMode::Babysitter => 0,
+                        raven_tui::session::ExecApprovalMode::SpringBreak => 1,
+                        raven_tui::session::ExecApprovalMode::Vegas => 2,
+                        raven_tui::session::ExecApprovalMode::Thunderdome => 3,
                     };
                 }
             }
@@ -348,7 +348,7 @@ pub fn apply_settings_actions(
     left_committed: &mut Vec<String>,
     trace_lines: &mut Vec<String>,
     display_model: &mut String,
-    display_budget: &mut crate::config::ContextBudget,
+    display_budget: &mut raven_tui::config::ContextBudget,
     settings: &mut SettingsModal,
 ) {
     use crate::settings_modal::SettingsAction;
@@ -377,8 +377,8 @@ pub fn apply_settings_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Agent;
-    use crate::config::{Config, ContextBudget};
+    use raven_tui::agent::Agent;
+    use raven_tui::config::{Config, ContextBudget};
     use crate::settings_modal::SettingsModal;
     use crate::tui_render::Pane;
     use std::path::PathBuf;

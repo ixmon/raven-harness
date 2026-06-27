@@ -1,0 +1,16 @@
+{
+  "type": "smoke",
+  "name": "judge_continue",
+  "prompt": "Fix the bug in foo.py",
+  "mock_tools": {},
+  "llm_turns": [
+    {"content": "", "tool_calls": [{"name": "read", "arguments": "{\"path\":\"foo.py\"}"}]},
+    {"content": "I see the issue", "tool_calls": []},
+    {"content": "CONTINUE\nThe bug is not yet fixed\nWrite a test to verify the fix"}
+  ],
+  "completion_criteria": "The bug is fixed",
+  "expect": {
+    "judge_decision": "CONTINUE",
+    "tools_used": ["read"]
+  }
+}

@@ -11,8 +11,8 @@ use ratatui::{
     Frame,
 };
 
-use crate::agent::Agent;
-use crate::config::{Config, ContextBudget, InferenceEndpoint};
+use raven_tui::agent::Agent;
+use raven_tui::config::{Config, ContextBudget, InferenceEndpoint};
 use crate::key_edit::{map_key_to_edit, EditAction};
 use crate::keystore::Keystore;
 use std::sync::Arc;
@@ -529,7 +529,7 @@ pub async fn handle_settings_key(
                             let url = settings.edit_buf.clone();
                             settings.new_url = url.clone();
                             settings.add_step = 2;
-                            match crate::llm::probe_server(&url, "", None).await {
+                            match raven_tui::llm::probe_server(&url, "", None).await {
                                 Some(probe) => {
                                     let model_id = probe.model_id.clone();
                                     settings.new_model = model_id.clone();
@@ -568,7 +568,7 @@ pub async fn handle_settings_key(
                         };
                         settings.edit_step = 2;
                         let hint = settings.new_model.as_str();
-                        match crate::llm::probe_server(&url, hint, api_key).await {
+                        match raven_tui::llm::probe_server(&url, hint, api_key).await {
                             Some(probe) => {
                                 let model_id = probe.model_id.clone();
                                 settings.new_model = model_id.clone();
@@ -814,7 +814,7 @@ async fn switch_to_endpoint(
     )));
 
     let mut active = ep.clone();
-    let budget = match crate::llm::probe_server(&ep.base_url, &ep.model, ep.api_key.as_deref()).await
+    let budget = match raven_tui::llm::probe_server(&ep.base_url, &ep.model, ep.api_key.as_deref()).await
     {
         Some(probe) => {
             active.model = probe.model_id.clone();
@@ -838,8 +838,13 @@ async fn switch_to_endpoint(
         }
     };
 
-    if let Ok(mut ag) = agent.try_lock() {
-        ag.switch_endpoint(&active, budget.clone());
+    match agent.try_lock() {
+        Ok(mut ag) => {
+            ag.switch_endpoint(&active, budget.clone()).await;
+        }
+        Err(_) => {
+            // Failed to acquire lock, continue without switching
+        }
     }
 
     actions.push(SettingsAction::DisplayUpdate {

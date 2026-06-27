@@ -1,6 +1,6 @@
 //! Chat completion backends — HTTP (OpenAI-compatible) vs scripted eval mocks.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use tokio::sync::mpsc;
@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::llm::{ChatRequest, ChatResponse, LlmClient, StreamChunk, ToolCall, Usage};
 
 /// LLM transport used by the agent loop.
+#[derive(Clone)]
 pub enum ChatBackend {
     Http(Box<LlmClient>),
     Mock(MockChatBackend),
@@ -39,16 +40,16 @@ impl ChatBackend {
 }
 
 /// Deterministic LLM responses for harness tests (`RAVEN_EVAL_MOCK_LLM=1`).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct MockChatBackend {
-    turns: Mutex<Vec<ChatResponse>>,
+    turns: Arc<Mutex<Vec<ChatResponse>>>,
     empty_fallback: ChatResponse,
 }
 
 impl MockChatBackend {
     pub fn new(scripted: Vec<ChatResponse>) -> Self {
         Self {
-            turns: Mutex::new(scripted),
+            turns: Arc::new(Mutex::new(scripted)),
             empty_fallback: ChatResponse {
                 content: "(mock llm: no more scripted turns)".into(),
                 tool_calls: vec![],

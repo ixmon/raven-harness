@@ -7,7 +7,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use crate::config::ContextBudget;
-use raven_tui::server_probe::{resolve_server_probe, ProbeMatch};
+use crate::server_probe::{resolve_server_probe, ProbeMatch};
 
 #[derive(Debug, Deserialize)]
 struct ProbeExpect {

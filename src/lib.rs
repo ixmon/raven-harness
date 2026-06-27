@@ -7,6 +7,7 @@ pub mod config;
 pub mod eval_metrics;
 pub mod eval_operator;
 pub mod eval_smoke;
+pub mod judge;
 pub mod llm;
 pub mod runtime;
 pub mod sanitize;
