@@ -24,10 +24,10 @@ impl Judge {
     ) -> TurnJudge {
         const JUDGE_MAX_TOKENS: u32 = 256;
 
-        if meta.current_goal.trim().is_empty() || meta.current_goal.contains("not yet established") {
-            if meta.completion_criteria.as_ref().is_none_or(|c| c.trim().is_empty()) {
-                return TurnJudge::Continue { suggestion: None };
-            }
+        if (meta.current_goal.trim().is_empty() || meta.current_goal.contains("not yet established"))
+            && meta.completion_criteria.as_ref().is_none_or(|c| c.trim().is_empty())
+        {
+            return TurnJudge::Continue { suggestion: None };
         }
 
         // Build compact recent activity for loop detection

@@ -796,7 +796,7 @@ pub async fn drive_turn(
         .session
         .as_ref()
         .and_then(|s| {
-            s.meta.last_judge.as_deref().and_then(|content| TurnJudge::from_log_content(content))
+            s.meta.last_judge.as_deref().and_then(TurnJudge::from_log_content)
         });
 
     let result = TurnResult {

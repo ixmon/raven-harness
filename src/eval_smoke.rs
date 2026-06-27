@@ -276,7 +276,7 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult, worksp
         eprintln!("DEBUG: result.judge = {:?}", result.judge);
         
         // First check result.judge directly
-        let found_in_judge = result.judge.as_ref().map_or(false, |jd| {
+        let found_in_judge = result.judge.as_ref().is_some_and(|jd| {
             let jd_str = match jd {
                 TurnJudge::Fulfilled { .. } => "FULFILLED",
                 TurnJudge::Continue { .. } => "CONTINUE",
