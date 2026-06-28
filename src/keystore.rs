@@ -75,8 +75,7 @@ impl Keystore {
         let file = if path.exists() {
             let data = std::fs::read_to_string(path)
                 .with_context(|| format!("reading {}", path.display()))?;
-            serde_json::from_str::<KeystoreFile>(&data)
-                .with_context(|| "parsing endpoints.json")?
+            serde_json::from_str::<KeystoreFile>(&data).with_context(|| "parsing endpoints.json")?
         } else {
             // Generate a fresh salt for future use
             let mut salt = [0u8; SALT_LEN];
@@ -114,8 +113,7 @@ impl Keystore {
             .map_err(|e| anyhow!("argon2 key derivation failed: {}", e))?;
 
         // Verify by trying to decrypt the first encrypted key
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|e| anyhow!("cipher init: {}", e))?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("cipher init: {}", e))?;
 
         for ep in &self.file.endpoints {
             if let Some(ref enc) = ep.encrypted_key {
@@ -146,8 +144,7 @@ impl Keystore {
         let key = self
             .derived_key
             .ok_or_else(|| anyhow!("keystore not unlocked"))?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|e| anyhow!("cipher init: {}", e))?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("cipher init: {}", e))?;
 
         let mut nonce_bytes = [0u8; NONCE_LEN];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -170,8 +167,7 @@ impl Keystore {
         let key = self
             .derived_key
             .ok_or_else(|| anyhow!("keystore not unlocked"))?;
-        let cipher = Aes256Gcm::new_from_slice(&key)
-            .map_err(|e| anyhow!("cipher init: {}", e))?;
+        let cipher = Aes256Gcm::new_from_slice(&key).map_err(|e| anyhow!("cipher init: {}", e))?;
 
         let blob = base64::engine::general_purpose::STANDARD
             .decode(encoded)
@@ -438,7 +434,8 @@ mod tests {
 
         // Reload from disk and unlock with correct pw
         let mut ks2 = Keystore::load_or_create(&path).expect("reload");
-        ks2.unlock("test-password-123").expect("correct password unlock");
+        ks2.unlock("test-password-123")
+            .expect("correct password unlock");
         let eps2 = ks2.decrypt_all_endpoints().expect("decrypt after reload");
         assert_eq!(eps2[0].api_key.as_deref(), Some("sk-secret-key-xyz"));
 
@@ -457,7 +454,8 @@ mod tests {
 
         let mut ks = Keystore::load_or_create(&path).unwrap();
         ks.init_password("pw").unwrap();
-        ks.add_endpoint("ep1", "http://one/v1", "model-a", None).unwrap();
+        ks.add_endpoint("ep1", "http://one/v1", "model-a", None)
+            .unwrap();
 
         ks.update_endpoint(0, "ep1-renamed", "http://two/v1", "model-b", None)
             .unwrap();
@@ -496,7 +494,8 @@ mod tests {
         let mut ks = Keystore::load_or_create(&path).unwrap();
         ks.init_password("pw").unwrap();
 
-        ks.add_endpoint("no-key-ep", "http://local", "model", None).unwrap();
+        ks.add_endpoint("no-key-ep", "http://local", "model", None)
+            .unwrap();
         assert!(!ks.has_encrypted_keys());
 
         let eps = ks.decrypt_all_endpoints().unwrap();

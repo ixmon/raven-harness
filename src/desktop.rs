@@ -1,5 +1,7 @@
 //! Multi-desktop view state (workspace ↔ splash) with fake horizontal slide.
 
+use std::time::{Duration, Instant};
+
 /// Which full-width desktop is active once any slide animation completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveDesktop {
@@ -17,9 +19,12 @@ pub enum SlideDirection {
 struct SlideState {
     direction: SlideDirection,
     frame: u8,
+    /// When set, tick() will hold at current frame until this instant.
+    pause_until: Option<Instant>,
 }
 
-/// Number of animation frames for a desktop transition (~300ms at 50ms idle poll).
+/// Number of animation frames for a desktop transition.
+/// A ~250ms pause is held at the midpoint (half-and-half view) before auto-completing.
 pub const SLIDE_FRAMES: u8 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +59,7 @@ impl DesktopState {
             Some(SlideState {
                 direction: SlideDirection::ToSplash,
                 frame,
+                ..
             }) if frame < SLIDE_FRAMES => false,
             Some(SlideState {
                 direction: SlideDirection::ToSplash,
@@ -80,6 +86,7 @@ impl DesktopState {
         self.slide = Some(SlideState {
             direction: SlideDirection::ToSplash,
             frame: 0,
+            pause_until: None,
         });
     }
 
@@ -87,14 +94,26 @@ impl DesktopState {
         self.slide = Some(SlideState {
             direction: SlideDirection::ToWorkspace,
             frame: 0,
+            pause_until: None,
         });
     }
 
     /// Advance the slide by one frame. Returns `true` while animation continues.
+    /// Inserts a 250ms pause when reaching the halfway frame so the split view
+    /// is briefly visible before the transition completes automatically.
     pub fn tick(&mut self) -> bool {
-        let Some(mut slide) = self.slide else {
+        let Some(mut slide) = self.slide.take() else {
             return false;
         };
+
+        if let Some(until) = slide.pause_until {
+            if Instant::now() < until && !cfg!(test) {
+                self.slide = Some(slide);
+                return false;
+            }
+            slide.pause_until = None;
+        }
+
         slide.frame = slide.frame.saturating_add(1);
         if slide.frame >= SLIDE_FRAMES {
             self.active = match slide.direction {
@@ -104,6 +123,11 @@ impl DesktopState {
             self.slide = None;
             false
         } else {
+            // At midpoint, pause so user sees the half-and-half transition briefly.
+            let mid = SLIDE_FRAMES / 2;
+            if slide.frame == mid {
+                slide.pause_until = Some(Instant::now() + Duration::from_millis(250));
+            }
             self.slide = Some(slide);
             true
         }

@@ -29,7 +29,6 @@ use std::path::PathBuf;
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeFlags {
     // ── Eval mode ──────────────────────────────────────────────────────
-
     /// True when running under the eval harness (RAVEN_EVAL, RAVEN_EVAL_MOCK_LLM,
     /// or --eval flag). Controls system prompt content, summary strategy,
     /// anti-rabbithole stripping, eval-specific goal seeding, and the
@@ -39,7 +38,6 @@ pub struct RuntimeFlags {
     pub is_eval: bool,
 
     // ── Goal tracking ──────────────────────────────────────────────────
-
     /// Enable goal tracking features (update_goal tool, goal section in
     /// injection block, goal seeding from first user request).
     ///
@@ -62,7 +60,6 @@ pub struct RuntimeFlags {
     pub no_initial_goal: bool,
 
     // ── Judge / nudge ──────────────────────────────────────────────────
-
     /// Enable the full V2 nudge/judge/criteria logic (define_done +
     /// budgeted progress continues, no hard budget cap on judge Continue).
     ///
@@ -71,7 +68,6 @@ pub struct RuntimeFlags {
     pub enable_judge: bool,
 
     // ── Safety limits ──────────────────────────────────────────────────
-
     /// Hard wall-clock timeout for a single turn (seconds).
     /// When elapsed, drive_turn() stops the agent regardless of judge/nudge state.
     /// Set via --max-duration CLI, "max_duration" in scenario JSON, or default.
@@ -79,14 +75,12 @@ pub struct RuntimeFlags {
     pub max_duration_secs: Option<u64>,
 
     // ── Presentation / terminal ────────────────────────────────────────
-
     /// Override terminal color depth (e.g. "256", "truecolor").
     /// Replaces RAVEN_COLOR_DEPTH.
     #[allow(dead_code)]
     pub color_depth: Option<String>,
 
     // ── Secrets ────────────────────────────────────────────────────────
-
     /// Vault password for encrypted keystore.
     /// From RAVEN_VAULT_PASSWORD env var (secrets never on CLI).
     pub vault_password: Option<String>,
@@ -101,8 +95,8 @@ impl RuntimeFlags {
     /// CLI flags (e.g. --enable-judge) should be merged by the caller
     /// after this returns.
     pub fn from_env() -> Self {
-        let is_eval = std::env::var("RAVEN_EVAL").is_ok()
-            || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
+        let is_eval =
+            std::env::var("RAVEN_EVAL").is_ok() || std::env::var("RAVEN_EVAL_MOCK_LLM").is_ok();
 
         let goal_tracking = std::env::var("RAVEN_GOAL_TRACKING").is_ok();
 
@@ -175,7 +169,9 @@ impl EvalHarness {
             eval_python3: std::env::var("RAVEN_EVAL_PYTHON3").ok(),
             eval_project_venv: std::env::var("RAVEN_EVAL_PROJECT_VENV").ok(),
             metrics_out: std::env::var("RAVEN_METRICS_OUT").ok().map(PathBuf::from),
-            eval_workspace: std::env::var("RAVEN_EVAL_WORKSPACE").ok().map(PathBuf::from),
+            eval_workspace: std::env::var("RAVEN_EVAL_WORKSPACE")
+                .ok()
+                .map(PathBuf::from),
             eval_scenario: std::env::var("RAVEN_EVAL_SCENARIO").ok(),
             initial_prompt_file: std::env::var("RAVEN_EVAL_INITIAL_PROMPT_FILE")
                 .ok()

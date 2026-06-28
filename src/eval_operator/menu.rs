@@ -6,8 +6,8 @@ use std::io::{self, Write};
 use super::ai_shell::{explain_last_run, run_repl};
 use super::probe::{format_status, LlmStatus};
 use super::registry::find_entry;
-use super::registry::{load_registry, list_text};
-use super::runner::{Runner, print_summary};
+use super::registry::{list_text, load_registry};
+use super::runner::{print_summary, Runner};
 use super::state::{format_last_run, load_state, save_state};
 
 pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
@@ -81,10 +81,7 @@ pub fn run_interactive(llm: &LlmStatus, runner: &Runner) -> Result<()> {
                 print!("{}", list_text(&reg));
             }
             "5" => {
-                let profile = state
-                    .last_profile
-                    .clone()
-                    .unwrap_or_else(|| "quick".into());
+                let profile = state.last_profile.clone().unwrap_or_else(|| "quick".into());
                 let s = runner.run_profile(&profile, &mut state)?;
                 print_summary(&s);
             }

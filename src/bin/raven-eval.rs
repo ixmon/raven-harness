@@ -3,7 +3,8 @@
 use anyhow::Result;
 use clap::Parser;
 use raven_tui::eval_operator::{
-    menu, probe::{format_status, probe_llm},
+    menu,
+    probe::{format_status, probe_llm},
     registry::{list_text, load_registry, profile_ids},
     runner::{print_summary, Runner},
     state::load_state,
@@ -22,7 +23,6 @@ struct Args {
 
     // Note: --test <name> --interactive will set up the workspace + prompt and launch the full interactive TUI
     // (with --temperature 1 by default for these runs).
-
     /// Live Raven agent for a single SWE-bench instance (--run / --test <instance_id> only)
     #[arg(long)]
     live: bool,
@@ -69,10 +69,8 @@ fn main() -> Result<()> {
     if let Some(id) = args.test.clone() {
         // --test (or --run via alias) was provided
         let mut state = load_state()?;
-        let is_swebench = raven_tui::eval_operator::swebench::is_instance_id(
-            &runner.manifest_dir,
-            &id,
-        );
+        let is_swebench =
+            raven_tui::eval_operator::swebench::is_instance_id(&runner.manifest_dir, &id);
         let is_easy = id.starts_with("easy-");
         if args.live && !is_swebench && !is_easy {
             anyhow::bail!("--live requires a SWE-bench instance id (see evals/swebench/instances/) or easy-* id");
@@ -84,7 +82,11 @@ fn main() -> Result<()> {
         }
 
         let profile = if args.live {
-            if is_easy { "easy-bench-live".into() } else { "swebench-live".into() }
+            if is_easy {
+                "easy-bench-live".into()
+            } else {
+                "swebench-live".into()
+            }
         } else if is_swebench {
             "swebench-smoke".into()
         } else if is_easy {

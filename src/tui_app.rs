@@ -13,27 +13,27 @@ use ratatui::{
     Terminal,
 };
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use raven_tui::agent::Agent;
-use raven_tui::agent_driver::TurnObserver;
-use raven_tui::config::Config;
 use crate::desktop::{load_raven_art, DesktopState, WorkspacePane};
 use crate::input_dispatch::{
     apply_settings_actions, default_slash_commands, dispatch_slash_command, SlashContext,
     SlashDispatch,
 };
 use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
-use raven_tui::llm::{strip_xml_tool_call_blocks, ToolCall};
-use raven_tui::session::ExecApprovalMode;
-use async_trait::async_trait;
-use tokio::sync::oneshot;
 use crate::search::SearchState;
 use crate::settings_modal::{handle_settings_key, SettingsModal};
+use async_trait::async_trait;
+use raven_tui::agent::Agent;
+use raven_tui::agent_driver::TurnObserver;
+use raven_tui::config::Config;
+use raven_tui::llm::{strip_xml_tool_call_blocks, ToolCall};
+use raven_tui::session::ExecApprovalMode;
+use tokio::sync::oneshot;
 
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard;
@@ -121,6 +121,21 @@ struct App {
     tool_calls_this_turn: usize,
     turn_rounds: usize,
     ctx_used_tokens: u32,
+    processing_start: Option<std::time::Instant>,
+    tokens_processed: u32,
+    tps: f64,
+    // API-reported usage for TPS calculation
+    api_prompt_tokens: Option<u32>,
+    api_completion_tokens: Option<u32>,
+    api_total_tokens: Option<u32>,
+    api_tps: f64,
+
+    // Accurate generation time for TPS: only counts time between consecutive
+    // output tokens (Token/Thinking). This excludes tool execution, approvals,
+    // waiting for user, multi-round gaps, etc. Makes "server tps" match what
+    // llama.cpp / the backend reports (~45 tps instead of 2-3).
+    generation_active_time: f64,
+    last_token_time: Option<std::time::Instant>,
 
     // Approval
     pending_approval: Option<String>,
@@ -131,6 +146,11 @@ struct App {
     mode_menu_active: bool,
     selected_mode_idx: usize,
     approval_modes: [&'static str; 4],
+
+    // Agent mode submenu for /mode (talk, think, ...)
+    agent_mode_menu_active: bool,
+    selected_agent_mode_idx: usize,
+    agent_modes: [&'static str; 5],
 
     // Slash menu
     slash_commands: Vec<crate::input_dispatch::SlashCommand>,
@@ -161,6 +181,7 @@ struct App {
     // Cached status-bar labels to avoid flicker when agent lock is contended (glm.md)
     cached_mode_label: String,
     cached_goal_text: String,
+    cached_agent_mode: String,
 
     // Multi-desktop: workspace ↔ splash (left/right arrow slide)
     desktop: DesktopState,
@@ -201,6 +222,15 @@ impl App {
             tool_calls_this_turn: 0,
             turn_rounds: 0,
             ctx_used_tokens: 0,
+            processing_start: None,
+            tokens_processed: 0,
+            tps: 0.0,
+            api_prompt_tokens: None,
+            api_completion_tokens: None,
+            api_total_tokens: None,
+            api_tps: 0.0,
+            generation_active_time: 0.0,
+            last_token_time: None,
             pending_approval: None,
             approval_responder: None,
             needs_redraw: true,
@@ -212,6 +242,9 @@ impl App {
                 "Vegas - Yolo in sandbox",
                 "Thunderdome - eternal Yolo, anytime, anywhere",
             ],
+            agent_mode_menu_active: false,
+            selected_agent_mode_idx: 0,
+            agent_modes: ["talk", "think", "research", "work", "dream"],
             slash_commands: default_slash_commands(),
             slash_selected: 0,
             display_model: config.model.clone(),
@@ -232,6 +265,7 @@ impl App {
             search_mode: false,
             cached_mode_label: String::new(),
             cached_goal_text: "none".into(),
+            cached_agent_mode: "talk".into(),
             desktop: DesktopState::new(),
             raven_art: load_raven_art(),
         }
@@ -287,7 +321,6 @@ fn render_pane(pane: Pane) -> crate::tui_render::Pane {
     }
 }
 
-
 /// Idle fallback interval for OpenRouter balance polling (no OpenRouter guidance on cadence).
 const BALANCE_IDLE_REFRESH_SECS: u64 = 600;
 
@@ -299,10 +332,7 @@ fn schedule_balance_refresh(agent: &Arc<tokio::sync::Mutex<Agent>>, tx: &mpsc::S
     });
 }
 
-async fn refresh_balance_label(
-    agent: &Arc<tokio::sync::Mutex<Agent>>,
-    tx: &mpsc::Sender<String>,
-) {
+async fn refresh_balance_label(agent: &Arc<tokio::sync::Mutex<Agent>>, tx: &mpsc::Sender<String>) {
     let (base_url, api_key) = {
         let ag = agent.lock().await;
         let cfg = ag.current_config();
@@ -337,11 +367,12 @@ async fn apply_settings_key(
     );
     if endpoint_switched {
         if let Ok(ag) = agent.try_lock() {
-            app.balance_label = if raven_tui::llm::is_metered_endpoint(&ag.current_config().base_url) {
-                "$…".to_string()
-            } else {
-                "$∞".to_string()
-            };
+            app.balance_label =
+                if raven_tui::llm::is_metered_endpoint(&ag.current_config().base_url) {
+                    "$…".to_string()
+                } else {
+                    "$∞".to_string()
+                };
         }
         schedule_balance_refresh(agent, balance_tx);
     }
@@ -388,9 +419,11 @@ impl App {
         }
         if matches!(
             self.settings.mode,
-            crate::settings_modal::SettingsMode::Adding | crate::settings_modal::SettingsMode::Editing
+            crate::settings_modal::SettingsMode::Adding
+                | crate::settings_modal::SettingsMode::Editing
         ) {
-            self.settings.apply_edit_action(EditAction::InsertStr(text.to_string()));
+            self.settings
+                .apply_edit_action(EditAction::InsertStr(text.to_string()));
             self.needs_redraw = true;
         }
     }
@@ -418,7 +451,6 @@ impl App {
             }
         }
     }
-
 
     /// Delete the character before the cursor (Backspace).
     fn delete_char_before(&mut self) {
@@ -539,7 +571,7 @@ impl App {
 
     /// Scroll the focused conversation/trace pane by `delta` lines (negative = up).
     fn scroll_focused_line(&mut self, delta: i16) {
-        if self.desktop.showing_splash() || self.mode_menu_active {
+        if self.desktop.showing_splash() || self.mode_menu_active || self.agent_mode_menu_active {
             return;
         }
         let pane = self.focused_pane;
@@ -551,7 +583,7 @@ impl App {
 
     /// Scroll the focused pane by `delta` pages (PgUp/PgDn).
     fn scroll_focused_page(&mut self, delta: i16, page_lines: u16) {
-        if self.desktop.showing_splash() || self.mode_menu_active {
+        if self.desktop.showing_splash() || self.mode_menu_active || self.agent_mode_menu_active {
             return;
         }
         let pane = self.focused_pane;
@@ -756,7 +788,7 @@ impl App {
             KeyCode::Enter => {
                 let chosen = self.approval_modes[self.selected_mode_idx];
                 self.left_committed
-                    .push(format!("Execution mode set to: {}", chosen));
+                    .push(format!("Approval mode set to: {}", chosen));
                 self.left_follow_output = true;
                 self.left_scroll = 10_000;
 
@@ -782,6 +814,58 @@ impl App {
                 self.mode_menu_active = false;
                 self.clear_input();
                 self.selected_mode_idx = 0;
+                self.needs_redraw = true;
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// Handle a key when the /mode (agent mode) selection menu is open.
+    /// Returns `true` if the key was consumed (caller should `continue`).
+    async fn handle_agent_mode_menu_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+        agent: &Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        if !self.agent_mode_menu_active {
+            return false;
+        }
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_agent_mode_idx > 0 {
+                    self.selected_agent_mode_idx -= 1;
+                }
+                self.needs_redraw = true;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.selected_agent_mode_idx < (self.agent_modes.len() - 1) as usize {
+                    self.selected_agent_mode_idx += 1;
+                }
+                self.needs_redraw = true;
+            }
+            KeyCode::Enter => {
+                let chosen = self.agent_modes[self.selected_agent_mode_idx];
+                self.left_committed
+                    .push(format!("Agent mode set to: {}", chosen));
+                self.left_follow_output = true;
+                self.left_scroll = 10_000;
+
+                if let Ok(mut ag) = agent.try_lock() {
+                    ag.set_agent_mode(chosen);
+                    if let Some(s) = &mut ag.session_mut() {
+                        let _ = s.save_meta();
+                    }
+                }
+                self.agent_mode_menu_active = false;
+                self.clear_input();
+                self.selected_agent_mode_idx = 0;
+                self.needs_redraw = true;
+            }
+            KeyCode::Esc => {
+                self.agent_mode_menu_active = false;
+                self.clear_input();
+                self.selected_agent_mode_idx = 0;
                 self.needs_redraw = true;
             }
             _ => {}
@@ -871,7 +955,8 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Channel for execution approval requests (tool needs user OK before running)
     // Sender goes to agent task, receiver stays in UI loop.
     // Carries (description, responder) so UI can show dialog and respond with bool.
-    let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<(String, tokio::sync::oneshot::Sender<bool>)>(4);
+    let (approval_req_tx, mut approval_req_rx) =
+        mpsc::channel::<(String, tokio::sync::oneshot::Sender<bool>)>(4);
 
     // Stop signal: UI sets this to true (Escape while processing), agent task checks it
     // at clean stopping points (before each LLM call, before each tool execution).
@@ -913,380 +998,505 @@ async fn run_app<B: ratatui::backend::Backend>(
 
         // Advance spinner
         if app.is_processing {
-           app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
 
         // Read current state from agent (try_lock to avoid blocking the draw).
         // app.ctx_used_tokens is NOT read here — it's pushed via UiUpdate::ContextUsage
         // from the agent task to avoid any lock contention during processing.
         // On lock contention, reuse cached labels instead of showing "…" to avoid flicker.
-        let (mode_label, goal_text) = if let Ok(ag) = agent.try_lock() {
-            let mode = ag.current_exec_mode().label().to_string();
+        let (approval_label, goal_text, agent_mode) = if let Ok(ag) = agent.try_lock() {
+            let approval = ag.current_exec_mode().label().to_string();
             let goal = if config.flags.goal_tracking {
-                ag.session().as_ref()
+                ag.session()
+                    .as_ref()
                     .and_then(|s| {
                         let g = s.meta.current_goal.as_str();
-                        if g.is_empty() { None } else { Some(g.to_string()) }
+                        if g.is_empty() {
+                            None
+                        } else {
+                            Some(g.to_string())
+                        }
                     })
                     .unwrap_or_else(|| "(no goal set)".into())
             } else {
                 "none".into()
             };
-            (mode, goal)
+            let amode = ag.current_agent_mode();
+            (approval, goal, amode)
         } else {
-            (app.cached_mode_label.clone(), app.cached_goal_text.clone())
+            (
+                app.cached_mode_label.clone(),
+                app.cached_goal_text.clone(),
+                app.cached_agent_mode.clone(),
+            )
         };
-        app.cached_mode_label = mode_label.clone();
+        app.cached_mode_label = approval_label.clone();
         app.cached_goal_text = goal_text.clone();
+        app.cached_agent_mode = agent_mode.clone();
 
         // Draw only when needed (basic perf improvement per glm.md)
-        if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 || app.desktop.is_animating() {
-           app.needs_redraw = false;
+        if app.needs_redraw
+            || app.is_processing
+            || app.scroll_flash_timer > 0
+            || app.desktop.is_animating()
+        {
+            app.needs_redraw = false;
             let workspace_display = config.workspace.display().to_string();
             // Draw - split into status bar + content area + context gauge + input bar
             terminal.draw(|f| {
-            let size = f.area();
+                let size = f.area();
 
-            // Vertical layout: status bar (1) + content panes (fill) + context gauge (1) + input bar (dynamic)
-            let show_gauge = app.is_processing;
-            let gauge_h = if show_gauge { 1 } else { 0 };
-            // Dynamic input height: 3 (single line) up to 8 (multiline)
-            let input_line_count = app.input.lines().count().max(1) as u16;
-            let input_h = (input_line_count + 2).clamp(3, 8); // +2 for borders
-            let vertical = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),        // status bar
-                    Constraint::Min(6),           // content panes
-                    Constraint::Length(gauge_h),   // context gauge (only during processing)
-                    Constraint::Length(input_h),   // input bar (dynamic height)
-                ])
-                .split(size);
+                // Vertical layout: status bar (1) + content panes (fill) + context gauge (1) + input bar (dynamic)
+                let show_gauge = app.is_processing;
+                let gauge_h = if show_gauge { 1 } else { 0 };
+                // Dynamic input height: 3 (single line) up to 8 (multiline)
+                let input_line_count = app.input.lines().count().max(1) as u16;
+                let input_h = (input_line_count + 2).clamp(3, 8); // +2 for borders
+                let vertical = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),       // status bar
+                        Constraint::Min(6),          // content panes
+                        Constraint::Length(gauge_h), // context gauge (only during processing)
+                        Constraint::Length(input_h), // input bar (dynamic height)
+                    ])
+                    .split(size);
 
-            let status_area = vertical[0];
-            let content_area = vertical[1];
-            let gauge_area = vertical[2];
-            let input_area = vertical[3];
+                let status_area = vertical[0];
+                let content_area = vertical[1];
+                let gauge_area = vertical[2];
+                let input_area = vertical[3];
 
-            // ═══════════════════ STATUS BAR ═══════════════════
-            let search_label = if app.desktop.showing_splash() {
-                "→ workspace".to_string()
-            } else {
-                app.search.status_label()
-            };
-            crate::tui_render::draw_status_bar(f, status_area, &crate::tui_render::StatusBarData {
-                display_model: &app.display_model,
-                balance_label: &app.balance_label,
-                ctx_used_tokens: app.ctx_used_tokens,
-                budget: &app.display_budget,
-                mode_label: &mode_label,
-                goal_text: &goal_text,
-                search_label: &search_label,
-            });
+                // ═══════════════════ STATUS BAR ═══════════════════
+                let search_label = if app.desktop.showing_splash() {
+                    "→ workspace".to_string()
+                } else {
+                    app.search.status_label()
+                };
+                crate::tui_render::draw_status_bar(
+                    f,
+                    status_area,
+                    &crate::tui_render::StatusBarData {
+                        display_model: &app.display_model,
+                        balance_label: &app.balance_label,
+                        ctx_used_tokens: app.ctx_used_tokens,
+                        budget: &app.display_budget,
+                        mode_label: &approval_label,
+                        agent_mode: &agent_mode,
+                        goal_text: &goal_text,
+                        search_label: &search_label,
+                        tps: app.api_tps,
+                    },
+                );
 
-            // ═══════════════════ CONTENT: workspace ↔ splash (slide) ═══════════════════
-            let left_highlight = if app.search.active
-                && app.search.pane == crate::tui_render::Pane::Left
-                && !app.search.match_lines.is_empty()
-            {
-                Some(app.search.match_lines[app.search.match_idx])
-            } else {
-                None
-            };
-            let right_highlight = if app.search.active
-                && app.search.pane == crate::tui_render::Pane::Right
-                && !app.search.match_lines.is_empty()
-            {
-                Some(app.search.match_lines[app.search.match_idx])
-            } else {
-                None
-            };
+                // ═══════════════════ CONTENT: workspace ↔ splash (slide) ═══════════════════
+                let left_highlight = if app.search.active
+                    && app.search.pane == crate::tui_render::Pane::Left
+                    && !app.search.match_lines.is_empty()
+                {
+                    Some(app.search.match_lines[app.search.match_idx])
+                } else {
+                    None
+                };
+                let right_highlight = if app.search.active
+                    && app.search.pane == crate::tui_render::Pane::Right
+                    && !app.search.match_lines.is_empty()
+                {
+                    Some(app.search.match_lines[app.search.match_idx])
+                } else {
+                    None
+                };
 
-            let left_focused = app.focused_pane == Pane::Left;
-            let right_focused = app.focused_pane == Pane::Right;
+                let left_focused = app.focused_pane == Pane::Left;
+                let right_focused = app.focused_pane == Pane::Right;
 
-            crate::tui_render::draw_content_desktop(
-                f,
-                content_area,
-                &app.desktop,
-                &crate::tui_render::WorkspaceDrawData {
-                    left_committed: &app.left_committed,
-                    current_response: &app.current_response,
-                    trace_lines: &app.trace_lines,
-                    current_thinking: &app.current_thinking,
-                    left_scroll: app.left_scroll,
-                    right_scroll: app.right_scroll,
-                    left_focused,
-                    right_focused,
-                    scroll_flash_timer: app.scroll_flash_timer,
-                    left_highlight,
-                    right_highlight,
-                },
-                &crate::tui_render::SplashData {
-                    raven_art: &app.raven_art,
-                    base_url: &config.base_url,
-                    model: &app.display_model,
-                    workspace: &workspace_display,
-                },
-                &mut app.last_left_area,
-                &mut app.last_right_area,
-                &mut app.last_left_line_count,
-                &mut app.last_right_line_count,
-                &mut app.left_scroll,
-                &mut app.right_scroll,
-                app.left_follow_output,
-                app.right_follow_output,
-            );
+                crate::tui_render::draw_content_desktop(
+                    f,
+                    content_area,
+                    &app.desktop,
+                    &crate::tui_render::WorkspaceDrawData {
+                        left_committed: &app.left_committed,
+                        current_response: &app.current_response,
+                        trace_lines: &app.trace_lines,
+                        current_thinking: &app.current_thinking,
+                        left_scroll: app.left_scroll,
+                        right_scroll: app.right_scroll,
+                        left_focused,
+                        right_focused,
+                        scroll_flash_timer: app.scroll_flash_timer,
+                        left_highlight,
+                        right_highlight,
+                    },
+                    &crate::tui_render::SplashData {
+                        raven_art: &app.raven_art,
+                        base_url: &config.base_url,
+                        model: &app.display_model,
+                        workspace: &workspace_display,
+                    },
+                    &mut app.last_left_area,
+                    &mut app.last_right_area,
+                    &mut app.last_left_line_count,
+                    &mut app.last_right_line_count,
+                    &mut app.left_scroll,
+                    &mut app.right_scroll,
+                    app.left_follow_output,
+                    app.right_follow_output,
+                );
 
-            // ═══════════════════ CONTEXT GAUGE ═══════════════════
-            if show_gauge {
-                crate::tui_render::draw_context_gauge(f, gauge_area, &crate::tui_render::ContextGaugeData {
-                    turn_rounds: app.turn_rounds,
-                    max_rounds: config.max_rounds,
-                    tool_calls_this_turn: app.tool_calls_this_turn,
-                });
-            }
+                // ═══════════════════ CONTEXT GAUGE ═══════════════════
+                if show_gauge {
+                    crate::tui_render::draw_context_gauge(
+                        f,
+                        gauge_area,
+                        &crate::tui_render::ContextGaugeData {
+                            turn_rounds: app.turn_rounds,
+                            max_rounds: config.max_rounds,
+                            tool_calls_this_turn: app.tool_calls_this_turn,
+                        },
+                    );
+                }
 
-            // ═══════════════════ INPUT BAR ═══════════════════
-            crate::tui_render::draw_input_bar(f, input_area, &crate::tui_render::InputBarData {
-                input: &app.input,
-                is_processing: app.is_processing,
-                spinner_tick: app.spinner_tick,
-                search_mode: app.search_mode,
-                focused: app.focused_pane == Pane::Input,
-            });
+                // ═══════════════════ INPUT BAR ═══════════════════
+                crate::tui_render::draw_input_bar(
+                    f,
+                    input_area,
+                    &crate::tui_render::InputBarData {
+                        input: &app.input,
+                        is_processing: app.is_processing,
+                        spinner_tick: app.spinner_tick,
+                        search_mode: app.search_mode,
+                        focused: app.focused_pane == Pane::Input,
+                    },
+                );
 
-            // Overlays: approval popup, slash menu, mode menu, settings modal
-            crate::tui_render::draw_overlays(
-                f,
-                size,
-                input_area,
-                &app.settings,
-                app.pending_approval.as_deref(),
-                &app.slash_commands,
-                &app.input,
-                app.slash_selected,
-                app.mode_menu_active,
-                &app.approval_modes,
-                app.selected_mode_idx,
-            );
+                // Overlays: approval popup, slash menu, mode menu, settings modal
+                crate::tui_render::draw_overlays(
+                    f,
+                    size,
+                    input_area,
+                    &app.settings,
+                    app.pending_approval.as_deref(),
+                    &app.slash_commands,
+                    &app.input,
+                    app.slash_selected,
+                    app.mode_menu_active,
+                    &app.approval_modes,
+                    app.selected_mode_idx,
+                    app.agent_mode_menu_active,
+                    &app.agent_modes,
+                    app.selected_agent_mode_idx,
+                );
 
-            // Cursor in input — compute position from cursor_pos, handling multiline
-            app.clamp_cursor();
-            let text_before_cursor = &app.input[..app.cursor_pos];
-            let cursor_line = text_before_cursor.matches('\n').count() as u16;
-            let last_newline = text_before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
-            let cursor_col = app.input[last_newline..app.cursor_pos].chars().count() as u16;
-            f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
-            
-            // Decrement scroll flash timer
-            if app.scroll_flash_timer > 0 {
-              app.scroll_flash_timer = app.scroll_flash_timer.saturating_sub(1);
-            }
+                // Cursor in input — compute position from cursor_pos, handling multiline
+                app.clamp_cursor();
+                let text_before_cursor = &app.input[..app.cursor_pos];
+                let cursor_line = text_before_cursor.matches('\n').count() as u16;
+                let last_newline = text_before_cursor.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let cursor_col = app.input[last_newline..app.cursor_pos].chars().count() as u16;
+                f.set_cursor_position((
+                    input_area.x + 1 + cursor_col,
+                    input_area.y + 1 + cursor_line,
+                ));
 
-            if app.desktop.tick() {
-                app.needs_redraw = true;
-            }
-        })?;
+                // Decrement scroll flash timer
+                if app.scroll_flash_timer > 0 {
+                    app.scroll_flash_timer = app.scroll_flash_timer.saturating_sub(1);
+                }
+
+                if app.desktop.tick() {
+                    app.needs_redraw = true;
+                }
+            })?;
         }
 
         // Poll for new approval requests from the agent background task
         while let Ok((desc, tx)) = approval_req_rx.try_recv() {
-           app.pending_approval = Some(desc.clone());
-           app.approval_responder = Some(tx);
-           app.needs_redraw = true; // force a redraw so popup shows
-           app.clear_input();
-           app.trace_lines.push(format!("🔒 Approval requested for: {}", desc));
-           app.left_committed.push(format!("🔒 Approval requested for: {}", desc));
-           app.left_follow_output = true;
-           app.left_scroll = 10_000;
-           app.right_follow_output = true;
-           app.right_scroll = 10_000;
+            app.pending_approval = Some(desc.clone());
+            app.approval_responder = Some(tx);
+            app.needs_redraw = true; // force a redraw so popup shows
+            app.clear_input();
+            app.trace_lines
+                .push(format!("🔒 Approval requested for: {}", desc));
+            app.left_committed
+                .push(format!("🔒 Approval requested for: {}", desc));
+            app.left_follow_output = true;
+            app.left_scroll = 10_000;
+            app.right_follow_output = true;
+            app.right_scroll = 10_000;
         }
         // If we just picked up a NEW approval this iteration, force a redraw
         // so the popup is visible before we block on select! waiting for input.
         // The `app.needs_redraw` flag prevents a hot loop (only continue once).
         if app.needs_redraw {
-           app.needs_redraw = false;
+            app.needs_redraw = false;
             continue; // → top of loop → draw → select
         }
 
         // Handle input + agent updates (non-blocking)
         if app.is_processing {
             // While processing we mostly listen for agent updates and a few keys
-            tokio::select! {
-                Some(update) = rx.recv() => {
-                    // Always poll for approval requests on any agent update to ensure dialog shows promptly
-                    while let Ok((desc, tx)) = approval_req_rx.try_recv() {
-                       app.pending_approval = Some(desc.clone());
-                       app.approval_responder = Some(tx);
-                       app.clear_input();
-                      app.trace_lines.push(format!("🔒 Approval requested for: {}", desc));
-                       app.left_committed.push(format!("🔒 Approval requested for: {}", desc));
-                      app.left_follow_output = true;
-                      app.left_scroll = 10_000;
-                      app.right_follow_output = true;
-                      app.right_scroll = 10_000;
+            // Drain all pending messages from the channel before blocking on input
+            while let Ok(update) = rx.try_recv() {
+                // Always poll for approval requests on any agent update to ensure dialog shows promptly
+                while let Ok((desc, tx)) = approval_req_rx.try_recv() {
+                    app.pending_approval = Some(desc.clone());
+                    app.approval_responder = Some(tx);
+                    app.clear_input();
+                    app.trace_lines
+                        .push(format!("🔒 Approval requested for: {}", desc));
+                    app.left_committed
+                        .push(format!("🔒 Approval requested for: {}", desc));
+                    app.left_follow_output = true;
+                    app.left_scroll = 10_000;
+                    app.right_follow_output = true;
+                    app.right_scroll = 10_000;
+                }
+                match update {
+                    UiUpdate::Token(t) => {
+                        // Regular content tokens → live on the LEFT pane (current turn output)
+                        app.current_response.push_str(&t);
+                        // Track generation time using inter-token deltas (skips big gaps from tools etc.)
+                        let now = std::time::Instant::now();
+                        if let Some(last) = app.last_token_time {
+                            let delta = now.duration_since(last).as_secs_f64();
+                            if delta < 1.5 {
+                                app.generation_active_time += delta;
+                            }
+                        }
+                        app.last_token_time = Some(now);
+                        app.tokens_processed += 1;
+                        app.needs_redraw = true;
+                        app.left_follow_output = true;
+                        app.left_scroll = 10_000; // auto-scroll to bottom while streaming output
                     }
-                    match update {
-                        UiUpdate::Token(t) => {
-                            // Regular content tokens → live on the LEFT pane (current turn output)
-                           app.current_response.push_str(&t);
-                           app.needs_redraw = true;
-                          app.left_follow_output = true;
-                          app.left_scroll = 10_000; // auto-scroll to bottom while streaming output
+                    UiUpdate::Thinking(t) => {
+                        // Accumulate small thinking chunks (models often send 1-3 tokens at a time)
+                        // and only commit to app.trace_lines on reasonable boundaries.
+                        app.current_thinking.push_str(&t);
+                        // Track generation time using inter-token deltas (skips big gaps from tools etc.)
+                        let now = std::time::Instant::now();
+                        if let Some(last) = app.last_token_time {
+                            let delta = now.duration_since(last).as_secs_f64();
+                            if delta < 1.5 {
+                                app.generation_active_time += delta;
+                            }
                         }
-                        UiUpdate::Thinking(t) => {
-                            // Accumulate small thinking chunks (models often send 1-3 tokens at a time)
-                            // and only commit to app.trace_lines on reasonable boundaries.
-                          app.current_thinking.push_str(&t);
-                           app.needs_redraw = true;
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000; // auto-scroll trace pane on new thinking
+                        app.last_token_time = Some(now);
+                        app.tokens_processed += 1;
+                        app.needs_redraw = true;
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000; // auto-scroll trace pane on new thinking
 
-                            // Flush heuristic: paragraph break, sentence terminator + space, or size limit.
-                            // This turns "one word per line" into proper sentences/paragraphs in the trace.
-                            let should_flush =
-                              app.current_thinking.contains("\n\n") ||
-                              app.current_thinking.ends_with(". ") ||
-                              app.current_thinking.ends_with("! ") ||
-                              app.current_thinking.ends_with("? ") ||
-                              app.current_thinking.len() > 160;
+                        // Flush heuristic: paragraph break, sentence terminator + space, or size limit.
+                        // This turns "one word per line" into proper sentences/paragraphs in the trace.
+                        let should_flush = app.current_thinking.contains("\n\n")
+                            || app.current_thinking.ends_with(". ")
+                            || app.current_thinking.ends_with("! ")
+                            || app.current_thinking.ends_with("? ")
+                            || app.current_thinking.len() > 160;
 
-                            if should_flush {
-                                let block = app.current_thinking.trim().to_string();
-                                if !block.is_empty() {
-                                  app.trace_lines.push(format!("🧠 {}", block));
-                                  app.right_follow_output = true;
-                                  app.right_scroll = 10_000;
-                                }
-                              app.current_thinking.clear();
+                        if should_flush {
+                            let block = app.current_thinking.trim().to_string();
+                            if !block.is_empty() {
+                                app.trace_lines.push(format!("🧠 {}", block));
+                                app.right_follow_output = true;
+                                app.right_scroll = 10_000;
+                            }
+                            app.current_thinking.clear();
+                        }
+                    }
+                    UiUpdate::ToolStart { name, args } => {
+                        // Tool activity → RIGHT pane (debug)
+                        app.trace_lines
+                            .push(format!("🔧 {}({})", name, truncate(&args, 90)));
+                        app.tool_calls_this_turn += 1;
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
+                    }
+                    UiUpdate::ToolResult { name, summary } => {
+                        if name == "system" && summary.contains("JUDGE") {
+                            app.trace_lines
+                                .push(format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140)));
+                        } else {
+                            app.trace_lines.push(format!(
+                                "   ↳ {} → {}",
+                                name,
+                                truncate(&summary, 120)
+                            ));
+                        }
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
+                    }
+                    UiUpdate::RoundLimitHit {
+                        continuation,
+                        max_continuations,
+                        exhausted,
+                    } => {
+                        let msg = if exhausted {
+                            format!(
+                                "⏸ Round limit — exhausted auto-continue budget ({}/{}). Send another message to continue.",
+                                continuation, max_continuations
+                            )
+                        } else {
+                            format!(
+                                "⟳ Round limit hit — auto-continuing ({}/{})...",
+                                continuation, max_continuations
+                            )
+                        };
+                        app.trace_lines.push(msg);
+                        app.turn_rounds += 1;
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
+                    }
+                    UiUpdate::Done { final_text } => {
+                        // Turn complete. Flush the output.
+                        // Use the Done's final_text as a robust fallback in case no individual
+                        // Token updates were emitted by the stream (some llama.cpp configurations
+                        // deliver the full response only in the final payload).
+                        let mut output = if !final_text.trim().is_empty() {
+                            // Prefer the cleaned version from the Done payload (already stripped of XML tool call syntax)
+                            final_text
+                        } else if !app.current_response.trim().is_empty() {
+                            app.current_response.trim().to_string()
+                        } else if !app.current_thinking.trim().is_empty() {
+                            // Fallback: if the model delivered the response via the reasoning/thinking channel
+                            // (no regular content tokens), use it so output appears in the conversation pane.
+                            app.current_thinking.trim().to_string()
+                        } else {
+                            String::new()
+                        };
+                        if !output.trim().is_empty() {
+                            output = strip_xml_tool_call_blocks(&output);
+                        }
+                        if !output.is_empty() {
+                            app.left_committed.push(format!("Agent: {}", output));
+                            #[cfg(feature = "clipboard")]
+                            try_copy_to_clipboard(&output);
+                            app.left_follow_output = true;
+                            app.left_scroll = 10_000; // auto-scroll to bottom after agent response
+                            app.current_response.clear();
+                        }
+                        // Flush any remaining live thinking (to right trace pane)
+                        if !app.current_thinking.trim().is_empty() {
+                            app.trace_lines
+                                .push(format!("🧠 {}", app.current_thinking.trim()));
+                            app.current_thinking.clear();
+                        }
+                        if !app.trace_lines.is_empty() {
+                            app.right_follow_output = true;
+                            app.right_scroll = 10_000;
+                        }
+                        // Calculate TPS for this turn.
+                        // Use *generation active time* (only periods when we were actually
+                        // receiving tokens from the model). This excludes tool execution,
+                        // approvals, user interjects, multi-round gaps, etc.
+                        // This is why you were seeing 2-3 instead of ~45: full turn elapsed
+                        // was being used as the denominator for server completion_tokens.
+                        let _elapsed_secs = app
+                            .processing_start
+                            .expect("processing_start should be set")
+                            .elapsed()
+                            .as_secs_f64()
+                            .max(0.001);
+
+                        // Capture any final tiny delta from last token to Done processing.
+                        let now = std::time::Instant::now();
+                        if let Some(last) = app.last_token_time {
+                            let delta = now.duration_since(last).as_secs_f64();
+                            if delta < 1.5 {
+                                app.generation_active_time += delta;
                             }
                         }
-                        UiUpdate::ToolStart { name, args } => {
-                            // Tool activity → RIGHT pane (debug)
-                          app.trace_lines.push(format!("🔧 {}({})", name, truncate(&args, 90)));
-                           app.tool_calls_this_turn += 1;
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000;
+
+                        let gen_elapsed = app.generation_active_time.max(0.001);
+
+                        // Chunk-based TPS (from live Token/Thinking events)
+                        app.tps = app.tokens_processed as f64 / gen_elapsed;
+
+                        // Server-reported TPS (preferred when available): uses actual
+                        // completion_tokens from the /usage object.
+                        let completion_tokens = app.api_completion_tokens.unwrap_or(0) as f64;
+                        app.api_tps = if completion_tokens > 0.0 {
+                            completion_tokens / gen_elapsed
+                        } else {
+                            // fallback
+                            app.tps
+                        };
+
+                        app.tokens_processed = 0;
+                        app.generation_active_time = 0.0;
+                        app.last_token_time = None;
+                        app.api_prompt_tokens = None;
+                        app.api_completion_tokens = None;
+                        app.api_total_tokens = None;
+                        app.needs_redraw = true;
+                        app.is_processing = false;
+                        schedule_balance_refresh(&agent, &balance_tx);
+                    }
+                    UiUpdate::Error(e) => {
+                        let msg = format!("⚠ ERROR: {}", e);
+                        app.trace_lines.push(msg.clone());
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
+                        // Flush any pending thinking on error
+                        if !app.current_thinking.trim().is_empty() {
+                            app.trace_lines
+                                .push(format!("🧠 {}", app.current_thinking.trim()));
+                            app.current_thinking.clear();
                         }
-                        UiUpdate::ToolResult { name, summary } => {
-                          if name == "system" && summary.contains("JUDGE") {
-                              app.trace_lines.push(format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140)));
-                          } else {
-                              app.trace_lines.push(format!("   ↳ {} → {}", name, truncate(&summary, 120)));
-                          }
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000;
+                        // Make errors visible in the main left pane too
+                        app.left_committed.push(msg);
+                        if !app.current_response.trim().is_empty() {
+                            app.left_committed
+                                .push(format!("Agent (partial): {}", app.current_response.trim()));
+                            app.current_response.clear();
                         }
-                        UiUpdate::RoundLimitHit { continuation, max_continuations, exhausted } => {
-                            let msg = if exhausted {
-                                format!(
-                                    "⏸ Round limit — exhausted auto-continue budget ({}/{}). Send another message to continue.",
-                                    continuation, max_continuations
-                                )
-                            } else {
-                                format!(
-                                    "⟳ Round limit hit — auto-continuing ({}/{})...",
-                                    continuation, max_continuations
-                                )
-                            };
-                          app.trace_lines.push(msg);
-                           app.turn_rounds += 1;
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000;
+                        app.needs_redraw = true;
+                        app.is_processing = false;
+                        app.generation_active_time = 0.0;
+                        app.last_token_time = None;
+                        schedule_balance_refresh(&agent, &balance_tx);
+                    }
+                    UiUpdate::ApprovalRequested => {
+                        // Poll the approval channel here to set pending immediately
+                        while let Ok((desc, tx)) = approval_req_rx.try_recv() {
+                            app.pending_approval = Some(desc);
+                            app.approval_responder = Some(tx);
+                            app.needs_redraw = true;
+                            app.clear_input();
                         }
-                        UiUpdate::Done { final_text } => {
-                            // Turn complete. Flush the output.
-                            // Use the Done's final_text as a robust fallback in case no individual
-                            // Token updates were emitted by the stream (some llama.cpp configurations
-                            // deliver the full response only in the final payload).
-                            let mut output = if !final_text.trim().is_empty() {
-                                // Prefer the cleaned version from the Done payload (already stripped of XML tool call syntax)
-                                final_text
-                            } else if !app.current_response.trim().is_empty() {
-                                app.current_response.trim().to_string()
-                            } else if !app.current_thinking.trim().is_empty() {
-                                // Fallback: if the model delivered the response via the reasoning/thinking channel
-                                // (no regular content tokens), use it so output appears in the conversation pane.
-                                app.current_thinking.trim().to_string()
-                            } else {
-                                String::new()
-                            };
-                            if !output.trim().is_empty() {
-                                output = strip_xml_tool_call_blocks(&output);
-                            }
-                            if !output.is_empty() {
-                               app.left_committed.push(format!("Agent: {}", output));
-                                #[cfg(feature = "clipboard")]
-                                try_copy_to_clipboard(&output);
-                              app.left_follow_output = true;
-                              app.left_scroll = 10_000; // auto-scroll to bottom after agent response
-                               app.current_response.clear();
-                            }
-                            // Flush any remaining live thinking (to right trace pane)
-                            if !app.current_thinking.trim().is_empty() {
-                              app.trace_lines.push(format!("🧠 {}", app.current_thinking.trim()));
-                              app.current_thinking.clear();
-                            }
-                            if !app.trace_lines.is_empty() {
-                              app.right_follow_output = true;
-                              app.right_scroll = 10_000;
-                            }
-                          app.needs_redraw = true;
-                          app.is_processing = false;
-                          schedule_balance_refresh(&agent, &balance_tx);
-                        }
-                        UiUpdate::Error(e) => {
-                            let msg = format!("⚠ ERROR: {}", e);
-                          app.trace_lines.push(msg.clone());
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000;
-                            // Flush any pending thinking on error
-                            if !app.current_thinking.trim().is_empty() {
-                              app.trace_lines.push(format!("🧠 {}", app.current_thinking.trim()));
-                              app.current_thinking.clear();
-                            }
-                            // Make errors visible in the main left pane too
-                           app.left_committed.push(msg);
-                            if !app.current_response.trim().is_empty() {
-                               app.left_committed.push(format!("Agent (partial): {}", app.current_response.trim()));
-                               app.current_response.clear();
-                            }
-                          app.needs_redraw = true;
-                          app.is_processing = false;
-                          schedule_balance_refresh(&agent, &balance_tx);
-                        }
-                        UiUpdate::ApprovalRequested => {
-                            // Poll the approval channel here to set pending immediately
-                            while let Ok((desc, tx)) = approval_req_rx.try_recv() {
-                               app.pending_approval = Some(desc);
-                               app.approval_responder = Some(tx);
-                               app.needs_redraw = true;
-                               app.clear_input();
-                            }
-                            // Force a redraw so the dialog appears immediately
-                          app.left_follow_output = true;
-                          app.right_follow_output = true;
-                        }
-                        UiUpdate::ContextUsage { used_tokens } => {
-                          app.ctx_used_tokens = used_tokens;
-                        }
-                        UiUpdate::InterjectRestart => {
-                          app.current_response.clear();
-                          app.current_thinking.clear();
-                          app.needs_redraw = true;
-                          app.left_follow_output = true;
-                          app.left_scroll = 10_000;
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000;
-                        }
+                        // Force a redraw so the dialog appears immediately
+                        app.left_follow_output = true;
+                        app.right_follow_output = true;
+                    }
+                    UiUpdate::ContextUsage { used_tokens } => {
+                        app.ctx_used_tokens = used_tokens;
+                    }
+                    UiUpdate::InterjectRestart => {
+                        app.current_response.clear();
+                        app.current_thinking.clear();
+                        app.needs_redraw = true;
+                        app.left_follow_output = true;
+                        app.left_scroll = 10_000;
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
+                        // keep generation timers running; this is mid-turn
+                    }
+                    UiUpdate::Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                    } => {
+                        // Store API-reported usage for TPS calculation
+                        app.api_prompt_tokens = prompt_tokens;
+                        app.api_completion_tokens = completion_tokens;
+                        app.api_total_tokens = total_tokens;
                     }
                 }
-
-                // Allow the user to scroll AND type-ahead while processing
-                Some(ev) = input_rx.recv() => {
-                    match ev {
+            }
+            if let Ok(ev) = input_rx.try_recv() {
+                match ev {
                     Event::Paste(text) => {
                         if app.settings.active {
                             app.paste_into_settings(&text);
@@ -1306,12 +1516,23 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
 
                         if app.settings.active {
-                            apply_settings_key(&mut app, key, &config, &mut keystore, &agent, &balance_tx).await;
+                            apply_settings_key(
+                                &mut app,
+                                key,
+                                &config,
+                                &mut keystore,
+                                &agent,
+                                &balance_tx,
+                            )
+                            .await;
                             continue;
                         }
 
                         // Handle /mode selection menu
                         if app.handle_mode_menu_key(key, &agent).await {
+                            continue;
+                        }
+                        if app.handle_agent_mode_menu_key(key, &agent).await {
                             continue;
                         }
 
@@ -1333,25 +1554,32 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 if let Some(tx) = app.approval_responder.take() {
                                     let _ = tx.send(false);
                                 }
-                               app.pending_approval = None;
-                              app.trace_lines.push("⏹ Stop requested by user (Esc)".to_string());
-                               app.left_committed.push("⏹ Stopping agent...".to_string());
-                              app.left_follow_output = true;
-                              app.left_scroll = 10_000;
-                              app.right_follow_output = true;
-                              app.right_scroll = 10_000;
+                                app.pending_approval = None;
+                                app.trace_lines
+                                    .push("⏹ Stop requested by user (Esc)".to_string());
+                                app.left_committed.push("⏹ Stopping agent...".to_string());
+                                app.left_follow_output = true;
+                                app.left_scroll = 10_000;
+                                app.right_follow_output = true;
+                                app.right_scroll = 10_000;
                             }
 
-                            KeyCode::PageUp if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                            KeyCode::PageUp
+                                if matches!(app.focused_pane, Pane::Left | Pane::Right) =>
+                            {
                                 app.scroll_focused_page(-1, 8);
                             }
-                            KeyCode::PageDown if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                            KeyCode::PageDown
+                                if matches!(app.focused_pane, Pane::Left | Pane::Right) =>
+                            {
                                 app.scroll_focused_page(1, 8);
                             }
                             KeyCode::Up if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
                                 app.scroll_focused_line(-1);
                             }
-                            KeyCode::Down if matches!(app.focused_pane, Pane::Left | Pane::Right) => {
+                            KeyCode::Down
+                                if matches!(app.focused_pane, Pane::Left | Pane::Right) =>
+                            {
                                 app.scroll_focused_line(1);
                             }
                             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1362,8 +1590,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 app.insert_char('\n');
                                 app.needs_redraw = true;
                             }
-                            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
-                                || key.modifiers.contains(KeyModifiers::ALT) =>
+                            KeyCode::Enter
+                                if key.modifiers.contains(KeyModifiers::SHIFT)
+                                    || key.modifiers.contains(KeyModifiers::ALT) =>
                             {
                                 app.insert_char('\n');
                                 app.needs_redraw = true;
@@ -1377,16 +1606,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     &stop_signal,
                                 );
                             }
-                            KeyCode::Enter if !app.input.trim().is_empty()
-                                && !app.input.starts_with('/') =>
+                            KeyCode::Enter
+                                if !app.input.trim().is_empty() && !app.input.starts_with('/') =>
                             {
                                 let text = app.input.clone();
                                 app.submit_queued_interject(text, &queued_interject);
                             }
 
                             // Cursor movement during processing (desktop slide takes precedence)
-                            KeyCode::Left if app.route_left_to_desktop() && app.try_slide_to_splash() => {}
-                            KeyCode::Right if app.route_right_to_desktop() && app.try_slide_to_workspace() => {}
+                            KeyCode::Left
+                                if app.route_left_to_desktop() && app.try_slide_to_splash() => {}
+                            KeyCode::Right
+                                if app.route_right_to_desktop() && app.try_slide_to_workspace() => {
+                            }
                             _ => {
                                 if let Some(action) = map_key_to_edit(&key) {
                                     app.apply_edit_action(action);
@@ -1402,12 +1634,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                     }
                     _ => {}
-                    }
                 }
-
-                else => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
             continue;
         }
@@ -1415,7 +1644,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Normal input handling when idle — read from the input channel
         let input_ev = tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await;
         if let Ok(Some(ev)) = input_ev {
-                match ev {
+            match ev {
                 Event::Paste(text) => {
                     if app.settings.active {
                         app.paste_into_settings(&text);
@@ -1425,338 +1654,428 @@ async fn run_app<B: ratatui::backend::Backend>(
                     continue;
                 }
                 Event::Key(key) => {
-                if app.handle_approval_key(key) {
-                    continue;
-                }
-                if app.handle_mode_menu_key(key, &agent).await {
-                    continue;
-                }
-                if is_paste_key(&key) {
-                    app.handle_clipboard_paste_key();
-                    continue;
-                }
-                if app.settings.active {
-                    apply_settings_key(&mut app, key, &config, &mut keystore, &agent, &balance_tx).await;
-                    continue;
-                }
-                match key.code {
-                    // --- Slash command menu navigation (takes precedence when active) ---
-                    KeyCode::Up if app.focused_pane == Pane::Input && app.input.starts_with('/') => {
-                        let filtered = get_filtered_commands(&app.slash_commands, &app.input);
-                        if !filtered.is_empty() {
-                           app.slash_selected = app.slash_selected.saturating_sub(1);
-                        }
-                       app.needs_redraw = true;
+                    if app.handle_approval_key(key) {
+                        continue;
                     }
-                    KeyCode::Down if app.focused_pane == Pane::Input && app.input.starts_with('/') => {
-                        let filtered = get_filtered_commands(&app.slash_commands, &app.input);
-                        if !filtered.is_empty() {
-                           app.slash_selected = (app.slash_selected + 1).min(filtered.len().saturating_sub(1));
-                        }
-                       app.needs_redraw = true;
+                    if app.handle_mode_menu_key(key, &agent).await {
+                        continue;
                     }
-                    KeyCode::Tab if app.input.starts_with('/') => {
-                        let filtered = get_filtered_commands(&app.slash_commands, &app.input);
-                        if let Some(cmd) = filtered.get(app.slash_selected.min(filtered.len().saturating_sub(1))) {
-                            app.set_input(format!("/{} ", cmd.name));
-                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                        }
+                    if app.handle_agent_mode_menu_key(key, &agent).await {
+                        continue;
                     }
-
-                    // --- Focus cycling ---
-                    KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        app.cycle_focus_backward();
-                        app.needs_redraw = true;
+                    if is_paste_key(&key) {
+                        app.handle_clipboard_paste_key();
+                        continue;
                     }
-                    KeyCode::Tab => {
-                        app.cycle_focus_forward();
-                        app.needs_redraw = true;
+                    if app.settings.active {
+                        apply_settings_key(
+                            &mut app,
+                            key,
+                            &config,
+                            &mut keystore,
+                            &agent,
+                            &balance_tx,
+                        )
+                        .await;
+                        continue;
                     }
-                    KeyCode::Esc => {
-                        if app.input.starts_with('/') {
-                            // Dismiss command menu / clear partial command
-                            app.clear_input();
-                            app.slash_selected = 0;
-                        } else if app.search_mode {
-                            app.search_mode = false;
-                            app.search.active = false;
-                        } else {
-                            // Reset focus to conversation pane, resume following
-                            app.focused_pane = Pane::Left;
-                            app.left_follow_output = true;
-                            app.right_follow_output = true;
-                        }
-                    }
-
-                    // --- Ctrl+C: exit ---
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        return Ok(());
-                    }
-
-                    // --- Multiline: Ctrl+J (reliable), Shift+Enter, or Alt+Enter inserts newline ---
-                    // Most terminals can't distinguish Shift+Enter from Enter,
-                    // but Ctrl+J (ASCII line feed) always works.
-                    KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        app.insert_char('\n');
-                        app.needs_redraw = true;
-                    }
-                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT)
-                        || key.modifiers.contains(KeyModifiers::ALT) => {
-                        app.insert_char('\n');
-                        app.needs_redraw = true;
-                    }
-
-                    // --- Enter: submit prompt (works from any pane) ---
-                    KeyCode::Enter => {
-                        let prompt = app.input.trim().to_string();
-                        if !prompt.is_empty() {
-                            if app.input_history.last() != Some(&prompt) {
-                                app.input_history.push(prompt.clone());
+                    match key.code {
+                        // --- Slash command menu navigation (takes precedence when active) ---
+                        KeyCode::Up
+                            if app.focused_pane == Pane::Input && app.input.starts_with('/') =>
+                        {
+                            let filtered = get_filtered_commands(&app.slash_commands, &app.input);
+                            if !filtered.is_empty() {
+                                app.slash_selected = app.slash_selected.saturating_sub(1);
                             }
-                            app.history_index = None;
+                            app.needs_redraw = true;
                         }
-                        if prompt.is_empty() {
-                            // nothing to do
-                        } else if prompt.starts_with('/') {
-                            let mut slash_ctx = SlashContext {
-                                left_committed: &mut app.left_committed,
-                                trace_lines: &mut app.trace_lines,
-                                current_response: &app.current_response,
-                                current_thinking: &app.current_thinking,
-                                input: &mut app.input,
-                                cursor_pos: &mut app.cursor_pos,
-                                slash_commands: &app.slash_commands,
-                                slash_selected: &mut app.slash_selected,
-                                mode_menu_active: &mut app.mode_menu_active,
-                                selected_mode_idx: &mut app.selected_mode_idx,
-                                settings: &mut app.settings,
-                                search: &mut app.search,
-                                focused_pane: render_pane(app.focused_pane),
-                                left_scroll: &mut app.left_scroll,
-                                right_scroll: &mut app.right_scroll,
-                                left_follow_output: &mut app.left_follow_output,
-                                right_follow_output: &mut app.right_follow_output,
-                                last_left_line_count: app.last_left_line_count,
-                                last_right_line_count: app.last_right_line_count,
-                                last_left_area_h: app.last_left_area.height,
-                                last_right_area_h: app.last_right_area.height,
-                                config: &config,
-                                keystore: &keystore,
-                                agent: &agent,
-                            };
-                            match dispatch_slash_command(&prompt, &mut slash_ctx) {
-                                SlashDispatch::Quit => return Ok(()),
-                                SlashDispatch::Handled => {
-                                    // /search sets pane scroll via apply_search_scroll; don't jump to bottom.
-                                    if app.search.active
-                                        && !app.search.query.is_empty()
-                                        && !app.search.match_lines.is_empty()
-                                    {
-                                        app.needs_redraw = true;
-                                    } else {
-                                        app.left_follow_output = true;
-                                        app.left_scroll = 10_000;
-                                        app.needs_redraw = true;
-                                    }
+                        KeyCode::Down
+                            if app.focused_pane == Pane::Input && app.input.starts_with('/') =>
+                        {
+                            let filtered = get_filtered_commands(&app.slash_commands, &app.input);
+                            if !filtered.is_empty() {
+                                app.slash_selected =
+                                    (app.slash_selected + 1).min(filtered.len().saturating_sub(1));
+                            }
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Tab if app.input.starts_with('/') => {
+                            let filtered = get_filtered_commands(&app.slash_commands, &app.input);
+                            if let Some(cmd) = filtered
+                                .get(app.slash_selected.min(filtered.len().saturating_sub(1)))
+                            {
+                                app.set_input(format!("/{} ", cmd.name));
+                                clamp_slash_selection(
+                                    &app.slash_commands,
+                                    &app.input,
+                                    &mut app.slash_selected,
+                                );
+                            }
+                        }
+
+                        // --- Focus cycling ---
+                        KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                            app.cycle_focus_backward();
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Tab => {
+                            app.cycle_focus_forward();
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Esc => {
+                            if app.input.starts_with('/') {
+                                // Dismiss command menu / clear partial command
+                                app.clear_input();
+                                app.slash_selected = 0;
+                            } else if app.search_mode {
+                                app.search_mode = false;
+                                app.search.active = false;
+                            } else {
+                                // Reset focus to conversation pane, resume following
+                                app.focused_pane = Pane::Left;
+                                app.left_follow_output = true;
+                                app.right_follow_output = true;
+                            }
+                        }
+
+                        // --- Ctrl+C: exit ---
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
+                        }
+
+                        // --- Multiline: Ctrl+J (reliable), Shift+Enter, or Alt+Enter inserts newline ---
+                        // Most terminals can't distinguish Shift+Enter from Enter,
+                        // but Ctrl+J (ASCII line feed) always works.
+                        KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.insert_char('\n');
+                            app.needs_redraw = true;
+                        }
+                        KeyCode::Enter
+                            if key.modifiers.contains(KeyModifiers::SHIFT)
+                                || key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            app.insert_char('\n');
+                            app.needs_redraw = true;
+                        }
+
+                        // --- Enter: submit prompt (works from any pane) ---
+                        KeyCode::Enter => {
+                            let prompt = app.input.trim().to_string();
+                            if !prompt.is_empty() {
+                                if app.input_history.last() != Some(&prompt) {
+                                    app.input_history.push(prompt.clone());
                                 }
-                                SlashDispatch::AgentPrompt(()) => {}
+                                app.history_index = None;
                             }
-                            app.cursor_pos = app.input.len(); // reset cursor after slash clears input
-                        } else {
-                            // === Normal user prompt to the agent ===
-                            // Commit any previous live response (from last turn) if present
-                            // Guard against duplicate if Done already committed it.
-                            if !app.current_response.trim().is_empty() {
-                                let agent_msg = format!("Agent: {}", app.current_response.trim());
-                                if app.left_committed.last() != Some(&agent_msg) {
-                                    app.left_committed.push(agent_msg);
-                                }
-                            }
-
-                            // New turn: record user prompt on left, clear live + trace for fresh view
-                           app.left_committed.push(format!("You: {}", prompt));
-                          app.left_follow_output = true;
-                          app.left_scroll = 10_000; // auto-scroll to bottom on new user message
-                           app.current_response.clear();
-                          app.trace_lines.clear();
-                          app.current_thinking.clear();
-                          app.trace_lines.push(format!("▶ Starting agent turn for: {}", prompt));
-                          app.trace_lines.push("   (waiting for first response from model...)".to_string());
-                          app.right_follow_output = true;
-                          app.right_scroll = 10_000; // auto-scroll trace pane on new turn start
-
-                           app.clear_input();
-                           app.slash_selected = 0;
-                           app.is_processing = true;
-                           app.tool_calls_this_turn = 0;
-                           app.turn_rounds = 0;
-
-                            // Spawn the agent turn — now using the unified drive_turn() via TuiObserver.
-                            // The observer delivers UI events and handles live approvals + interjects.
-                            // All nudges, auto-continue, finish_reason handling etc. come from one place.
-                            let tx2 = tx.clone();
-                            let agent_clone = agent.clone();
-                            let prompt2 = prompt.clone();
-
-                            let approval_req_tx2 = approval_req_tx.clone();
-                            let stop = stop_signal.clone();
-                            let queued = queued_interject.clone();
-                            let instant = instant_interject.clone();
-                            stop.store(false, Ordering::SeqCst); // reset for new turn
-                            if let Ok(mut slot) = queued.lock() {
-                                *slot = None;
-                            }
-                            if let Ok(mut slot) = instant.lock() {
-                                *slot = None;
-                            }
-                            tokio::spawn(async move {
-                                let mut agent = agent_clone.lock().await;
-
-                                let mode = agent.current_exec_mode();
-                                let _ = tx2.send(UiUpdate::ToolResult {
-                                    name: "system".into(),
-                                    summary: format!("Turn started with exec mode: {:?}", mode),
-                                }).await;
-
-                                let mut observer = TuiObserver {
-                                    tx: tx2.clone(),
-                                    approval_req_tx: approval_req_tx2,
-                                    stop,
-                                    queued,
-                                    instant,
-                                    denials_this_turn: 0,
-                                    halt_tools: false,
-                                    exec_mode: mode,
+                            if prompt.is_empty() {
+                                // nothing to do
+                            } else if prompt.starts_with('/') {
+                                let mut slash_ctx = SlashContext {
+                                    left_committed: &mut app.left_committed,
+                                    trace_lines: &mut app.trace_lines,
+                                    current_response: &app.current_response,
+                                    current_thinking: &app.current_thinking,
+                                    input: &mut app.input,
+                                    cursor_pos: &mut app.cursor_pos,
+                                    slash_commands: &app.slash_commands,
+                                    slash_selected: &mut app.slash_selected,
+                                    mode_menu_active: &mut app.mode_menu_active,
+                                    selected_mode_idx: &mut app.selected_mode_idx,
+                                    agent_mode_menu_active: &mut app.agent_mode_menu_active,
+                                    selected_agent_mode_idx: &mut app.selected_agent_mode_idx,
+                                    settings: &mut app.settings,
+                                    search: &mut app.search,
+                                    focused_pane: render_pane(app.focused_pane),
+                                    left_scroll: &mut app.left_scroll,
+                                    right_scroll: &mut app.right_scroll,
+                                    left_follow_output: &mut app.left_follow_output,
+                                    right_follow_output: &mut app.right_follow_output,
+                                    last_left_line_count: app.last_left_line_count,
+                                    last_right_line_count: app.last_right_line_count,
+                                    last_left_area_h: app.last_left_area.height,
+                                    last_right_area_h: app.last_right_area.height,
+                                    config: &config,
+                                    keystore: &keystore,
+                                    agent: &agent,
                                 };
-
-                                let result = raven_tui::agent_driver::drive_turn(&mut agent, &prompt2, &mut observer).await;
-
-                                match result {
-                                    Ok(r) => {
-                                        let _ = tx2.send(UiUpdate::Done { final_text: r.final_text }).await;
+                                match dispatch_slash_command(&prompt, &mut slash_ctx) {
+                                    SlashDispatch::Quit => return Ok(()),
+                                    SlashDispatch::Handled => {
+                                        // /search sets pane scroll via apply_search_scroll; don't jump to bottom.
+                                        if app.search.active
+                                            && !app.search.query.is_empty()
+                                            && !app.search.match_lines.is_empty()
+                                        {
+                                            app.needs_redraw = true;
+                                        } else {
+                                            app.left_follow_output = true;
+                                            app.left_scroll = 10_000;
+                                            app.needs_redraw = true;
+                                        }
                                     }
-                                    Err(e) => {
-                                        let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
+                                    SlashDispatch::AgentPrompt(()) => {}
+                                }
+                                app.cursor_pos = app.input.len(); // reset cursor after slash clears input
+                            } else {
+                                // === Normal user prompt to the agent ===
+                                // Commit any previous live response (from last turn) if present
+                                // Guard against duplicate if Done already committed it.
+                                if !app.current_response.trim().is_empty() {
+                                    let agent_msg =
+                                        format!("Agent: {}", app.current_response.trim());
+                                    if app.left_committed.last() != Some(&agent_msg) {
+                                        app.left_committed.push(agent_msg);
                                     }
                                 }
-                            });
-                        }
-                    }
-                    // --- History recall (Ctrl+Up / Ctrl+Down always works) ---
-                    KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if !app.input_history.is_empty() {
-                            let idx = match app.history_index {
-                                Some(i) if i > 0 => i - 1,
-                                Some(i) => i,
-                                None => app.input_history.len() - 1,
-                            };
-                            app.history_index = Some(idx);
-                            app.set_input(app.input_history[idx].clone());
-                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                            app.needs_redraw = true;
-                        }
-                    }
-                    KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        if let Some(i) = app.history_index {
-                            if i + 1 < app.input_history.len() {
-                                let next = i + 1;
-                                app.history_index = Some(next);
-                                app.set_input(app.input_history[next].clone());
-                            } else {
-                                app.history_index = None;
+
+                                // New turn: record user prompt on left, clear live + trace for fresh view
+                                app.left_committed.push(format!("You: {}", prompt));
+                                app.left_follow_output = true;
+                                app.left_scroll = 10_000; // auto-scroll to bottom on new user message
+                                app.current_response.clear();
+                                app.trace_lines.clear();
+                                app.current_thinking.clear();
+                                app.trace_lines
+                                    .push(format!("▶ Starting agent turn for: {}", prompt));
+                                app.trace_lines.push(
+                                    "   (waiting for first response from model...)".to_string(),
+                                );
+                                app.right_follow_output = true;
+                                app.right_scroll = 10_000; // auto-scroll trace pane on new turn start
+
                                 app.clear_input();
+                                app.slash_selected = 0;
+                                app.is_processing = true;
+                                app.processing_start = Some(std::time::Instant::now());
+                                app.tokens_processed = 0;
+                                app.generation_active_time = 0.0;
+                                app.last_token_time = None;
+                                app.tool_calls_this_turn = 0;
+                                app.turn_rounds = 0;
+
+                                // Spawn the agent turn — now using the unified drive_turn() via TuiObserver.
+                                // The observer delivers UI events and handles live approvals + interjects.
+                                // All nudges, auto-continue, finish_reason handling etc. come from one place.
+                                let tx2 = tx.clone();
+                                let agent_clone = agent.clone();
+                                let prompt2 = prompt.clone();
+
+                                let approval_req_tx2 = approval_req_tx.clone();
+                                let stop = stop_signal.clone();
+                                let queued = queued_interject.clone();
+                                let instant = instant_interject.clone();
+                                stop.store(false, Ordering::SeqCst); // reset for new turn
+                                if let Ok(mut slot) = queued.lock() {
+                                    *slot = None;
+                                }
+                                if let Ok(mut slot) = instant.lock() {
+                                    *slot = None;
+                                }
+                                tokio::spawn(async move {
+                                    let mut agent = agent_clone.lock().await;
+
+                                    let mode = agent.current_exec_mode();
+                                    let _ = tx2
+                                        .send(UiUpdate::ToolResult {
+                                            name: "system".into(),
+                                            summary: format!(
+                                                "Turn started with exec mode: {:?}",
+                                                mode
+                                            ),
+                                        })
+                                        .await;
+
+                                    let mut observer = TuiObserver {
+                                        tx: tx2.clone(),
+                                        approval_req_tx: approval_req_tx2,
+                                        stop,
+                                        queued,
+                                        instant,
+                                        denials_this_turn: 0,
+                                        halt_tools: false,
+                                        exec_mode: mode,
+                                    };
+
+                                    let result = raven_tui::agent_driver::drive_turn(
+                                        &mut agent,
+                                        &prompt2,
+                                        &mut observer,
+                                    )
+                                    .await;
+
+                                    match result {
+                                        Ok(r) => {
+                                            // Send usage data for TPS calculation
+                                            let metrics = &r.metrics;
+                                            let _ = tx2
+                                                .send(UiUpdate::Usage {
+                                                    prompt_tokens: Some(
+                                                        metrics.prompt_tokens as u32,
+                                                    ),
+                                                    completion_tokens: Some(
+                                                        metrics.completion_tokens as u32,
+                                                    ),
+                                                    total_tokens: Some(metrics.total_tokens as u32),
+                                                })
+                                                .await;
+                                            let _ = tx2
+                                                .send(UiUpdate::Done {
+                                                    final_text: r.final_text,
+                                                })
+                                                .await;
+                                        }
+                                        Err(e) => {
+                                            let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
+                                        }
+                                    }
+                                });
                             }
-                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                            app.needs_redraw = true;
                         }
-                    }
-
-                    // --- Desktop slide (pane focus) or cursor navigation (input) ---
-                    KeyCode::Left
-                        if !app.mode_menu_active
-                            && app.pending_approval.is_none()
-                            && app.route_left_to_desktop()
-                            && app.try_slide_to_splash() => {}
-                    KeyCode::Right
-                        if !app.mode_menu_active
-                            && app.pending_approval.is_none()
-                            && app.route_right_to_desktop()
-                            && app.try_slide_to_workspace() => {}
-
-                    // --- Context-sensitive Up/Down ---
-                    // When Input focused: history recall
-                    KeyCode::Up if !app.mode_menu_active && app.focused_pane == Pane::Input => {
-                        if !app.input_history.is_empty() {
-                            let idx = match app.history_index {
-                                Some(i) if i > 0 => i - 1,
-                                Some(i) => i,
-                                None => app.input_history.len() - 1,
-                            };
-                            app.history_index = Some(idx);
-                            app.set_input(app.input_history[idx].clone());
-                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                            app.needs_redraw = true;
+                        // --- History recall (Ctrl+Up / Ctrl+Down always works) ---
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if !app.input_history.is_empty() {
+                                let idx = match app.history_index {
+                                    Some(i) if i > 0 => i - 1,
+                                    Some(i) => i,
+                                    None => app.input_history.len() - 1,
+                                };
+                                app.history_index = Some(idx);
+                                app.set_input(app.input_history[idx].clone());
+                                clamp_slash_selection(
+                                    &app.slash_commands,
+                                    &app.input,
+                                    &mut app.slash_selected,
+                                );
+                                app.needs_redraw = true;
+                            }
                         }
-                    }
-                    KeyCode::Down if !app.mode_menu_active && app.focused_pane == Pane::Input => {
-                        if let Some(i) = app.history_index {
-                            if i + 1 < app.input_history.len() {
-                                let next = i + 1;
-                                app.history_index = Some(next);
-                                app.set_input(app.input_history[next].clone());
-                            } else {
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(i) = app.history_index {
+                                if i + 1 < app.input_history.len() {
+                                    let next = i + 1;
+                                    app.history_index = Some(next);
+                                    app.set_input(app.input_history[next].clone());
+                                } else {
+                                    app.history_index = None;
+                                    app.clear_input();
+                                }
+                                clamp_slash_selection(
+                                    &app.slash_commands,
+                                    &app.input,
+                                    &mut app.slash_selected,
+                                );
+                                app.needs_redraw = true;
+                            }
+                        }
+
+                        // --- Desktop slide (pane focus) or cursor navigation (input) ---
+                        KeyCode::Left
+                            if !app.mode_menu_active
+                                && !app.agent_mode_menu_active
+                                && app.pending_approval.is_none()
+                                && app.route_left_to_desktop()
+                                && app.try_slide_to_splash() => {}
+                        KeyCode::Right
+                            if !app.mode_menu_active
+                                && !app.agent_mode_menu_active
+                                && app.pending_approval.is_none()
+                                && app.route_right_to_desktop()
+                                && app.try_slide_to_workspace() => {}
+
+                        // --- Context-sensitive Up/Down ---
+                        // When Input focused: history recall
+                        KeyCode::Up if !app.mode_menu_active && !app.agent_mode_menu_active && app.focused_pane == Pane::Input => {
+                            if !app.input_history.is_empty() {
+                                let idx = match app.history_index {
+                                    Some(i) if i > 0 => i - 1,
+                                    Some(i) => i,
+                                    None => app.input_history.len() - 1,
+                                };
+                                app.history_index = Some(idx);
+                                app.set_input(app.input_history[idx].clone());
+                                clamp_slash_selection(
+                                    &app.slash_commands,
+                                    &app.input,
+                                    &mut app.slash_selected,
+                                );
+                                app.needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Down
+                            if !app.mode_menu_active && !app.agent_mode_menu_active && app.focused_pane == Pane::Input =>
+                        {
+                            if let Some(i) = app.history_index {
+                                if i + 1 < app.input_history.len() {
+                                    let next = i + 1;
+                                    app.history_index = Some(next);
+                                    app.set_input(app.input_history[next].clone());
+                                } else {
+                                    app.history_index = None;
+                                    app.clear_input();
+                                }
+                                clamp_slash_selection(
+                                    &app.slash_commands,
+                                    &app.input,
+                                    &mut app.slash_selected,
+                                );
+                                app.needs_redraw = true;
+                            }
+                        }
+
+                        // Scroll focused pane (conversation or trace)
+                        KeyCode::Up if !app.mode_menu_active && !app.agent_mode_menu_active => {
+                            app.scroll_focused_line(-1);
+                        }
+                        KeyCode::Down if !app.mode_menu_active && !app.agent_mode_menu_active => {
+                            app.scroll_focused_line(1);
+                        }
+
+                        // PageUp/PageDown: Shift scrolls trace pane, default scrolls conversation
+                        KeyCode::PageUp
+                            if !app.mode_menu_active
+                                && !app.agent_mode_menu_active
+                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            app.scroll_pane_page(Pane::Right, -1, 12);
+                        }
+                        KeyCode::PageUp if !app.mode_menu_active && !app.agent_mode_menu_active => {
+                            app.scroll_pane_page(Pane::Left, -1, 12);
+                        }
+                        KeyCode::PageDown
+                            if !app.mode_menu_active
+                                && !app.agent_mode_menu_active
+                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                        {
+                            app.scroll_pane_page(Pane::Right, 1, 12);
+                        }
+                        KeyCode::PageDown if !app.mode_menu_active && !app.agent_mode_menu_active => {
+                            app.scroll_pane_page(Pane::Left, 1, 12);
+                        }
+
+                        // --- Text editing (always active, chars go to input from any pane) ---
+                        _ if !app.mode_menu_active
+                            && !app.agent_mode_menu_active
+                            && app.pending_approval.is_none()
+                            && map_key_to_edit(&key).is_some() =>
+                        {
+                            if let Some(action) = map_key_to_edit(&key) {
+                                app.apply_edit_action(action);
                                 app.history_index = None;
-                                app.clear_input();
+                                clamp_slash_selection(
+                                    &app.slash_commands,
+                                    &app.input,
+                                    &mut app.slash_selected,
+                                );
+                                app.needs_redraw = true;
                             }
-                            clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-                            app.needs_redraw = true;
                         }
-                    }
 
-                    // Scroll focused pane (conversation or trace)
-                    KeyCode::Up if !app.mode_menu_active => {
-                        app.scroll_focused_line(-1);
+                        _ => {}
                     }
-                    KeyCode::Down if !app.mode_menu_active => {
-                        app.scroll_focused_line(1);
-                    }
-
-                    // PageUp/PageDown: Shift scrolls trace pane, default scrolls conversation
-                    KeyCode::PageUp if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        app.scroll_pane_page(Pane::Right, -1, 12);
-                    }
-                    KeyCode::PageUp if !app.mode_menu_active => {
-                        app.scroll_pane_page(Pane::Left, -1, 12);
-                    }
-                    KeyCode::PageDown if !app.mode_menu_active && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        app.scroll_pane_page(Pane::Right, 1, 12);
-                    }
-                    KeyCode::PageDown if !app.mode_menu_active => {
-                        app.scroll_pane_page(Pane::Left, 1, 12);
-                    }
-
-                    // --- Text editing (always active, chars go to input from any pane) ---
-                    _ if !app.mode_menu_active
-                        && app.pending_approval.is_none()
-                        && map_key_to_edit(&key).is_some() =>
-                    {
-                        if let Some(action) = map_key_to_edit(&key) {
-                            app.apply_edit_action(action);
-                            app.history_index = None;
-                            clamp_slash_selection(
-                                &app.slash_commands,
-                                &app.input,
-                                &mut app.slash_selected,
-                            );
-                            app.needs_redraw = true;
-                        }
-                    }
-
-                    _ => {}
-                }
                 }
                 _ => {}
-                }
+            }
         }
     }
 }
@@ -1767,16 +2086,35 @@ async fn run_app<B: ratatui::backend::Backend>(
 enum UiUpdate {
     Token(String),
     Thinking(String),
-    ToolStart { name: String, args: String },
-    ToolResult { name: String, summary: String },
-    RoundLimitHit { continuation: u32, max_continuations: u32, exhausted: bool },
-    Done { final_text: String },
+    ToolStart {
+        name: String,
+        args: String,
+    },
+    ToolResult {
+        name: String,
+        summary: String,
+    },
+    RoundLimitHit {
+        continuation: u32,
+        max_continuations: u32,
+        exhausted: bool,
+    },
+    Done {
+        final_text: String,
+    },
     Error(String),
-    ApprovalRequested,  // wake the UI so it can display the dialog from the approval channel
-    ContextUsage { used_tokens: u32 }, // pushed from agent task after tool rounds
+    ApprovalRequested, // wake the UI so it can display the dialog from the approval channel
+    ContextUsage {
+        used_tokens: u32,
+    }, // pushed from agent task after tool rounds
     InterjectRestart,
+    // API-reported usage data for TPS calculation
+    Usage {
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+        total_tokens: Option<u32>,
+    },
 }
-
 
 /// Truncate a string for display, respecting UTF-8 char boundaries.
 fn truncate(s: &str, max: usize) -> String {
@@ -1825,7 +2163,7 @@ impl TurnObserver for TuiObserver {
     }
 
     fn on_tool_result(&mut self, record: &raven_tui::agent::ActionRecord) {
-        let summary = record.summary.clone();  // judge summaries already include ⭐ from driver
+        let summary = record.summary.clone(); // judge summaries already include ⭐ from driver
         let _ = self.tx.try_send(UiUpdate::ToolResult {
             name: record.tool.clone(),
             summary,
@@ -1835,7 +2173,10 @@ impl TurnObserver for TuiObserver {
     fn on_nudge(&mut self, count: u32, max: u32) {
         let _ = self.tx.try_send(UiUpdate::ToolResult {
             name: "system".into(),
-            summary: format!("Nudging agent to continue (text-only pause {}/{})", count, max),
+            summary: format!(
+                "Nudging agent to continue (text-only pause {}/{})",
+                count, max
+            ),
         });
     }
 
@@ -1855,7 +2196,9 @@ impl TurnObserver for TuiObserver {
     }
 
     fn on_context_usage(&mut self, tokens: u32) {
-        let _ = self.tx.try_send(UiUpdate::ContextUsage { used_tokens: tokens });
+        let _ = self.tx.try_send(UiUpdate::ContextUsage {
+            used_tokens: tokens,
+        });
     }
 
     fn should_stop(&self) -> bool {
@@ -1903,9 +2246,7 @@ impl TurnObserver for TuiObserver {
         // UI will show dialog and respond via the oneshot.
         // If approved, the caller (drive_turn) will emit on_tool_start right after.
         match resp_rx.await {
-            Ok(true) => {
-                true
-            }
+            Ok(true) => true,
             _ => {
                 let deny = format!(
                     "DENIED: The user refused to approve this {} action. \
@@ -1915,10 +2256,13 @@ impl TurnObserver for TuiObserver {
                     name
                 );
                 self.denials_this_turn += 1;
-                let _ = self.tx.send(UiUpdate::ToolResult {
-                    name: name.clone(),
-                    summary: deny.clone(),
-                }).await;
+                let _ = self
+                    .tx
+                    .send(UiUpdate::ToolResult {
+                        name: name.clone(),
+                        summary: deny.clone(),
+                    })
+                    .await;
 
                 if self.denials_this_turn >= 3 {
                     let _ = self.tx.send(UiUpdate::ToolResult {
@@ -1944,7 +2288,11 @@ impl TuiObserver {
         let is_outside = if name == "exec" {
             let cmd = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
-                .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_owned()))
+                .and_then(|v| {
+                    v.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_owned())
+                })
                 .unwrap_or_default();
             cmd.contains("cd /")
                 || cmd.contains("/etc")
@@ -1969,7 +2317,11 @@ impl TuiObserver {
             "write" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
                 let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
-                let n = v.get("content").and_then(|c| c.as_str()).map(|s| s.len()).unwrap_or(0);
+                let n = v
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .map(|s| s.len())
+                    .unwrap_or(0);
                 format!("write {} ({} bytes)", path, n)
             }
             "patch" => {
@@ -1985,7 +2337,10 @@ impl TuiObserver {
             }
             "update_goal" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
-                let goal = v.get("goal").and_then(|g| g.as_str()).map(|s| s.to_string())
+                let goal = v
+                    .get("goal")
+                    .and_then(|g| g.as_str())
+                    .map(|s| s.to_string())
                     .unwrap_or_else(|| args.to_string());
                 format!("update_goal: {}", truncate(&goal, 80))
             }

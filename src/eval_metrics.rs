@@ -15,13 +15,15 @@ struct MetricsFile {
     smoke: Option<Value>,
 }
 
-
-
 fn baselines_path() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("evals/baselines/metrics.json")
 }
 
-pub fn assert_smoke_metrics(scenario: &SmokeScenario, result: &TurnResult, harness: &crate::runtime::EvalHarness) -> Result<()> {
+pub fn assert_smoke_metrics(
+    scenario: &SmokeScenario,
+    result: &TurnResult,
+    harness: &crate::runtime::EvalHarness,
+) -> Result<()> {
     if !harness.assert_strict {
         return Ok(());
     }
@@ -73,18 +75,15 @@ pub fn write_turn_metrics(
     model: &str,
     max_rounds: u32,
 ) -> Result<()> {
-    let tool_counts: serde_json::Map<String, Value> = result
-        .actions
-        .iter()
-        .fold(serde_json::Map::new(), |mut acc, a| {
-            let n = acc
-                .get(&a.tool)
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0)
-                + 1;
-            acc.insert(a.tool.clone(), json!(n));
-            acc
-        });
+    let tool_counts: serde_json::Map<String, Value> =
+        result
+            .actions
+            .iter()
+            .fold(serde_json::Map::new(), |mut acc, a| {
+                let n = acc.get(&a.tool).and_then(|v| v.as_u64()).unwrap_or(0) + 1;
+                acc.insert(a.tool.clone(), json!(n));
+                acc
+            });
 
     let payload = json!({
         "version": 1,

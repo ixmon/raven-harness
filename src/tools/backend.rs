@@ -6,7 +6,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use super::{browse, exec, grep_files, list_dir, patch_file, read_file, safe_truncate, web_search, write_file};
+use super::{
+    browse, exec, grep_files, list_dir, patch_file, read_file, safe_truncate, web_search,
+    write_file,
+};
 
 /// How tool calls are fulfilled (real side effects vs scripted eval responses).
 #[derive(Clone, Debug, Default)]
@@ -226,7 +229,10 @@ async fn real_execute(
         "browse" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-            let extract = args.get("extract").and_then(|v| v.as_str()).unwrap_or("text");
+            let extract = args
+                .get("extract")
+                .and_then(|v| v.as_str())
+                .unwrap_or("text");
             Ok(browse(url, depth, extract).await)
         }
         "update_goal" => {
@@ -266,9 +272,7 @@ mod tests {
             "list": { ".": "README.md\n", "default": "empty\n" },
             "read": { "README.md": "# mock\n" }
         }));
-        let list = m
-            .lookup("list", &json!({ "path": "." }))
-            .expect("list .");
+        let list = m.lookup("list", &json!({ "path": "." })).expect("list .");
         assert!(list.contains("README"));
         let read = m
             .lookup("read", &json!({ "path": "README.md" }))

@@ -16,7 +16,10 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
     let dangerous = ["rm -rf /", "mkfs", ":(){ :|:& };:", "dd if=/dev"];
     for d in dangerous {
         if command.contains(d) {
-            return format!("⛔ Refused to run potentially destructive command: {}", command);
+            return format!(
+                "⛔ Refused to run potentially destructive command: {}",
+                command
+            );
         }
     }
 
@@ -53,7 +56,11 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
         Err(e) => return format!("(exec spawn error: {})", e),
     };
 
-    let output_res = timeout(Duration::from_secs(EXEC_TIMEOUT_SECS), child.wait_with_output()).await;
+    let output_res = timeout(
+        Duration::from_secs(EXEC_TIMEOUT_SECS),
+        child.wait_with_output(),
+    )
+    .await;
 
     match output_res {
         Ok(Ok(output)) => {

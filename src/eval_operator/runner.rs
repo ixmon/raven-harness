@@ -32,7 +32,11 @@ impl Runner {
         self.manifest_dir.join("evals")
     }
 
-    pub fn run_profile(&self, profile: &str, state: &mut super::state::OperatorState) -> Result<RunSummary> {
+    pub fn run_profile(
+        &self,
+        profile: &str,
+        state: &mut super::state::OperatorState,
+    ) -> Result<RunSummary> {
         if profile == "swebench-live" {
             let status = super::probe::probe_llm(&self.llm_base_url);
             super::probe::preflight_swebench_live(&status)?;
@@ -131,7 +135,9 @@ impl Runner {
         let finished_at = Utc::now();
         let passed = results.iter().all(|r| r.passed);
 
-        let has_swebench = ids.iter().any(|id| super::swebench::is_instance_id(&self.manifest_dir, id));
+        let has_swebench = ids
+            .iter()
+            .any(|id| super::swebench::is_instance_id(&self.manifest_dir, id));
         if profile.starts_with("swebench") || has_swebench {
             let _ = self.aggregate_swebench_scorecard(profile, ids, &log_dir);
         }
@@ -147,10 +153,7 @@ impl Runner {
         };
 
         let summary_path = summary.log_dir.join("summary.json");
-        std::fs::write(
-            &summary_path,
-            serde_json::to_string_pretty(&summary)?,
-        )?;
+        std::fs::write(&summary_path, serde_json::to_string_pretty(&summary)?)?;
 
         push_run(state, summary.clone());
         super::state::save_state(state)?;
@@ -228,8 +231,6 @@ impl Runner {
         Ok(())
     }
 
-
-
     /// Load agent metrics (llm_rounds/turns, tool_calls, duration_ms) for a just-run id.
     /// Supports both easy-style *_harness_turn.json in the run log_dir and
     /// swebench harness_turn.json or metrics.json under swebench/results/<id>.
@@ -241,10 +242,14 @@ impl Runner {
         let manifest = &self.manifest_dir;
         let evals = self.evals_dir();
 
-        let (workspace, prompt_file, is_swebench) = if super::swebench::is_instance_id(manifest, id) {
+        let (workspace, prompt_file, is_swebench) = if super::swebench::is_instance_id(manifest, id)
+        {
             // SWE-bench instance: use harness to materialize (skip agent)
             let script = evals.join("swebench/run_instance.sh");
-            println!("==> Materializing SWE-bench workspace for {} (this may take a minute)", id);
+            println!(
+                "==> Materializing SWE-bench workspace for {} (this may take a minute)",
+                id
+            );
             let output = Command::new("bash")
                 .arg(&script)
                 .arg(id)
@@ -252,7 +257,9 @@ impl Runner {
                 .arg("--skip-grade")
                 .current_dir(manifest)
                 .output()
-                .with_context(|| format!("running {} --skip-raven --skip-grade", script.display()))?;
+                .with_context(|| {
+                    format!("running {} --skip-raven --skip-grade", script.display())
+                })?;
             // Print the script's progress output (==> checkout etc.)
             if !output.stdout.is_empty() {
                 print!("{}", String::from_utf8_lossy(&output.stdout));
@@ -280,10 +287,13 @@ impl Runner {
             }
 
             // Get raw problem statement and augment with instruction to call define_done early from it.
-            let inst = evals.join("swebench/instances").join(format!("{}.json", id));
+            let inst = evals
+                .join("swebench/instances")
+                .join(format!("{}.json", id));
             let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&inst)?)
                 .context("read swebench instance")?;
-            let raw_prompt = data.get("problem_statement")
+            let raw_prompt = data
+                .get("problem_statement")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -312,10 +322,14 @@ impl Runner {
             // Get prompt from scenario json
             let scen = evals.join("scenarios").join(format!("{}.json", id));
             if !scen.exists() {
-                anyhow::bail!("unknown test id {} (not a swebench instance and no scenario json)", id);
+                anyhow::bail!(
+                    "unknown test id {} (not a swebench instance and no scenario json)",
+                    id
+                );
             }
             let data: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&scen)?)?;
-            let prompt = data.get("prompt")
+            let prompt = data
+                .get("prompt")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -329,7 +343,10 @@ impl Runner {
         println!();
         println!("=== Launching test {} in interactive TUI ===", id);
         println!("Workspace: {}", workspace.display());
-        println!("Prompt file (with env context + test): {}", prompt_file.display());
+        println!(
+            "Prompt file (with env context + test): {}",
+            prompt_file.display()
+        );
         println!();
         println!("Launching the full TUI. The test prompt will be pre-filled in the input box.");
         println!("Press Enter (or edit the prompt first) to start the agent on the test.");
@@ -339,13 +356,23 @@ impl Runner {
         println!("Equivalent command: cargo run --release --bin raven-tui -- --workspace {} --fresh-session --temperature 1 --approval thunderdome --context-size 65536 --base-url {}", 
             workspace.display(), &self.llm_base_url);
         let mut tui_args = vec![
-            "run", "--release", "--quiet", "--bin", "raven-tui", "--",
-            "--workspace", workspace.to_str().unwrap(),
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--workspace",
+            workspace.to_str().unwrap(),
             "--fresh-session",
-            "--temperature", "1",
-            "--approval", "thunderdome",
-            "--context-size", "65536",
-            "--base-url", &self.llm_base_url,
+            "--temperature",
+            "1",
+            "--approval",
+            "thunderdome",
+            "--context-size",
+            "65536",
+            "--base-url",
+            &self.llm_base_url,
         ];
         if self.should_enable_judge_for_scenario(id) {
             tui_args.push("--enable-judge");
@@ -354,7 +381,10 @@ impl Runner {
         cmd.args(tui_args);
         cmd.current_dir(manifest);
         // Pass the prompt file so TUI can prefill the input with the test prompt
-        cmd.env("RAVEN_EVAL_INITIAL_PROMPT_FILE", prompt_file.to_str().unwrap());
+        cmd.env(
+            "RAVEN_EVAL_INITIAL_PROMPT_FILE",
+            prompt_file.to_str().unwrap(),
+        );
 
         // Pass through some useful envs from eval context
         if is_swebench {
@@ -363,7 +393,11 @@ impl Runner {
             if venv.exists() {
                 let venv_bin = venv.join("bin");
                 if venv_bin.exists() {
-                    let new_path = format!("{}:{}", venv_bin.display(), std::env::var("PATH").unwrap_or_default());
+                    let new_path = format!(
+                        "{}:{}",
+                        venv_bin.display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    );
                     cmd.env("PATH", new_path);
                     cmd.env("RAVEN_EVAL_PYTHON", venv.join("bin/python"));
                     cmd.env("RAVEN_EVAL_PYTHON3", venv.join("bin/python3"));
@@ -443,7 +477,10 @@ impl Runner {
         } else if let Some(entry) = super::registry::find_entry(&reg, id) {
             match entry.tier {
                 TestTier::Replay => {
-                    return Ok((false, format!("scenario {id} is replay-only; use replay tier")));
+                    return Ok((
+                        false,
+                        format!("scenario {id} is replay-only; use replay tier"),
+                    ));
                 }
                 TestTier::MockSmoke => self.run_mock_scenario(id, &log_path)?,
                 TestTier::LiveSmoke => self.run_live_scenario(id, &log_path)?,
@@ -456,7 +493,11 @@ impl Runner {
         Ok((status.success(), msg))
     }
 
-    fn run_script(&self, script: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+    fn run_script(
+        &self,
+        script: &str,
+        log_path: &PathBuf,
+    ) -> Result<(std::process::ExitStatus, String)> {
         let path = self.evals_dir().join(script);
         let output = Command::new("bash")
             .arg(&path)
@@ -465,10 +506,7 @@ impl Runner {
             .output()
             .with_context(|| format!("run {}", path.display()))?;
         std::fs::write(log_path, &output.stdout)?;
-        let _ = std::fs::write(
-            log_path.with_extension("err.log"),
-            &output.stderr,
-        );
+        let _ = std::fs::write(log_path.with_extension("err.log"), &output.stderr);
         Ok((output.status, script.to_string()))
     }
 
@@ -479,18 +517,25 @@ impl Runner {
             .output()
             .context("cargo test")?;
         std::fs::write(log_path, &output.stdout)?;
-        let _ = std::fs::write(
-            log_path.with_extension("err.log"),
-            &output.stderr,
-        );
+        let _ = std::fs::write(log_path.with_extension("err.log"), &output.stderr);
         Ok((output.status, "unit_tests".into()))
     }
 
-    fn run_mock_scenario(&self, id: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+    fn run_mock_scenario(
+        &self,
+        id: &str,
+        log_path: &PathBuf,
+    ) -> Result<(std::process::ExitStatus, String)> {
         let prompt_file = self.write_scenario_prompt_file(id, log_path)?;
         let mut tui_args = vec![
-            "run", "--release", "--quiet", "--bin", "raven-tui", "--",
-            "--prompt-file", prompt_file.to_str().unwrap(),
+            "run",
+            "--release",
+            "--quiet",
+            "--bin",
+            "raven-tui",
+            "--",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
         ];
         if self.should_enable_judge_for_scenario(id) {
             tui_args.push("--enable-judge");
@@ -505,10 +550,7 @@ impl Runner {
             .output()
             .context("mock scenario")?;
         std::fs::write(log_path, &output.stdout)?;
-        let _ = std::fs::write(
-            log_path.with_extension("err.log"),
-            &output.stderr,
-        );
+        let _ = std::fs::write(log_path.with_extension("err.log"), &output.stderr);
         Ok((output.status, format!("mock:{id}")))
     }
 
@@ -554,11 +596,13 @@ impl Runner {
         Ok((output.status, message))
     }
 
-    fn run_live_scenario(&self, id: &str, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
-        let workspace = std::env::temp_dir().join(format!(
-            "raven-eval-live-{}-{id}",
-            std::process::id()
-        ));
+    fn run_live_scenario(
+        &self,
+        id: &str,
+        log_path: &PathBuf,
+    ) -> Result<(std::process::ExitStatus, String)> {
+        let workspace =
+            std::env::temp_dir().join(format!("raven-eval-live-{}-{id}", std::process::id()));
         let _ = std::fs::create_dir_all(&workspace);
 
         let prompt_file = self.write_scenario_prompt_file(id, log_path)?;
@@ -591,14 +635,14 @@ impl Runner {
             .context("live scenario")?;
         let _ = std::fs::remove_dir_all(&workspace);
         std::fs::write(log_path, &output.stdout)?;
-        let _ = std::fs::write(
-            log_path.with_extension("err.log"),
-            &output.stderr,
-        );
+        let _ = std::fs::write(log_path.with_extension("err.log"), &output.stderr);
         Ok((output.status, format!("live:{id}")))
     }
 
-    fn run_easy_hello_world(&self, log_path: &PathBuf) -> Result<(std::process::ExitStatus, String)> {
+    fn run_easy_hello_world(
+        &self,
+        log_path: &PathBuf,
+    ) -> Result<(std::process::ExitStatus, String)> {
         let workspace = std::env::temp_dir().join(format!(
             "raven-eval-easy-hello-{}-{}",
             std::process::id(),
@@ -690,10 +734,7 @@ impl Runner {
         let _ = std::fs::remove_dir_all(&workspace);
 
         std::fs::write(log_path, &output.stdout)?;
-        let _ = std::fs::write(
-            log_path.with_extension("err.log"),
-            &output.stderr,
-        );
+        let _ = std::fs::write(log_path.with_extension("err.log"), &output.stderr);
 
         let status = if verified {
             // force success even if tui did something
@@ -796,7 +837,8 @@ impl Runner {
 
         if !verified {
             let agent_output = String::from_utf8_lossy(&output.stdout).to_lowercase();
-            if agent_output.contains("fizz") && agent_output.contains("buzz")
+            if agent_output.contains("fizz")
+                && agent_output.contains("buzz")
                 && (agent_output.contains("write") || agent_output.contains("[actions]"))
             {
                 verified = true;
@@ -811,10 +853,7 @@ impl Runner {
         let _ = std::fs::remove_dir_all(&workspace);
 
         std::fs::write(log_path, &output.stdout)?;
-        let _ = std::fs::write(
-            log_path.with_extension("err.log"),
-            &output.stderr,
-        );
+        let _ = std::fs::write(log_path.with_extension("err.log"), &output.stderr);
 
         let status = if verified {
             #[cfg(unix)]
@@ -858,9 +897,14 @@ impl Runner {
         let _ = std::fs::create_dir_all(&workspace);
 
         // Copy the analyzer source so agent can read_summary it
-        let src_analyzer = self.evals_dir().join("functional").join("cache-lift").join("analyzer.py");
-        std::fs::copy(&src_analyzer, workspace.join("analyzer.py"))
-            .with_context(|| format!("failed to copy analyzer.py from {}", src_analyzer.display()))?;
+        let src_analyzer = self
+            .evals_dir()
+            .join("functional")
+            .join("cache-lift")
+            .join("analyzer.py");
+        std::fs::copy(&src_analyzer, workspace.join("analyzer.py")).with_context(|| {
+            format!("failed to copy analyzer.py from {}", src_analyzer.display())
+        })?;
 
         let prompt_file = self.write_scenario_prompt_file("cache-lift", log_path)?;
 
@@ -900,7 +944,11 @@ impl Runner {
         // Copy test script too? The verify is in functional, but for live we run in ws
         // For simplicity, run python on the copied? Wait, test script not copied yet.
         // Actually, since test is verification, copy it and run.
-        let src_test = self.evals_dir().join("functional").join("cache-lift").join("test_cache_lift.py");
+        let src_test = self
+            .evals_dir()
+            .join("functional")
+            .join("cache-lift")
+            .join("test_cache_lift.py");
         std::fs::copy(&src_test, &test_script)
             .with_context(|| format!("failed to copy test script from {}", src_test.display()))?;
 
@@ -937,7 +985,11 @@ impl Runner {
         let _ = std::fs::create_dir_all(&workspace);
 
         // Copy the config source
-        let src_config = self.evals_dir().join("functional").join("cache-fidelity").join("config.py");
+        let src_config = self
+            .evals_dir()
+            .join("functional")
+            .join("cache-fidelity")
+            .join("config.py");
         std::fs::copy(&src_config, workspace.join("config.py"))
             .with_context(|| format!("failed to copy config.py from {}", src_config.display()))?;
 
@@ -976,7 +1028,11 @@ impl Runner {
 
         // Verify
         let test_script = workspace.join("test_cache_fidelity.py");
-        let src_test = self.evals_dir().join("functional").join("cache-fidelity").join("test_cache_fidelity.py");
+        let src_test = self
+            .evals_dir()
+            .join("functional")
+            .join("cache-fidelity")
+            .join("test_cache_fidelity.py");
         std::fs::copy(&src_test, &test_script)
             .with_context(|| format!("failed to copy test script from {}", src_test.display()))?;
 
@@ -994,7 +1050,8 @@ impl Runner {
         let _ = std::fs::remove_dir_all(&workspace);
 
         let label = if verified {
-            "cache-fidelity: verified (post-edit re-summary reflects changes, no stale data)".to_string()
+            "cache-fidelity: verified (post-edit re-summary reflects changes, no stale data)"
+                .to_string()
         } else {
             "cache-fidelity: verification failed (possible stale summary)".to_string()
         };
@@ -1002,12 +1059,16 @@ impl Runner {
     }
 
     fn write_scenario_prompt_file(&self, id: &str, log_path: &Path) -> Result<PathBuf> {
-        let scenario_path = self.evals_dir().join("scenarios").join(format!("{}.json", id));
+        let scenario_path = self
+            .evals_dir()
+            .join("scenarios")
+            .join(format!("{}.json", id));
         let data = std::fs::read_to_string(&scenario_path)
             .with_context(|| format!("read scenario {}", scenario_path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&data)
             .with_context(|| format!("parse scenario {}", scenario_path.display()))?;
-        let prompt = v.get("prompt")
+        let prompt = v
+            .get("prompt")
             .and_then(|p| p.as_str())
             .ok_or_else(|| anyhow::anyhow!("scenario {} has no prompt field", id))?;
 
@@ -1018,11 +1079,16 @@ impl Runner {
     }
 
     fn should_enable_judge_for_scenario(&self, id: &str) -> bool {
-        let scenario_path = self.evals_dir().join("scenarios").join(format!("{}.json", id));
+        let scenario_path = self
+            .evals_dir()
+            .join("scenarios")
+            .join(format!("{}.json", id));
         if let Ok(data) = std::fs::read_to_string(&scenario_path) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                 let dj = v.get("disable_judge");
-                if dj.and_then(|x| x.as_bool()) == Some(true) || dj.and_then(|x| x.as_u64()) == Some(1) {
+                if dj.and_then(|x| x.as_bool()) == Some(true)
+                    || dj.and_then(|x| x.as_u64()) == Some(1)
+                {
                     return false;
                 }
             }
@@ -1032,7 +1098,9 @@ impl Runner {
 }
 
 fn load_json(path: &Path) -> Option<serde_json::Value> {
-    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok())
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
 }
 
 pub fn print_summary(summary: &RunSummary) {
@@ -1044,7 +1112,9 @@ pub fn print_summary(summary: &RunSummary) {
                 "{}ms wall, {} turns, {} tool calls, {}ms agent",
                 r.duration_ms, t, c, d
             ),
-            (Some(t), Some(c), None) => format!("{}ms wall, {} turns, {} tool calls", r.duration_ms, t, c),
+            (Some(t), Some(c), None) => {
+                format!("{}ms wall, {} turns, {} tool calls", r.duration_ms, t, c)
+            }
             _ => format!("{}ms", r.duration_ms),
         };
         println!("{mark} {} ({}) — {}", r.id, metrics, r.message);
@@ -1058,7 +1128,10 @@ pub fn print_summary(summary: &RunSummary) {
         println!();
         println!(
             "Series totals: {}ms wall, {} turns, {} tool calls across {} items",
-            total_wall, total_turns, total_calls, summary.results.len()
+            total_wall,
+            total_turns,
+            total_calls,
+            summary.results.len()
         );
     }
 
@@ -1090,9 +1163,11 @@ pub fn print_summary(summary: &RunSummary) {
 }
 
 fn print_baseline_diff(summary: &RunSummary) {
-    let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("evals/baselines/easy_bench_live.json");
-    let Some(base) = load_json(&base_path) else { return; };
+    let base_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("evals/baselines/easy_bench_live.json");
+    let Some(base) = load_json(&base_path) else {
+        return;
+    };
 
     let tests = match base.get("tests").and_then(|t| t.as_object()) {
         Some(t) => t,
@@ -1104,27 +1179,39 @@ fn print_baseline_diff(summary: &RunSummary) {
         if let Some(tb) = tests.get(&r.id) {
             let expect_pass = tb.get("pass").and_then(|v| v.as_bool()).unwrap_or(true);
             if r.passed != expect_pass {
-                notes.push(format!("{}: pass expected {}, got {}", r.id, expect_pass, r.passed));
+                notes.push(format!(
+                    "{}: pass expected {}, got {}",
+                    r.id, expect_pass, r.passed
+                ));
             }
 
             // regression checks on max_*
             if let Some(max_r) = tb.get("max_llm_rounds").and_then(|v| v.as_u64()) {
                 if let Some(actual) = r.turns {
                     if actual > max_r as u32 {
-                        notes.push(format!("{}: turns {} exceeded baseline max {}", r.id, actual, max_r));
+                        notes.push(format!(
+                            "{}: turns {} exceeded baseline max {}",
+                            r.id, actual, max_r
+                        ));
                     }
                 }
             }
             if let Some(max_c) = tb.get("max_tool_calls").and_then(|v| v.as_u64()) {
                 if let Some(actual) = r.tool_calls {
                     if actual > max_c as u32 {
-                        notes.push(format!("{}: tool_calls {} exceeded baseline max {}", r.id, actual, max_c));
+                        notes.push(format!(
+                            "{}: tool_calls {} exceeded baseline max {}",
+                            r.id, actual, max_c
+                        ));
                     }
                 }
             }
             if let Some(max_d) = tb.get("max_duration_ms").and_then(|v| v.as_u64()) {
                 if r.duration_ms > max_d {
-                    notes.push(format!("{}: {}ms exceeded baseline max {}ms", r.id, r.duration_ms, max_d));
+                    notes.push(format!(
+                        "{}: {}ms exceeded baseline max {}ms",
+                        r.id, r.duration_ms, max_d
+                    ));
                 }
             }
         }
@@ -1136,7 +1223,10 @@ fn print_baseline_diff(summary: &RunSummary) {
         for n in notes {
             println!("  ! {}", n);
         }
-    } else if tests.keys().any(|k| summary.results.iter().any(|r| &r.id == k)) {
+    } else if tests
+        .keys()
+        .any(|k| summary.results.iter().any(|r| &r.id == k))
+    {
         println!();
         println!("Baseline: all checked tests match expectations (no regressions detected)");
     }
@@ -1163,7 +1253,9 @@ fn scorecard_summary_line(log_dir: &Path) -> Option<String> {
         .filter(|(k, v)| *k != "resolved" && v.as_u64().unwrap_or(0) > 0)
         .map(|(k, v)| format!("{k}={}", v.as_u64().unwrap_or(0)))
         .collect();
-    let rate_pct = rate.map(|r| format!("{:.1}%", r * 100.0)).unwrap_or_else(|| "?".into());
+    let rate_pct = rate
+        .map(|r| format!("{:.1}%", r * 100.0))
+        .unwrap_or_else(|| "?".into());
     let model = card["endpoint"]["model_id"].as_str();
     let ctx = card["endpoint"]["context_tokens"].as_u64();
     let mut line = if let (Some(m), Some(c)) = (model, ctx) {
@@ -1197,9 +1289,15 @@ fn harness_stats_line(log_dir: &Path) -> Option<String> {
                     if name.ends_with("_harness_turn.json") || name == "harness_turn.json" {
                         if let Ok(data) = std::fs::read_to_string(&p) {
                             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
-                                if let Some(d) = v.get("duration_ms").and_then(|x| x.as_f64()) { durs.push(d); }
-                                if let Some(r) = v.get("llm_rounds").and_then(|x| x.as_f64()) { rounds.push(r); }
-                                if let Some(t) = v.get("tool_calls").and_then(|x| x.as_f64()) { tcalls.push(t); }
+                                if let Some(d) = v.get("duration_ms").and_then(|x| x.as_f64()) {
+                                    durs.push(d);
+                                }
+                                if let Some(r) = v.get("llm_rounds").and_then(|x| x.as_f64()) {
+                                    rounds.push(r);
+                                }
+                                if let Some(t) = v.get("tool_calls").and_then(|x| x.as_f64()) {
+                                    tcalls.push(t);
+                                }
                             }
                         }
                     }
@@ -1211,15 +1309,37 @@ fn harness_stats_line(log_dir: &Path) -> Option<String> {
         return None;
     }
     fn med(v: &[f64]) -> Option<f64> {
-        if v.is_empty() { return None; }
-        let mut s = v.to_vec(); s.sort_by(|a,b| a.partial_cmp(b).unwrap());
-        let n = s.len(); Some( if n%2==1 { s[n/2] } else { (s[n/2-1]+s[n/2])/2.0 } )
+        if v.is_empty() {
+            return None;
+        }
+        let mut s = v.to_vec();
+        s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = s.len();
+        Some(if n % 2 == 1 {
+            s[n / 2]
+        } else {
+            (s[n / 2 - 1] + s[n / 2]) / 2.0
+        })
     }
-    let md = med(&durs).map(|x| format!("{:.0}ms", x)).unwrap_or_default();
-    let mr = med(&rounds).map(|x| format!("{:.0} turns", x)).unwrap_or_default();
-    let mt = med(&tcalls).map(|x| format!("{:.0} tools", x)).unwrap_or_default();
+    let md = med(&durs)
+        .map(|x| format!("{:.0}ms", x))
+        .unwrap_or_default();
+    let mr = med(&rounds)
+        .map(|x| format!("{:.0} turns", x))
+        .unwrap_or_default();
+    let mt = med(&tcalls)
+        .map(|x| format!("{:.0} tools", x))
+        .unwrap_or_default();
     let parts: Vec<_> = [md, mr, mt].into_iter().filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() { None } else { Some(format!("Harness stats ({}): {}", durs.len(), parts.join(", "))) }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Harness stats ({}): {}",
+            durs.len(),
+            parts.join(", ")
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1232,9 +1352,15 @@ mod tests {
         let base = std::env::temp_dir().join(format!("raven-test-harness-{}", std::process::id()));
         let _ = fs::create_dir_all(&base);
         let p = base.join("easy-hello-world_harness_turn.json");
-        let _ = fs::write(&p, r#"{"duration_ms": 1234, "llm_rounds": 3, "tool_calls": 2}"#);
+        let _ = fs::write(
+            &p,
+            r#"{"duration_ms": 1234, "llm_rounds": 3, "tool_calls": 2}"#,
+        );
         let p2 = base.join("easy-fizzbuzz_harness_turn.json");
-        let _ = fs::write(&p2, r#"{"duration_ms": 2345, "llm_rounds": 5, "tool_calls": 7}"#);
+        let _ = fs::write(
+            &p2,
+            r#"{"duration_ms": 2345, "llm_rounds": 5, "tool_calls": 7}"#,
+        );
         let line = harness_stats_line(&base).expect("some line");
         let _ = fs::remove_dir_all(&base);
         assert!(line.contains("Harness stats (2)"));

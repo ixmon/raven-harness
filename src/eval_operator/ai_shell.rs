@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use super::llm_text::extract_from_chat_response;
 use super::probe::LlmStatus;
-use super::registry::{load_registry, list_text};
-use super::runner::{Runner, print_summary};
-use super::state::{load_state, last_run, RunSummary, OperatorState};
+use super::registry::{list_text, load_registry};
+use super::runner::{print_summary, Runner};
+use super::state::{last_run, load_state, OperatorState, RunSummary};
 
 pub fn explain_last_run(llm: &LlmStatus) -> Result<()> {
     let state = load_state()?;
@@ -107,7 +107,10 @@ fn failure_log_excerpt(run: &RunSummary, max_chars: usize) -> String {
 
 pub fn run_repl(llm: &LlmStatus, runner: &Runner) -> Result<()> {
     if !llm.reachable {
-        anyhow::bail!("AI Shell unavailable — LLM not reachable at {}", llm.base_url);
+        anyhow::bail!(
+            "AI Shell unavailable — LLM not reachable at {}",
+            llm.base_url
+        );
     }
 
     println!("\nAI Shell — /help for commands, /quit to exit\n");
@@ -215,7 +218,10 @@ fn compare_runs(run_id: &str) -> Result<()> {
         .chain(b.results.iter().map(|r| r.id.as_str()))
         .collect();
 
-    println!("  {:<36} {:>6} {:>6}  {:>8} {:>8}", "Scenario", "A", "B", "A ms", "B ms");
+    println!(
+        "  {:<36} {:>6} {:>6}  {:>8} {:>8}",
+        "Scenario", "A", "B", "A ms", "B ms"
+    );
     println!("  {}", "─".repeat(70));
 
     for id in &all_ids {
@@ -223,12 +229,19 @@ fn compare_runs(run_id: &str) -> Result<()> {
         let br = b.results.iter().find(|r| r.id == *id);
         let a_mark = ar.map(|r| if r.passed { "✓" } else { "✗" }).unwrap_or("—");
         let b_mark = br.map(|r| if r.passed { "✓" } else { "✗" }).unwrap_or("—");
-        let a_ms = ar.map(|r| format!("{}", r.duration_ms)).unwrap_or_else(|| "—".into());
-        let b_ms = br.map(|r| format!("{}", r.duration_ms)).unwrap_or_else(|| "—".into());
+        let a_ms = ar
+            .map(|r| format!("{}", r.duration_ms))
+            .unwrap_or_else(|| "—".into());
+        let b_ms = br
+            .map(|r| format!("{}", r.duration_ms))
+            .unwrap_or_else(|| "—".into());
 
         let changed = ar.map(|r| r.passed) != br.map(|r| r.passed);
         let marker = if changed { " Δ" } else { "" };
-        println!("  {:<36} {:>6} {:>6}  {:>8} {:>8}{}", id, a_mark, b_mark, a_ms, b_ms, marker);
+        println!(
+            "  {:<36} {:>6} {:>6}  {:>8} {:>8}{}",
+            id, a_mark, b_mark, a_ms, b_ms, marker
+        );
     }
 
     // Totals
@@ -240,9 +253,12 @@ fn compare_runs(run_id: &str) -> Result<()> {
     println!(
         "  {:<36} {:>5}/{} {:>5}/{}  {:>8} {:>8}",
         "Total",
-        a_pass, a.results.len(),
-        b_pass, b.results.len(),
-        a_total_ms, b_total_ms
+        a_pass,
+        a.results.len(),
+        b_pass,
+        b.results.len(),
+        a_total_ms,
+        b_total_ms
     );
 
     if a_total_ms > 0 && b_total_ms > 0 {
@@ -340,7 +356,11 @@ fn ask_llm_with_context(llm: &LlmStatus, user: &str, context: &str) -> Result<St
         .send()
         .context("LLM chat request")?;
     if !resp.status().is_success() {
-        anyhow::bail!("LLM error {}: {}", resp.status(), resp.text().unwrap_or_default());
+        anyhow::bail!(
+            "LLM error {}: {}",
+            resp.status(),
+            resp.text().unwrap_or_default()
+        );
     }
     let data: serde_json::Value = resp.json()?;
     let content = extract_from_chat_response(&data);

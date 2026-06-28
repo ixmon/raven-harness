@@ -16,9 +16,11 @@ use tokio::sync::mpsc;
 
 use crate::config::Config;
 
-#[allow(unused_imports)]
-pub use crate::server_probe::{extract_context_tokens, resolve_server_probe, ProbeMatch, ServerProbeResult};
 pub use crate::server_probe::probe_server;
+#[allow(unused_imports)]
+pub use crate::server_probe::{
+    extract_context_tokens, resolve_server_probe, ProbeMatch, ServerProbeResult,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
@@ -138,8 +140,7 @@ impl LlmClient {
             body["reasoning"] = json!({ "enabled": true });
         }
 
-        let mut request = self.http.post(self.config.chat_url())
-            .json(&body);
+        let mut request = self.http.post(self.config.chat_url()).json(&body);
 
         if let Some(key) = &self.config.api_key {
             request = request.bearer_auth(key);
@@ -182,9 +183,9 @@ impl LlmClient {
         // even when the XML parser didn't recognize a full call.
         let content = strip_xml_tool_call_blocks(&original_content);
 
-        let usage = data.get("usage").and_then(|u| {
-            serde_json::from_value::<Usage>(u.clone()).ok()
-        });
+        let usage = data
+            .get("usage")
+            .and_then(|u| serde_json::from_value::<Usage>(u.clone()).ok());
 
         Ok(ChatResponse {
             content,
@@ -199,10 +200,7 @@ impl LlmClient {
 
     /// Streaming chat. Sends tokens and final tool calls over the channel.
     /// Returns the sender side; caller should consume the receiver.
-    pub async fn chat_stream(
-        &self,
-        req: ChatRequest,
-    ) -> Result<mpsc::Receiver<StreamChunk>> {
+    pub async fn chat_stream(&self, req: ChatRequest) -> Result<mpsc::Receiver<StreamChunk>> {
         let (tx, rx) = mpsc::channel(128);
 
         let mut body = json!({
@@ -211,6 +209,7 @@ impl LlmClient {
             "temperature": req.temperature,
             "max_tokens": req.max_tokens,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
 
         if let Some(tools) = &req.tools {
@@ -258,7 +257,9 @@ impl LlmClient {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            let _ = tx.send(StreamChunk::Error(format!("{}: {}", status, text))).await;
+            let _ = tx
+                .send(StreamChunk::Error(format!("{}: {}", status, text)))
+                .await;
             return Ok(());
         }
 
@@ -292,9 +293,7 @@ impl LlmClient {
                 let data_str = &line[6..];
                 if data_str == "[DONE]" {
                     // Emit final
-                    let mut final_tools: Vec<ToolCall> = tool_accum
-                        .into_values()
-                        .collect();
+                    let mut final_tools: Vec<ToolCall> = tool_accum.into_values().collect();
 
                     // Fallback: if no structured tool_calls were accumulated
                     // but the content contains XML tool calls (Qwen native format),
@@ -333,17 +332,20 @@ impl LlmClient {
                             if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
                                 last_finish_reason = Some(fr.to_string());
                             }
-                            let delta_val = choice.get("delta").cloned().unwrap_or_else(|| json!({}));
+                            let delta_val =
+                                choice.get("delta").cloned().unwrap_or_else(|| json!({}));
                             let delta = &delta_val;
 
                             // Reasoning / thinking content (Qwen-style: reasoning_content,
                             // OpenRouter/Kimi-style: reasoning)
-                            if let Some(thinking) = delta.get("reasoning_content")
+                            if let Some(thinking) = delta
+                                .get("reasoning_content")
                                 .and_then(|v| v.as_str())
                                 .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()))
                             {
                                 if !thinking.is_empty() {
-                                    let _ = tx.send(StreamChunk::Thinking(thinking.to_string())).await;
+                                    let _ =
+                                        tx.send(StreamChunk::Thinking(thinking.to_string())).await;
                                 }
                             }
 
@@ -358,14 +360,18 @@ impl LlmClient {
                                     // showing raw "}<function=..." , "function=..." or stray closing
                                     // tags like "}</parameter></function></tool_call>".
                                     let token_has_xml = contains_tool_xml_syntax(token);
-                                    let entering_tool_xml = token_has_xml || contains_tool_xml_syntax(&full_text);
+                                    let entering_tool_xml =
+                                        token_has_xml || contains_tool_xml_syntax(&full_text);
                                     if !entering_tool_xml {
-                                        let _ = tx.send(StreamChunk::Token(token.to_string())).await;
+                                        let _ =
+                                            tx.send(StreamChunk::Token(token.to_string())).await;
                                     }
                                 }
                             }
 
-                            if let Some(tool_deltas) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            if let Some(tool_deltas) =
+                                delta.get("tool_calls").and_then(|t| t.as_array())
+                            {
                                 accumulate_tool_call_deltas(&mut tool_accum, tool_deltas);
                             }
                         }
@@ -463,7 +469,9 @@ fn parse_xml_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
     // Quick reject: need either `<function=` or bare `function=` or parameter fragments
     let has_xml_function = content.contains("<function=") || content.contains("<function>");
     let has_bare_function = content.contains("function=") || content.contains("function>");
-    let has_parameter = content.contains("<parameter") || content.contains("parameter=") || content.contains("parameter ");
+    let has_parameter = content.contains("<parameter")
+        || content.contains("parameter=")
+        || content.contains("parameter ");
     if !has_xml_function && !has_bare_function && !has_parameter {
         return vec![];
     }
@@ -472,7 +480,10 @@ fn parse_xml_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
     // prepend `<` so the rest of the parser sees `<function=`.
     let normalized: std::borrow::Cow<str> = if !has_xml_function && has_bare_function {
         // Find where `function=` or `function>` appears and insert `<` before it
-        if let Some(pos) = content.find("function=").or_else(|| content.find("function>")) {
+        if let Some(pos) = content
+            .find("function=")
+            .or_else(|| content.find("function>"))
+        {
             let mut s = content.to_string();
             if pos == 0 || content.as_bytes().get(pos.wrapping_sub(1)) != Some(&b'<') {
                 s.insert(pos, '<');
@@ -500,7 +511,8 @@ fn parse_xml_tool_calls_from_content(content: &str) -> Vec<ToolCall> {
         let Some(name) = xml_function_name(block) else {
             continue;
         };
-        let arguments = serde_json::to_string(&xml_parameters(block)).unwrap_or_else(|_| "{}".into());
+        let arguments =
+            serde_json::to_string(&xml_parameters(block)).unwrap_or_else(|_| "{}".into());
         out.push(ToolCall {
             id: format!("xml-{name}-{idx}"),
             r#type: "function".into(),
@@ -526,7 +538,10 @@ fn xml_parameters(block: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut map = serde_json::Map::new();
     let mut cursor = block;
     // Support <parameter , <parameter= , bare parameter=
-    while let Some(start) = cursor.find("<parameter").or_else(|| cursor.find("parameter=")) {
+    while let Some(start) = cursor
+        .find("<parameter")
+        .or_else(|| cursor.find("parameter="))
+    {
         let after_start = &cursor[start..];
         let marker_len = if after_start.starts_with("<parameter=") {
             "<parameter=".len()
@@ -537,7 +552,7 @@ fn xml_parameters(block: &str) -> serde_json::Map<String, serde_json::Value> {
             if let Some(eq) = after_start.find('=') {
                 eq + 1
             } else if let Some(gt) = after_start.find('>') {
-                gt + 1  // key might be missing, skip
+                gt + 1 // key might be missing, skip
             } else {
                 cursor = &cursor[start + 1..];
                 continue;
@@ -551,7 +566,11 @@ fn xml_parameters(block: &str) -> serde_json::Map<String, serde_json::Value> {
         };
         let key = after_key[..key_end].trim().to_string();
         let value_block = &after_key[key_end + 1..];
-        let Some(value_end) = value_block.find("</parameter>").or_else(|| value_block.find("<parameter")).or_else(|| value_block.find("parameter=")) else {
+        let Some(value_end) = value_block
+            .find("</parameter>")
+            .or_else(|| value_block.find("<parameter"))
+            .or_else(|| value_block.find("parameter="))
+        else {
             // take to end if no close
             let value = value_block.trim();
             if !value.is_empty() {
@@ -588,8 +607,13 @@ pub(crate) fn contains_tool_xml_syntax(text: &str) -> bool {
     let trimmed = text.trim();
     if trimmed.len() <= 12 {
         let l = trimmed.to_lowercase();
-        if matches!(l.as_str(), "function" | "read" | "write" | "patch" | "exec" | "grep" | "list" | "parameter")
-            || l == "function" || l.starts_with("function") || l.starts_with("read>") || l.starts_with("write>")
+        if matches!(
+            l.as_str(),
+            "function" | "read" | "write" | "patch" | "exec" | "grep" | "list" | "parameter"
+        ) || l == "function"
+            || l.starts_with("function")
+            || l.starts_with("read>")
+            || l.starts_with("write>")
         {
             return true;
         }
@@ -635,8 +659,15 @@ pub fn strip_xml_tool_call_blocks(content: &str) -> String {
     let mut out = s.trim().to_string();
 
     // Drop pure junk / dangling closer that was right before the XML (the exact case reported)
-    let cleaned = out.trim_end_matches(|c: char| " \t\n\r{}[],.;:()".contains(c)).trim().to_string();
-    if out == "}" || out == "}," || cleaned.is_empty() || (out.len() <= 5 && !out.chars().any(|c| c.is_alphanumeric())) {
+    let cleaned = out
+        .trim_end_matches(|c: char| " \t\n\r{}[],.;:()".contains(c))
+        .trim()
+        .to_string();
+    if out == "}"
+        || out == "},"
+        || cleaned.is_empty()
+        || (out.len() <= 5 && !out.chars().any(|c| c.is_alphanumeric()))
+    {
         return String::new();
     }
 
@@ -644,15 +675,25 @@ pub fn strip_xml_tool_call_blocks(content: &str) -> String {
     // as XML leakage even if the completing "=..." or ">" never arrived in this content stream.
     // These can leak when the first token(s) are forwarded before full marker is visible in full_text.
     let lower = out.to_lowercase();
-    if matches!(lower.as_str(), "function" | "read" | "write" | "patch" | "exec" | "grep" | "list" | "parameter")
-        || (out.len() <= 12 && (lower == "function" || lower.starts_with("function") || lower.starts_with("read") || lower.starts_with("write") || lower.starts_with("patch")))
+    if matches!(
+        lower.as_str(),
+        "function" | "read" | "write" | "patch" | "exec" | "grep" | "list" | "parameter"
+    ) || (out.len() <= 12
+        && (lower == "function"
+            || lower.starts_with("function")
+            || lower.starts_with("read")
+            || lower.starts_with("write")
+            || lower.starts_with("patch")))
     {
         return String::new();
     }
 
     // If the remaining ends with a stray closer, trim it.
     if out.ends_with('}') || out.ends_with("},") {
-        let core = out.trim_end_matches(|c: char| " \t\n\r{}[],.;:()".contains(c)).trim().to_string();
+        let core = out
+            .trim_end_matches(|c: char| " \t\n\r{}[],.;:()".contains(c))
+            .trim()
+            .to_string();
         if core.is_empty() || core.len() + 3 >= out.len() {
             out = core;
         }
@@ -704,11 +745,7 @@ pub async fn fetch_openrouter_balance(api_key: &str) -> Option<OpenRouterBalance
     fetch_openrouter_key_limit(&client, api_key).await
 }
 
-async fn openrouter_get(
-    client: &Client,
-    path: &str,
-    api_key: &str,
-) -> Option<serde_json::Value> {
+async fn openrouter_get(client: &Client, path: &str, api_key: &str) -> Option<serde_json::Value> {
     let resp = client
         .get(format!("https://openrouter.ai/api/v1{path}"))
         .bearer_auth(api_key)
@@ -759,10 +796,7 @@ pub(crate) fn accumulate_tool_call_deltas(
     tool_deltas: &[serde_json::Value],
 ) {
     for td in tool_deltas {
-        let idx = td
-            .get("index")
-            .and_then(|i| i.as_u64())
-            .unwrap_or(0) as usize;
+        let idx = td.get("index").and_then(|i| i.as_u64()).unwrap_or(0) as usize;
 
         let entry = tool_accum.entry(idx).or_insert_with(|| ToolCall {
             id: String::new(),
@@ -791,7 +825,6 @@ pub(crate) fn accumulate_tool_call_deltas(
         }
     }
 }
-
 
 #[cfg(test)]
 fn parse_sse_data_payload(data_str: &str) -> SseParseResult {
@@ -902,7 +935,8 @@ mod tests {
 
     #[test]
     fn parse_sse_tool_delta_chunk() {
-        let payload = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"exec"}}]}}]}"#;
+        let payload =
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"exec"}}]}}]}"#;
         match parse_sse_data_payload(payload) {
             SseParseResult::ToolDeltas(deltas) => {
                 assert_eq!(deltas.len(), 1);
@@ -948,7 +982,8 @@ README.md
     fn parse_xml_tool_calls_truncated_streaming_format() {
         // llama.cpp streaming sometimes strips the leading `<tool_call>\n<`
         // so the content starts with bare `function=name>`.
-        let content = "function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
+        let content =
+            "function=list>\n<parameter=path>\n.\n</parameter>\n</function>\n</tool_call>";
         let calls = parse_xml_tool_calls_from_content(content);
         assert_eq!(calls.len(), 1, "should parse truncated XML: {:?}", calls);
         assert_eq!(calls[0].function.name, "list");
@@ -966,9 +1001,20 @@ README.md
         // Also handles mixed with opening
         let mixed = "I will call the tool now}\n<tool_call>\n<function=read>\n<parameter=path>src/foo.py</parameter>\n</function>\n</tool_call>";
         let cleaned = strip_xml_tool_call_blocks(mixed);
-        assert!(!cleaned.contains("function="), "should strip XML: {}", cleaned);
-        assert!(!cleaned.contains("</tool_call>"), "should strip XML: {}", cleaned);
-        assert!(cleaned.contains("I will call"), "should keep prefix narrative");
+        assert!(
+            !cleaned.contains("function="),
+            "should strip XML: {}",
+            cleaned
+        );
+        assert!(
+            !cleaned.contains("</tool_call>"),
+            "should strip XML: {}",
+            cleaned
+        );
+        assert!(
+            cleaned.contains("I will call"),
+            "should keep prefix narrative"
+        );
 
         // Pure opening form also stripped to empty when no narrative
         let pure = "function=patch>\n<parameter=path>bar.rs</parameter>\n</function>\n</tool_call>";
@@ -1049,5 +1095,4 @@ README.md
         });
         assert_eq!(parse_openrouter_key_limit(&body), None);
     }
-
 }

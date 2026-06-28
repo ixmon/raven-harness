@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::runtime::{RuntimeFlags, EvalHarness};
+use crate::runtime::{EvalHarness, RuntimeFlags};
 
 /// Computed budget limits derived from the server's actual context window size.
 /// All tool-result truncation limits, file-read line caps, etc. flow from this

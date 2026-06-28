@@ -122,8 +122,8 @@ fn is_replay_scenario(path: &Path) -> bool {
 }
 
 fn load_scenario(path: &Path) -> Result<Scenario, String> {
-    let data = std::fs::read_to_string(path)
-        .map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let data =
+        std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
     serde_json::from_str(&data).map_err(|e| format!("parse {}: {}", path.display(), e))
 }
 
@@ -177,7 +177,10 @@ mod tests {
     fn probe_single_model_fallback_uses_single_model_match() {
         let path = scenarios_dir().join("probe_single_model_fallback.json");
         let scenario = load_scenario(&path).expect("load scenario");
-        let Scenario::Probe { body, model_hint, .. } = scenario else {
+        let Scenario::Probe {
+            body, model_hint, ..
+        } = scenario
+        else {
             panic!("wrong scenario type");
         };
         let r = resolve_server_probe(&body, &model_hint).expect("resolve");

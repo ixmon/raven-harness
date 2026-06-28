@@ -75,7 +75,11 @@ pub fn web_search(query: &str, count: usize) -> String {
             .map(|e| e.text().collect::<String>())
             .unwrap_or_default();
 
-        results.push((title.trim().to_string(), url.trim().to_string(), snippet.trim().to_string()));
+        results.push((
+            title.trim().to_string(),
+            url.trim().to_string(),
+            snippet.trim().to_string(),
+        ));
     }
 
     if results.is_empty() {
@@ -98,7 +102,11 @@ pub fn web_search(query: &str, count: usize) -> String {
         return format!("🔍 No results found for: {}", query);
     }
 
-    let mut out = format!("🔍 Web search: \"{}\" ({} results)\n\n", query, results.len());
+    let mut out = format!(
+        "🔍 Web search: \"{}\" ({} results)\n\n",
+        query,
+        results.len()
+    );
     for (i, (title, url, snippet)) in results.into_iter().enumerate() {
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, url));
         if !snippet.is_empty() {
@@ -151,7 +159,10 @@ pub async fn browse(url: &str, depth: usize, extract: &str) -> String {
         // Format using the single fetched HTML
         let page = match extract {
             "links" => extract_links(&html, &current),
-            "html" => { let end = super::safe_truncate(&html, 25000).len(); format!("<!-- {} -->\n{}", current, &html[..end]) },
+            "html" => {
+                let end = super::safe_truncate(&html, 25000).len();
+                format!("<!-- {} -->\n{}", current, &html[..end])
+            }
             _ => extract_text(&html, &current),
         };
         pages.push((current.clone(), page));
@@ -177,7 +188,12 @@ pub async fn browse(url: &str, depth: usize, extract: &str) -> String {
         }
     }
 
-    let mut out = format!("🕷️ Spidered {} (depth={}, {} pages)\n\n", url, depth, pages.len());
+    let mut out = format!(
+        "🕷️ Spidered {} (depth={}, {} pages)\n\n",
+        url,
+        depth,
+        pages.len()
+    );
     for (u, content) in pages {
         out.push_str(&format!("--- {} ---\n{}\n\n", u, content));
     }
@@ -185,11 +201,17 @@ pub async fn browse(url: &str, depth: usize, extract: &str) -> String {
 }
 
 async fn fetch_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
-    let resp = client.get(url).send().await.map_err(|e| format!("❌ Failed to fetch {}: {}", url, e))?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| format!("❌ Failed to fetch {}: {}", url, e))?;
     if !resp.status().is_success() {
         return Err(format!("❌ HTTP {} for {}", resp.status(), url));
     }
-    resp.text().await.map_err(|e| format!("❌ Read error for {}: {}", url, e))
+    resp.text()
+        .await
+        .map_err(|e| format!("❌ Read error for {}: {}", url, e))
 }
 
 async fn fetch_and_format(client: &reqwest::Client, url: &str, extract: &str) -> String {
@@ -200,7 +222,10 @@ async fn fetch_and_format(client: &reqwest::Client, url: &str, extract: &str) ->
 
     match extract {
         "links" => extract_links(&html, url),
-        "html" => { let end = super::safe_truncate(&html, 25000).len(); format!("<!-- {} -->\n{}", url, &html[..end]) },
+        "html" => {
+            let end = super::safe_truncate(&html, 25000).len();
+            format!("<!-- {} -->\n{}", url, &html[..end])
+        }
         _ => extract_text(&html, url),
     }
 }
@@ -220,7 +245,11 @@ fn extract_text(html: &str, url: &str) -> String {
     }
 
     // Collapse whitespace
-    let text = regex::Regex::new(r"\s+").unwrap().replace_all(&text, " ").trim().to_string();
+    let text = regex::Regex::new(r"\s+")
+        .unwrap()
+        .replace_all(&text, " ")
+        .trim()
+        .to_string();
 
     let title = if let Ok(title_sel) = Selector::parse("title") {
         doc.select(&title_sel)
@@ -233,7 +262,11 @@ fn extract_text(html: &str, url: &str) -> String {
 
     let preview = if text.len() > 12000 {
         let truncated = super::safe_truncate(&text, 12000);
-        format!("{}...\n... ({} chars total, truncated)", truncated, text.len())
+        format!(
+            "{}...\n... ({} chars total, truncated)",
+            truncated,
+            text.len()
+        )
     } else {
         text
     };

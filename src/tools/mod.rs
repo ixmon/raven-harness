@@ -10,8 +10,8 @@ use anyhow::Result;
 use serde_json::json;
 
 pub use self::exec::exec;
-pub use self::fs::{read_file, write_file, patch_file, grep_files, list_dir};
-pub use self::web::{web_search, browse};
+pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
+pub use self::web::{browse, web_search};
 
 pub mod backend;
 
@@ -284,7 +284,7 @@ mod tests {
         let t = safe_truncate(s, 3);
         assert!(t.len() <= 3);
         assert!(std::str::from_utf8(t.as_bytes()).is_ok());
-        assert_eq!(t, "caf");  // é skipped cleanly
+        assert_eq!(t, "caf"); // é skipped cleanly
 
         // Multi-char boundary safety
         let emoji = "hello😀world"; // 😀 is 4 bytes

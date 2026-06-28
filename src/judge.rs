@@ -1,9 +1,9 @@
 // Judge module - handles inference-based judgment of agent progress
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use crate::agent::{TurnJudge, ActionRecord};
+use crate::agent::{ActionRecord, TurnJudge};
 use crate::chat_backend::ChatBackend;
 use crate::session::SessionMeta;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub struct Judge {
     client: Arc<Mutex<ChatBackend>>,
@@ -24,8 +24,12 @@ impl Judge {
     ) -> TurnJudge {
         const JUDGE_MAX_TOKENS: u32 = 256;
 
-        if (meta.current_goal.trim().is_empty() || meta.current_goal.contains("not yet established"))
-            && meta.completion_criteria.as_ref().is_none_or(|c| c.trim().is_empty())
+        if (meta.current_goal.trim().is_empty()
+            || meta.current_goal.contains("not yet established"))
+            && meta
+                .completion_criteria
+                .as_ref()
+                .is_none_or(|c| c.trim().is_empty())
         {
             return TurnJudge::Continue { suggestion: None };
         }
@@ -51,13 +55,11 @@ impl Judge {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let mut judge_prompt = format!(
-            "Current goal: {}\n\n",
-            meta.current_goal
-        );
+        let mut judge_prompt = format!("Current goal: {}\n\n", meta.current_goal);
 
         if !meta.achievement_tests.is_empty() {
-            judge_prompt.push_str("Success criteria (only answer FULFILLED if these are clearly met):\n");
+            judge_prompt
+                .push_str("Success criteria (only answer FULFILLED if these are clearly met):\n");
             for test in &meta.achievement_tests {
                 judge_prompt.push_str(&format!("- {}\n", test));
             }
@@ -65,9 +67,12 @@ impl Judge {
         }
 
         if let Some(criteria) = &meta.completion_criteria {
-            judge_prompt.push_str("Agent-defined 'done' definition (what completion looks like):\n");
+            judge_prompt
+                .push_str("Agent-defined 'done' definition (what completion looks like):\n");
             judge_prompt.push_str(criteria);
-            judge_prompt.push_str("\n(Answer FULFILLED only if recent actions clearly satisfy this definition.)\n\n");
+            judge_prompt.push_str(
+                "\n(Answer FULFILLED only if recent actions clearly satisfy this definition.)\n\n",
+            );
         }
 
         // Explicitly include the original user request so the judge knows the full intent
@@ -129,14 +134,29 @@ impl Judge {
         if upper.contains("FULFILLED") {
             TurnJudge::Fulfilled { note: response }
         } else if upper.contains("STUCK") {
-            let reason = lines.get(1).unwrap_or(&"Repeating similar actions without progress").to_string();
-            let suggested = lines.get(2).unwrap_or(&"What additional information or direction do you have?").to_string();
-            TurnJudge::Stuck { reason, suggested_guidance: suggested.to_string() }
+            let reason = lines
+                .get(1)
+                .unwrap_or(&"Repeating similar actions without progress")
+                .to_string();
+            let suggested = lines
+                .get(2)
+                .unwrap_or(&"What additional information or direction do you have?")
+                .to_string();
+            TurnJudge::Stuck {
+                reason,
+                suggested_guidance: suggested.to_string(),
+            }
         } else {
             let suggestion = if lines.len() > 1 {
                 let rest = lines[1..].join(" ").trim().to_string();
-                if rest.is_empty() { None } else { Some(rest) }
-            } else { None };
+                if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest)
+                }
+            } else {
+                None
+            };
             TurnJudge::Continue { suggestion }
         }
     }
@@ -165,6 +185,7 @@ mod tests {
             repo_cache: crate::session::RepoCache::default(),
             recent_turns_summary: String::new(),
             exec_approval_mode: crate::session::ExecApprovalMode::default(),
+            agent_mode: "talk".to_string(),
             initial_analysis: None,
             last_judge: None,
         }
@@ -185,16 +206,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_judge_fulfilled() {
-        let mock = MockChatBackend::new(vec![
-            ChatResponse {
-                content: "FULFILLED\nAll tests pass".to_string(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".to_string()),
-                usage: None,
-            }
-        ]);
+        let mock = MockChatBackend::new(vec![ChatResponse {
+            content: "FULFILLED\nAll tests pass".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        }]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
-        
+
         let meta = make_test_meta();
         let result = judge.judge_turn(&meta, "test", &[]).await;
         assert!(matches!(result, TurnJudge::Fulfilled { .. }));
@@ -202,16 +221,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_judge_continue() {
-        let mock = MockChatBackend::new(vec![
-            ChatResponse {
-                content: "CONTINUE\nStill working\nRun the script to see output".to_string(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".to_string()),
-                usage: None,
-            }
-        ]);
+        let mock = MockChatBackend::new(vec![ChatResponse {
+            content: "CONTINUE\nStill working\nRun the script to see output".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        }]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
-        
+
         let meta = make_test_meta();
         let result = judge.judge_turn(&meta, "test", &[]).await;
         assert!(matches!(result, TurnJudge::Continue { .. }));
@@ -219,16 +236,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_judge_stuck() {
-        let mock = MockChatBackend::new(vec![
-            ChatResponse {
-                content: "STUCK\nRepeating same action\nAsk user for guidance".to_string(),
-                tool_calls: vec![],
-                finish_reason: Some("stop".to_string()),
-                usage: None,
-            }
-        ]);
+        let mock = MockChatBackend::new(vec![ChatResponse {
+            content: "STUCK\nRepeating same action\nAsk user for guidance".to_string(),
+            tool_calls: vec![],
+            finish_reason: Some("stop".to_string()),
+            usage: None,
+        }]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
-        
+
         let meta = make_test_meta();
         let result = judge.judge_turn(&meta, "test", &[]).await;
         assert!(matches!(result, TurnJudge::Stuck { .. }));
@@ -238,7 +253,7 @@ mod tests {
     async fn test_judge_no_criteria() {
         let mock = MockChatBackend::new(vec![]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
-        
+
         let mut meta = make_test_meta();
         meta.current_goal = "not yet established".to_string();
         let result = judge.judge_turn(&meta, "test", &[]).await;

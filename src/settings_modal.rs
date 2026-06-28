@@ -11,10 +11,10 @@ use ratatui::{
     Frame,
 };
 
-use raven_tui::agent::Agent;
-use raven_tui::config::{Config, ContextBudget, InferenceEndpoint};
 use crate::key_edit::{map_key_to_edit, EditAction};
 use crate::keystore::Keystore;
+use raven_tui::agent::Agent;
+use raven_tui::config::{Config, ContextBudget, InferenceEndpoint};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -284,7 +284,10 @@ pub enum SettingsAction {
     Close,
     Notify(String),
     Trace(String),
-    DisplayUpdate { model: String, budget: ContextBudget },
+    DisplayUpdate {
+        model: String,
+        budget: ContextBudget,
+    },
     ActiveIdx(usize),
 }
 
@@ -310,13 +313,20 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
         SettingsMode::Adding => {
             modal_lines.lines.push(Line::from(Span::styled(
                 "  Add New Endpoint",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
             modal_lines.lines.push(Line::from(""));
             render_wizard_fields(
                 &mut modal_lines,
                 &["Label", "Base URL", "Model", "API Key (optional)"],
-                &[&settings.new_label, &settings.new_url, &settings.new_model, &settings.new_key],
+                &[
+                    &settings.new_label,
+                    &settings.new_url,
+                    &settings.new_model,
+                    &settings.new_key,
+                ],
                 settings.add_step,
                 &settings.edit_buf,
                 settings.edit_cursor,
@@ -330,7 +340,9 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
         SettingsMode::Editing => {
             modal_lines.lines.push(Line::from(Span::styled(
                 "  Edit Endpoint",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
             modal_lines.lines.push(Line::from(""));
             let key_display = if settings.edit_step > 3 {
@@ -345,7 +357,12 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
             render_wizard_fields(
                 &mut modal_lines,
                 &["Label", "Base URL", "Model", "API Key (blank=keep)"],
-                &[&settings.new_label, &settings.new_url, &settings.new_model, &key_display],
+                &[
+                    &settings.new_label,
+                    &settings.new_url,
+                    &settings.new_model,
+                    &key_display,
+                ],
                 settings.edit_step,
                 &settings.edit_buf,
                 settings.edit_cursor,
@@ -359,7 +376,9 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
         SettingsMode::List => {
             modal_lines.lines.push(Line::from(Span::styled(
                 "  Inference Endpoints",
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
             modal_lines.lines.push(Line::from(""));
 
@@ -368,7 +387,9 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
                 let is_active = i == settings.active_endpoint_idx;
                 let marker = if is_active { "●" } else { "○" };
                 let name_style = if is_sel {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -419,13 +440,26 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
                 Span::styled("navigate", Style::default().fg(Color::Gray)),
                 Span::styled("  Enter ", Style::default().fg(Color::DarkGray)),
                 Span::styled("switch", Style::default().fg(Color::Gray)),
-                Span::styled("  A ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "  A ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("add", Style::default().fg(Color::Gray)),
-                Span::styled("  E ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "  E ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("edit", Style::default().fg(Color::Gray)),
             ]));
             modal_lines.lines.push(Line::from(vec![
-                Span::styled("  D ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "  D ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("delete", Style::default().fg(Color::Gray)),
                 Span::styled("  Esc ", Style::default().fg(Color::DarkGray)),
                 Span::styled("close", Style::default().fg(Color::Gray)),
@@ -439,7 +473,9 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
             Block::default()
                 .title(Span::styled(
                     " Settings ",
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .borders(Borders::ALL)
                 .border_type(BorderType::Double)
@@ -467,7 +503,9 @@ fn render_wizard_fields(
             " "
         };
         let label_style = if is_current {
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
         } else if i < current_step {
             Style::default().fg(Color::Green)
         } else {
@@ -523,13 +561,53 @@ pub async fn handle_settings_key(
                 settings.apply_edit_action(action);
             } else {
                 match key.code {
-                KeyCode::Enter => {
-                    if settings.mode == SettingsMode::Adding {
-                        if settings.add_step == 1 {
+                    KeyCode::Enter => {
+                        if settings.mode == SettingsMode::Adding {
+                            if settings.add_step == 1 {
+                                let url = settings.edit_buf.clone();
+                                settings.new_url = url.clone();
+                                settings.add_step = 2;
+                                match raven_tui::llm::probe_server(&url, "", None).await {
+                                    Some(probe) => {
+                                        let model_id = probe.model_id.clone();
+                                        settings.new_model = model_id.clone();
+                                        settings.edit_buf = model_id.clone();
+                                        settings.edit_cursor = settings.edit_buf.len();
+                                        actions.push(SettingsAction::Trace(format!(
+                                            "   ↳ detected: {} ({} tokens)",
+                                            model_id, probe.context_tokens
+                                        )));
+                                    }
+                                    None => {
+                                        settings.edit_buf.clear();
+                                        settings.edit_cursor = 0;
+                                        actions.push(SettingsAction::Trace(
+                                        "   ↳ could not probe /v1/models — enter model manually"
+                                            .into(),
+                                    ));
+                                    }
+                                }
+                            } else if settings.add_step < 3 {
+                                settings.advance_add_field();
+                            } else {
+                                settings.new_key = settings.edit_buf.clone();
+                                actions.extend(finish_add(settings, config, keystore));
+                            }
+                        } else if settings.mode == SettingsMode::Editing && settings.edit_step == 1
+                        {
                             let url = settings.edit_buf.clone();
                             settings.new_url = url.clone();
-                            settings.add_step = 2;
-                            match raven_tui::llm::probe_server(&url, "", None).await {
+                            let api_key = if settings.new_key.is_empty() {
+                                settings
+                                    .endpoints
+                                    .get(settings.editing_idx.unwrap_or(0))
+                                    .and_then(|ep| ep.api_key.as_deref())
+                            } else {
+                                Some(settings.new_key.as_str())
+                            };
+                            settings.edit_step = 2;
+                            let hint = settings.new_model.as_str();
+                            match raven_tui::llm::probe_server(&url, hint, api_key).await {
                                 Some(probe) => {
                                     let model_id = probe.model_id.clone();
                                     settings.new_model = model_id.clone();
@@ -541,64 +619,26 @@ pub async fn handle_settings_key(
                                     )));
                                 }
                                 None => {
-                                    settings.edit_buf.clear();
-                                    settings.edit_cursor = 0;
+                                    settings.edit_buf = settings.new_model.clone();
+                                    settings.edit_cursor = settings.edit_buf.len();
                                     actions.push(SettingsAction::Trace(
-                                        "   ↳ could not probe /v1/models — enter model manually"
+                                        "   ↳ could not probe /v1/models — edit model manually"
                                             .into(),
                                     ));
                                 }
                             }
-                        } else if settings.add_step < 3 {
-                            settings.advance_add_field();
+                        } else if settings.edit_step < 3 {
+                            settings.advance_edit_field();
                         } else {
                             settings.new_key = settings.edit_buf.clone();
-                            actions.extend(finish_add(settings, config, keystore));
+                            actions.extend(finish_edit(settings, config, keystore, agent).await);
                         }
-                    } else if settings.mode == SettingsMode::Editing && settings.edit_step == 1 {
-                        let url = settings.edit_buf.clone();
-                        settings.new_url = url.clone();
-                        let api_key = if settings.new_key.is_empty() {
-                            settings
-                                .endpoints
-                                .get(settings.editing_idx.unwrap_or(0))
-                                .and_then(|ep| ep.api_key.as_deref())
-                        } else {
-                            Some(settings.new_key.as_str())
-                        };
-                        settings.edit_step = 2;
-                        let hint = settings.new_model.as_str();
-                        match raven_tui::llm::probe_server(&url, hint, api_key).await {
-                            Some(probe) => {
-                                let model_id = probe.model_id.clone();
-                                settings.new_model = model_id.clone();
-                                settings.edit_buf = model_id.clone();
-                                settings.edit_cursor = settings.edit_buf.len();
-                                actions.push(SettingsAction::Trace(format!(
-                                    "   ↳ detected: {} ({} tokens)",
-                                    model_id, probe.context_tokens
-                                )));
-                            }
-                            None => {
-                                settings.edit_buf = settings.new_model.clone();
-                                settings.edit_cursor = settings.edit_buf.len();
-                                actions.push(SettingsAction::Trace(
-                                    "   ↳ could not probe /v1/models — edit model manually".into(),
-                                ));
-                            }
-                        }
-                    } else if settings.edit_step < 3 {
-                        settings.advance_edit_field();
-                    } else {
-                        settings.new_key = settings.edit_buf.clone();
-                        actions.extend(finish_edit(settings, config, keystore, agent).await);
                     }
-                }
-                KeyCode::Esc => {
-                    settings.mode = SettingsMode::List;
-                    settings.clear_wizard();
-                }
-                _ => {}
+                    KeyCode::Esc => {
+                        settings.mode = SettingsMode::List;
+                        settings.clear_wizard();
+                    }
+                    _ => {}
                 }
             }
         }
@@ -685,7 +725,10 @@ fn finish_add(
             "Added endpoint: {}",
             settings.new_label
         ))),
-        Err(e) => actions.push(SettingsAction::Notify(format!("Failed to save endpoint: {}", e))),
+        Err(e) => actions.push(SettingsAction::Notify(format!(
+            "Failed to save endpoint: {}",
+            e
+        ))),
     }
 
     let session_endpoint = SettingsModal::session_list_head(keystore, config);
@@ -783,14 +826,16 @@ async fn finish_edit(
                     "Updated endpoint: {}",
                     settings.new_label
                 )));
-                let session_endpoint =
-                    SettingsModal::session_list_head(keystore, config);
+                let session_endpoint = SettingsModal::session_list_head(keystore, config);
                 settings.rebuild_endpoints(&session_endpoint, keystore);
                 if list_idx == settings.active_endpoint_idx {
                     actions.extend(switch_to_endpoint(settings, config, agent, list_idx).await);
                 }
             }
-            Err(e) => actions.push(SettingsAction::Notify(format!("Failed to update endpoint: {}", e))),
+            Err(e) => actions.push(SettingsAction::Notify(format!(
+                "Failed to update endpoint: {}",
+                e
+            ))),
         }
     }
 
@@ -814,29 +859,29 @@ async fn switch_to_endpoint(
     )));
 
     let mut active = ep.clone();
-    let budget = match raven_tui::llm::probe_server(&ep.base_url, &ep.model, ep.api_key.as_deref()).await
-    {
-        Some(probe) => {
-            active.model = probe.model_id.clone();
-            if probe.model_id != ep.model {
+    let budget =
+        match raven_tui::llm::probe_server(&ep.base_url, &ep.model, ep.api_key.as_deref()).await {
+            Some(probe) => {
+                active.model = probe.model_id.clone();
+                if probe.model_id != ep.model {
+                    actions.push(SettingsAction::Trace(format!(
+                        "   ↳ model: {} (configured: {})",
+                        probe.model_id, ep.model
+                    )));
+                }
                 actions.push(SettingsAction::Trace(format!(
-                    "   ↳ model: {} (configured: {})",
-                    probe.model_id, ep.model
+                    "   ↳ context: {} tokens (probed)",
+                    probe.context_tokens
                 )));
+                ContextBudget::from_context_tokens(probe.context_tokens, config.max_rounds)
             }
-            actions.push(SettingsAction::Trace(format!(
-                "   ↳ context: {} tokens (probed)",
-                probe.context_tokens
-            )));
-            ContextBudget::from_context_tokens(probe.context_tokens, config.max_rounds)
-        }
-        None => {
-            actions.push(SettingsAction::Trace(
-                "   ↳ probe failed, using default 8192".into(),
-            ));
-            ContextBudget::default_fallback()
-        }
-    };
+            None => {
+                actions.push(SettingsAction::Trace(
+                    "   ↳ probe failed, using default 8192".into(),
+                ));
+                ContextBudget::default_fallback()
+            }
+        };
 
     match agent.try_lock() {
         Ok(mut ag) => {

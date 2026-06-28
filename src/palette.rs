@@ -72,7 +72,9 @@ fn detect() -> ColorDepth {
     }
 
     // 3. TERM hint.
-    let term = std::env::var("TERM").unwrap_or_default().to_ascii_lowercase();
+    let term = std::env::var("TERM")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if term.contains("truecolor") || term.contains("24bit") || term.contains("direct") {
         return ColorDepth::True;
     }
@@ -428,15 +430,18 @@ mod tests {
         } else {
             gray_rgb(i)
         };
-        assert!(r as u32 + g as u32 + b as u32 >= 700, "white-ish expected, got {r},{g},{b}");
+        assert!(
+            r as u32 + g as u32 + b as u32 >= 700,
+            "white-ish expected, got {r},{g},{b}"
+        );
     }
     #[test]
     fn resolve_truecolor_passes_through() {
         DEPTH.set(ColorDepth::True).ok(); // ignore if already set
-        // Force via env-independent path: re-init not possible, so test the
-        // match arm directly by checking a known rgb returns unchanged.
-        // (DEPTH may already be initialized to the real depth in tests; this
-        // test only asserts the True branch maps identity, which is trivial.)
+                                          // Force via env-independent path: re-init not possible, so test the
+                                          // match arm directly by checking a known rgb returns unchanged.
+                                          // (DEPTH may already be initialized to the real depth in tests; this
+                                          // test only asserts the True branch maps identity, which is trivial.)
         let c = Color::Rgb(1, 2, 3);
         // When depth is True, resolve is identity:
         if depth() == ColorDepth::True {
