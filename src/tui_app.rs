@@ -147,7 +147,7 @@ struct App {
     selected_mode_idx: usize,
     approval_modes: [&'static str; 4],
 
-    // Agent mode submenu for /mode (talk, think, ...)
+    // Run mode submenu for /run-mode (talk, think, ...)
     agent_mode_menu_active: bool,
     selected_agent_mode_idx: usize,
     agent_modes: [&'static str; 5],
@@ -821,7 +821,7 @@ impl App {
         true
     }
 
-    /// Handle a key when the /mode (agent mode) selection menu is open.
+    /// Handle a key when the /run-mode selection menu is open.
     /// Returns `true` if the key was consumed (caller should `continue`).
     async fn handle_agent_mode_menu_key(
         &mut self,
@@ -847,7 +847,7 @@ impl App {
             KeyCode::Enter => {
                 let chosen = self.agent_modes[self.selected_agent_mode_idx];
                 self.left_committed
-                    .push(format!("Agent mode set to: {}", chosen));
+                    .push(format!("Run mode set to: {}", chosen));
                 self.left_follow_output = true;
                 self.left_scroll = 10_000;
 
@@ -1483,6 +1483,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.right_scroll = 10_000;
                         // keep generation timers running; this is mid-turn
                     }
+                    UiUpdate::SuperJudgeBegin => {
+                        app.is_processing = true;
+                        app.needs_redraw = true;
+                        app.trace_lines.push("🔍 SUPER JUDGE reviewing the work...".to_string());
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
+                    }
                     UiUpdate::Usage {
                         prompt_tokens,
                         completion_tokens,
@@ -1528,7 +1535,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             continue;
                         }
 
-                        // Handle /mode selection menu
+                        // Handle /run-mode selection menu
                         if app.handle_mode_menu_key(key, &agent).await {
                             continue;
                         }
@@ -1639,6 +1646,23 @@ async fn run_app<B: ratatui::backend::Backend>(
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             continue;
+        }
+
+        // Drain any pending agent updates even when idle (e.g. Super Judge start after turn)
+        while let Ok(update) = rx.try_recv() {
+            match update {
+                UiUpdate::SuperJudgeBegin => {
+                    app.is_processing = true;
+                    app.needs_redraw = true;
+                    app.trace_lines.push("🔍 SUPER JUDGE reviewing the work...".to_string());
+                    app.right_follow_output = true;
+                    app.right_scroll = 10_000;
+                    // next loop iteration will enter the is_processing branch
+                }
+                _ => {
+                    // ignore other late updates when idle
+                }
+            }
         }
 
         // Normal input handling when idle — read from the input channel
@@ -1924,6 +1948,69 @@ async fn run_app<B: ratatui::backend::Backend>(
                                                     final_text: r.final_text,
                                                 })
                                                 .await;
+
+                                            // Super Judge for run-mode == "work"
+                                            // Let Processing shut off briefly for UX, then if work mode, turn it back on
+                                            // and run Super Judge synchronously.
+                                            if agent.current_agent_mode() == "work" {
+                                                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                                let _ = tx2.send(UiUpdate::SuperJudgeBegin).await;
+
+                                                // Super Judge for work mode: inject review request as user message.
+                                                // The review prompt gives adversarial perspective and instructs use of read/exec for verification.
+                                                // Re-drive with empty prompt gives it a full "mini agent turn" with tools, thinking, autonomy.
+                                                // Recent thinking blocks are available in the model's context.
+                                                let last_req = if let Some(s) = agent.session() {
+                                                    s.meta.last_user_request.clone().unwrap_or_else(|| s.meta.current_goal.clone())
+                                                } else {
+                                                    "the task".to_string()
+                                                };
+
+                                                let review_msg = format!(
+                                                    "🔍 SUPER JUDGE (external adversarial reviewer - some dude wrote this code, find bugs like a tough trainer/Morpheus):\n\n\
+                                                     Original goal / last user request:\n{}\n\n\
+                                                     Do real verification work: use read + exec tools (stop and report on the FIRST error, warning or test failure). \
+                                                     If you detect a death spiral (repeating the same failing actions), note 'death spiral detected' and give advice to break the pattern. \
+                                                     If the work appears complete after your verification, say exactly 'this work appears to be complete'.\n\n\
+                                                     Otherwise give the goal plus specific problems found and concrete next steps.",
+                                                    last_req
+                                                );
+
+                                                agent.push_message("user", &review_msg);
+
+                                                // Make super judge activity visible in thinking pane
+                                                let _ = tx2.send(UiUpdate::Thinking(review_msg.clone())).await;
+
+                                                // Re-invoke drive_turn with empty prompt (the review_msg is already the last user input).
+                                                // This gives the Super Judge its mini agent turn with full autonomy and tool use.
+                                                let result2 = raven_tui::agent_driver::drive_turn(
+                                                    &mut agent,
+                                                    "",
+                                                    &mut observer,
+                                                )
+                                                .await;
+
+                                                match result2 {
+                                                    Ok(r2) => {
+                                                        let metrics = &r2.metrics;
+                                                        let _ = tx2
+                                                            .send(UiUpdate::Usage {
+                                                                prompt_tokens: Some(metrics.prompt_tokens as u32),
+                                                                completion_tokens: Some(metrics.completion_tokens as u32),
+                                                                total_tokens: Some(metrics.total_tokens as u32),
+                                                            })
+                                                            .await;
+                                                        let _ = tx2
+                                                            .send(UiUpdate::Done {
+                                                                final_text: r2.final_text,
+                                                            })
+                                                            .await;
+                                                    }
+                                                    Err(e) => {
+                                                        let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
+                                                    }
+                                                }
+                                            }
                                         }
                                         Err(e) => {
                                             let _ = tx2.send(UiUpdate::Error(e.to_string())).await;
@@ -2108,6 +2195,7 @@ enum UiUpdate {
         used_tokens: u32,
     }, // pushed from agent task after tool rounds
     InterjectRestart,
+    SuperJudgeBegin,
     // API-reported usage data for TPS calculation
     Usage {
         prompt_tokens: Option<u32>,

@@ -1019,6 +1019,11 @@ History:
             .unwrap_or_else(|| "talk".to_string())
     }
 
+    /// For Super Judge (work mode) to perform its own LLM calls.
+    pub fn backend(&self) -> Arc<Mutex<ChatBackend>> {
+        self.client.clone()
+    }
+
     /// Set agent operating mode and persist.
     pub fn set_agent_mode(&mut self, mode: &str) {
         let normalized = normalize_agent_mode(mode);

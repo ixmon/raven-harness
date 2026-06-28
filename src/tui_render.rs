@@ -77,7 +77,7 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
             Style::default().fg(Color::Yellow),
         ),
         Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Mode:", Style::default().fg(Color::DarkGray)),
+        Span::styled("Run Mode:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             data.agent_mode,
             Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff)),
@@ -670,7 +670,7 @@ pub fn draw_overlays(
         draw_mode_menu(f, input_area, approval_modes, selected_mode_idx, "Approval Mode");
     }
     if agent_mode_menu_active {
-        draw_mode_menu(f, input_area, agent_modes, selected_agent_mode_idx, "Agent Mode");
+        draw_mode_menu(f, input_area, agent_modes, selected_agent_mode_idx, "Run Mode");
     }
     draw_settings_modal(f, screen, settings);
 }

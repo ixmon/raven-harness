@@ -183,7 +183,9 @@ pub async fn drive_turn(
     // latest user input onto the conversation as a role:user turn so the model
     // has proper alternating history context. (The SESSION CONTEXT injection
     // block also includes "Latest User Message" + summaries + repo for richness.)
-    agent.on_new_user_input(prompt);
+    if !prompt.trim().is_empty() {
+        agent.on_new_user_input(prompt);
+    }
 
     let max_rounds = agent.current_config().max_rounds.clamp(1, MAX_TOOL_ROUNDS);
     let tools_schema = tools::all_tools(&agent.current_config().flags);

@@ -126,7 +126,7 @@ pub struct SessionMeta {
     pub exec_approval_mode: ExecApprovalMode,
 
     /// Agent operating mode: talk | think | research | work | dream (default: talk).
-    /// Shown in status bar as "Mode:". May influence future prompting / behavior.
+    /// Shown in status bar as "Run Mode:". May influence future prompting / behavior.
     #[serde(default = "default_agent_mode")]
     pub agent_mode: String,
 

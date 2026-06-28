@@ -153,7 +153,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                     )
                 };
             let status = format!(
-                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Approval:  {}\n  Mode:      {}\n  History:   {} entries",
+                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Approval:  {}\n  Run Mode:  {}\n  History:   {} entries",
                 endpoint_label,
                 model,
                 base_url,
@@ -189,13 +189,13 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             scroll_left(ctx.left_committed);
             SlashDispatch::Handled
         }
-        "mode" => {
+        "run-mode" => {
             let parts: Vec<&str> = prompt
                 .trim_start_matches('/')
                 .split_whitespace()
                 .collect();
             if parts.len() > 1 {
-                // direct set via arg, e.g. /mode research
+                // direct set via arg, e.g. /run-mode research
                 let arg = parts[1].to_lowercase();
                 let normalized = if ["talk", "think", "research", "work", "dream"]
                     .contains(&arg.as_str())
@@ -211,7 +211,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                     }
                 }
                 ctx.left_committed
-                    .push(format!("Agent mode set to: {}", normalized));
+                    .push(format!("Run mode set to: {}", normalized));
                 scroll_left(ctx.left_committed);
                 clear_slash_input(ctx);
                 *ctx.slash_selected = 0;
@@ -231,7 +231,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                 clear_slash_input(ctx);
                 *ctx.slash_selected = 0;
                 ctx.left_committed.push(
-                    "Use ↑/↓ to select agent mode, Enter to confirm, Esc to cancel.".to_string(),
+                    "Use ↑/↓ to select run mode, Enter to confirm, Esc to cancel.".to_string(),
                 );
                 scroll_left(ctx.left_committed);
                 SlashDispatch::Handled
@@ -336,8 +336,8 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
             desc: "Change execution approval mode",
         },
         SlashCommand {
-            name: "mode",
-            desc: "Set agent mode (talk, think, research, work, dream)",
+            name: "run-mode",
+            desc: "Set run mode (talk, think, research, work, dream)",
         },
         SlashCommand {
             name: "settings",
@@ -380,7 +380,7 @@ Available commands:
 /reset         Reset conversation memory (session goals stay)
 /status        Show endpoint, model, workspace
 /approval-mode Change execution approval mode (Babysitter / Spring Break / Vegas / Thunderdome)
-/mode          Set agent mode (talk, think, research, work, dream)
+/run-mode      Set run mode (talk, think, research, work, dream)
 /settings      Manage inference endpoints (add/switch/edit/delete)
 /search        Search conversation or trace (or Ctrl-F)
 /quit or /exit Quit the TUI
