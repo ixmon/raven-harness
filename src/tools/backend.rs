@@ -116,6 +116,12 @@ impl MockToolBackend {
 
         // Session tools are handled by Agent; keep acks uniform if they slip through.
         match name {
+            "read" => {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let lines = args.get("lines").and_then(|v| v.as_str());
+                let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+                return Ok(read_file(path, lines, workspace, max_read_lines, full));
+            }
             "update_goal" => {
                 let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
                 return Ok(format!(
@@ -191,7 +197,8 @@ async fn real_execute(
         "read" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let lines = args.get("lines").and_then(|v| v.as_str());
-            Ok(read_file(path, lines, workspace, max_read_lines))
+            let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(read_file(path, lines, workspace, max_read_lines, full))
         }
         "write" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");

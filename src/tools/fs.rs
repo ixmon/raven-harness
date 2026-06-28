@@ -54,6 +54,7 @@ pub fn read_file(
     lines: Option<&str>,
     workspace: &Path,
     max_lines: usize,
+    full: bool,
 ) -> String {
     let path = match resolve(workspace, user_path) {
         Ok(p) => p,
@@ -95,8 +96,11 @@ pub fn read_file(
             }
 
             // Default: show first max_lines or whole file (the 2MB guard above protects against truly huge files)
+            // full=true allows larger reads (for refactoring etc.)
             let mut out = format!("📄 {} ({} lines)\n", path.display(), all_lines.len());
-            let limit = if all_lines.len() > max_lines {
+            let limit = if full {
+                all_lines.len()
+            } else if all_lines.len() > max_lines {
                 max_lines
             } else {
                 all_lines.len()
@@ -104,7 +108,7 @@ pub fn read_file(
             for (i, line) in all_lines[..limit].iter().enumerate() {
                 out.push_str(&format!("{:4} | {}\n", i + 1, line));
             }
-            if all_lines.len() > limit {
+            if !full && all_lines.len() > limit {
                 out.push_str(&format!(
                     "... ({} more lines, use lines=\"{}-\" to continue)",
                     all_lines.len() - limit,

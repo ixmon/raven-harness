@@ -63,12 +63,13 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read".into(),
-                description: "Read a file's contents. Use lines=\"N-M\" for a specific range. Always read before editing.".into(),
+                description: "Read a file's contents. Use lines=\"N-M\" or full=true to read more/entire file (useful for refactoring). Always read before editing.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Path to the file (relative to workspace or absolute)" },
-                        "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" }
+                        "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" },
+                        "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" }
                     },
                     "required": ["path"]
                 }),

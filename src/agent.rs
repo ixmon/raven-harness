@@ -872,6 +872,7 @@ History:
                     None,
                     &self.config.workspace,
                     self.config.context_budget.read_line_limit,
+                    false,
                 );
                 let mtime =
                     crate::session::current_file_mtime_for_agent(&self.config.workspace.join(&rel));
@@ -886,6 +887,7 @@ History:
                 None,
                 &self.config.workspace,
                 self.config.context_budget.read_line_limit,
+                false,
             );
             return Some(format!("📄 {}:\n{}", rel, raw));
         }

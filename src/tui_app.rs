@@ -137,6 +137,9 @@ struct App {
     generation_active_time: f64,
     last_token_time: Option<std::time::Instant>,
 
+    // For Super Judge inactivity trigger in work mode
+    last_turn_end: Option<std::time::Instant>,
+
     // Approval
     pending_approval: Option<String>,
     approval_responder: Option<tokio::sync::oneshot::Sender<bool>>,
@@ -231,6 +234,7 @@ impl App {
             api_tps: 0.0,
             generation_active_time: 0.0,
             last_token_time: None,
+            last_turn_end: None,
             pending_approval: None,
             approval_responder: None,
             needs_redraw: true,
@@ -1432,6 +1436,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.api_total_tokens = None;
                         app.needs_redraw = true;
                         app.is_processing = false;
+                        app.last_turn_end = Some(std::time::Instant::now());
                         schedule_balance_refresh(&agent, &balance_tx);
                     }
                     UiUpdate::Error(e) => {
@@ -1454,6 +1459,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         app.needs_redraw = true;
                         app.is_processing = false;
+                        app.last_turn_end = Some(std::time::Instant::now());
                         app.generation_active_time = 0.0;
                         app.last_token_time = None;
                         schedule_balance_refresh(&agent, &balance_tx);
@@ -1665,6 +1671,75 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        // In work mode, trigger Super Judge on >10s inactivity (in addition to clean ends)
+        if !app.is_processing {
+            if let Some(end) = app.last_turn_end {
+                if end.elapsed() > Duration::from_secs(10) {
+                    if let Ok(ag) = agent.try_lock() {
+                        if ag.current_agent_mode() == "work" {
+                            app.last_turn_end = None;
+                            app.is_processing = true;
+                            app.needs_redraw = true;
+                            app.trace_lines.push("🔍 SUPER JUDGE (idle >10s) reviewing the work...".to_string());
+                            app.right_follow_output = true;
+                            app.right_scroll = 10_000;
+                            // spawn review
+                            let agent_c = agent.clone();
+                            let tx_c = tx.clone();
+                            let appr_c = approval_req_tx.clone();
+                            let stop_c = stop_signal.clone();
+                            let q_c = queued_interject.clone();
+                            let i_c = instant_interject.clone();
+                            tokio::spawn(async move {
+                                let mut ag = agent_c.lock().await;
+                                if ag.current_agent_mode() != "work" {
+                                    return;
+                                }
+                                let mode = ag.current_exec_mode();
+                                let mut obs = TuiObserver {
+                                    tx: tx_c.clone(),
+                                    approval_req_tx: appr_c,
+                                    stop: stop_c,
+                                    queued: q_c,
+                                    instant: i_c,
+                                    denials_this_turn: 0,
+                                    halt_tools: false,
+                                    exec_mode: mode,
+                                };
+                                let last_req = if let Some(s) = ag.session() {
+                                    s.meta.last_user_request.clone().unwrap_or_else(|| s.meta.current_goal.clone())
+                                } else {
+                                    "the task".to_string()
+                                };
+                                let review_msg = format!(
+                                    "🔍 SUPER JUDGE (idle timeout review):\n\nOriginal goal / last user request:\n{}\n\nReview using read + exec. Note death spirals. Say complete if done.",
+                                    last_req
+                                );
+                                ag.push_message("user", &review_msg);
+                                let _ = tx_c.send(UiUpdate::Thinking(review_msg.clone())).await;
+                                let res = raven_tui::agent_driver::drive_turn(&mut ag, "", &mut obs).await;
+                                match res {
+                                    Ok(r) => {
+                                        let m = &r.metrics;
+                                        let _ = tx_c.send(UiUpdate::Usage {
+                                            prompt_tokens: Some(m.prompt_tokens as u32),
+                                            completion_tokens: Some(m.completion_tokens as u32),
+                                            total_tokens: Some(m.total_tokens as u32),
+                                        }).await;
+                                        let _ = tx_c.send(UiUpdate::Done { final_text: r.final_text }).await;
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_c.send(UiUpdate::Error(e.to_string())).await;
+                                    }
+                                }
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         // Normal input handling when idle — read from the input channel
         let input_ev = tokio::time::timeout(Duration::from_millis(50), input_rx.recv()).await;
         if let Ok(Some(ev)) = input_ev {
@@ -1872,6 +1947,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 app.slash_selected = 0;
                                 app.is_processing = true;
                                 app.processing_start = Some(std::time::Instant::now());
+                                app.last_turn_end = None;
                                 app.tokens_processed = 0;
                                 app.generation_active_time = 0.0;
                                 app.last_token_time = None;
