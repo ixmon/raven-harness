@@ -283,7 +283,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         instant: instant_interject.clone(),
         denials_this_turn: 0,
         halt_tools: false,
-        exec_mode: agent.lock().await.current_exec_mode().clone(),
+        exec_mode: agent.lock().await.current_exec_mode(),
     };
 
     app.needs_redraw = true;

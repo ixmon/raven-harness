@@ -925,15 +925,13 @@ pub fn list_workspaces() -> Result<Vec<WorkspaceEntry>> {
     let mut ws_map: std::collections::HashMap<PathBuf, Vec<String>> = std::collections::HashMap::new();
 
     if let Ok(rd) = fs::read_dir(&base) {
-        for entry in rd {
-            if let Ok(e) = entry {
-                let meta_path = e.path().join("meta.json");
-                if let Ok(data) = fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
-                        ws_map.entry(meta.workspace.clone())
-                            .or_default()
-                            .push(meta.updated_at.clone());
-                    }
+        for e in rd.flatten() {
+            let meta_path = e.path().join("meta.json");
+            if let Ok(data) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                    ws_map.entry(meta.workspace.clone())
+                        .or_default()
+                        .push(meta.updated_at.clone());
                 }
             }
         }
@@ -963,14 +961,12 @@ pub fn list_sessions_for(workspace: &Path) -> Result<Vec<SessionMeta>> {
     let mut out = vec![];
 
     if let Ok(rd) = fs::read_dir(&base) {
-        for entry in rd {
-            if let Ok(e) = entry {
-                let meta_path = e.path().join("meta.json");
-                if let Ok(data) = fs::read_to_string(&meta_path) {
-                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
-                        if meta.workspace == workspace {
-                            out.push(meta);
-                        }
+        for e in rd.flatten() {
+            let meta_path = e.path().join("meta.json");
+            if let Ok(data) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                    if meta.workspace == workspace {
+                        out.push(meta);
                     }
                 }
             }

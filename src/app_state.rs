@@ -758,7 +758,7 @@ impl App {
                 self.needs_redraw = true;
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.selected_agent_mode_idx < (self.agent_modes.len() - 1) as usize {
+                if self.selected_agent_mode_idx < self.agent_modes.len() - 1 {
                     self.selected_agent_mode_idx += 1;
                 }
                 self.needs_redraw = true;

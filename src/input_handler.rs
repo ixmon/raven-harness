@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
 /// Handle a key event and update the app state accordingly.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_key_event(
     app: &mut App,
     event: Event,
@@ -66,6 +67,7 @@ pub async fn handle_key_event(
 }
 
 /// Handle a single key event.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_key(
     app: &mut App,
     key: crossterm::event::KeyEvent,
@@ -203,10 +205,8 @@ async fn handle_input_key(
     }
 
     // Session picker screen navigation (two drop-down lists)
-    if app.desktop.showing_picker() {
-        if app.handle_picker_key(key.code, agent) {
-            return Ok(true);
-        }
+    if app.desktop.showing_picker() && app.handle_picker_key(key.code, agent) {
+        return Ok(true);
     }
 
     // When focused on content panes (Left/Right), use arrows for focus or desktop slide
@@ -287,10 +287,10 @@ async fn handle_input_key(
     }
 
     // Suppress text input editing on splash and picker screens (input bar is hidden there)
-    if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) {
-        if matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete) {
-            return Ok(true);
-        }
+    if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker)
+        && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
+    {
+        return Ok(true);
     }
 
     // Map key to edit action (updated API) — only when focused on input
@@ -384,7 +384,7 @@ async fn handle_input_key(
 
                         tokio::spawn(async move {
                             let mut ag = agent_c.lock().await;
-                            let mode = ag.current_exec_mode().clone();
+                            let mode = ag.current_exec_mode();
                             let mut obs = crate::event_loop::TuiObserver {
                                 tx: tx_c.clone(),
                                 approval_req_tx: appr_c,
