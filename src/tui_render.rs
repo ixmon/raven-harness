@@ -340,8 +340,10 @@ pub fn draw_slash_menu(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x55))),
+            .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x55)))
+            .style(Style::default().bg(Color::Rgb(0x22, 0x22, 0x33))),
     );
+    f.render_widget(Clear, menu_area);
     f.render_widget(menu_block, menu_area);
 }
 
@@ -392,8 +394,10 @@ pub fn draw_mode_menu(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x55))),
+            .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x55)))
+            .style(Style::default().bg(Color::Rgb(0x22, 0x22, 0x33))),
     );
+    f.render_widget(Clear, menu_area);
     f.render_widget(menu_block, menu_area);
 }
 
@@ -713,12 +717,13 @@ fn conversation_entry_styles(entry: &str) -> (Style, Style) {
 }
 
 fn trace_line_style(line: &str) -> Style {
-    if line.starts_with("🧠") {
-        Style::default()
-            .fg(Color::Rgb(0xd0, 0xa0, 0xff))
-            .add_modifier(Modifier::ITALIC)
-    } else if line.starts_with("🔧") {
+    // Tool debug: 🔧 only on first line of a tool call block; results use indented ↳ (no brain).
+    if line.starts_with("🔧") {
         Style::default().fg(Color::Rgb(0xff, 0xc0, 0x60))
+    } else if line.starts_with("🧠") {
+        Style::default()
+            .fg(Color::Rgb(0xa0, 0x80, 0xc0))
+            .add_modifier(Modifier::ITALIC)
     } else if line.starts_with("   ↳") {
         Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80))
     } else if line.starts_with("▶") || line.starts_with("⟳") {
@@ -946,6 +951,14 @@ pub struct SplashData<'a> {
     pub workspace: &'a str,
 }
 
+pub struct PickerDrawData<'a> {
+    pub workspaces: &'a [raven_tui::session::WorkspaceEntry],
+    pub selected_workspace: usize,
+    pub sessions: &'a [raven_tui::session::SessionMeta],
+    pub selected_session: usize,
+    pub focus: crate::app_state::PickerFocus,
+}
+
 pub struct WorkspaceDrawData<'a> {
     pub left_committed: &'a [String],
     pub current_response: &'a str,
@@ -961,12 +974,14 @@ pub struct WorkspaceDrawData<'a> {
 }
 
 /// Draw splash or workspace, or animate a horizontal slide between them.
+/// When desktop is Picker, draws the two-column session/workspace chooser.
 pub fn draw_content_desktop(
     f: &mut Frame,
     content_area: Rect,
     desktop: &DesktopState,
     workspace: &WorkspaceDrawData<'_>,
     splash: &SplashData<'_>,
+    picker: &PickerDrawData<'_>,
     last_left_area: &mut Rect,
     last_right_area: &mut Rect,
     last_left_line_count: &mut u16,
@@ -976,6 +991,13 @@ pub fn draw_content_desktop(
     left_follow_output: bool,
     right_follow_output: bool,
 ) {
+    if matches!(desktop.active, ActiveDesktop::Picker) {
+        draw_picker(f, content_area, picker);
+        *last_left_area = Rect::default();
+        *last_right_area = Rect::default();
+        return;
+    }
+
     if desktop.is_animating() {
         let progress = desktop.slide_progress();
         let width = content_area.width as i32;
@@ -1015,6 +1037,11 @@ pub fn draw_content_desktop(
     match desktop.active {
         ActiveDesktop::Splash => {
             draw_splash(f, content_area, splash);
+            *last_left_area = Rect::default();
+            *last_right_area = Rect::default();
+        }
+        ActiveDesktop::Picker => {
+            draw_picker(f, content_area, picker);
             *last_left_area = Rect::default();
             *last_right_area = Rect::default();
         }
@@ -1065,6 +1092,140 @@ pub fn draw_content_desktop(
     }
 }
 
+pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(area);
+
+    draw_workspace_column(f, cols[0], data.workspaces, data.selected_workspace, data.focus == crate::app_state::PickerFocus::Workspaces);
+    draw_sessions_column(f, cols[1], data.sessions, data.selected_session, data.focus == crate::app_state::PickerFocus::Sessions);
+
+    // subtle hint line at bottom of area if space
+    if area.height > 4 {
+        let hint = " ←/→ focus list   ↑/↓ select   →/Enter load   ← back to main ";
+        let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
+        f.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            hint_area,
+        );
+    }
+}
+
+fn draw_workspace_column(
+    f: &mut Frame,
+    area: Rect,
+    workspaces: &[raven_tui::session::WorkspaceEntry],
+    selected: usize,
+    focused: bool,
+) {
+    let mut text = Text::default();
+    text.lines.push(Line::from(Span::styled(
+        "  Workspaces (recent first)",
+        if focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        },
+    )));
+    text.lines.push(Line::from(""));
+
+    if workspaces.is_empty() {
+        text.lines.push(Line::from(Span::styled("  (no previous sessions)", Style::default().fg(Color::DarkGray))));
+    } else {
+        for (i, ws) in workspaces.iter().enumerate().take(12) {
+            let is_sel = i == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let style = if is_sel {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else if focused {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+            };
+            let label = format!(
+                "{}{} ({} sess)",
+                prefix,
+                ws.path.display(),
+                ws.session_count
+            );
+            text.lines.push(Line::from(Span::styled(truncate_str(&label, area.width as usize - 4), style)));
+        }
+    }
+
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" Workspaces ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border_style)
+                .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+fn draw_sessions_column(
+    f: &mut Frame,
+    area: Rect,
+    sessions: &[raven_tui::session::SessionMeta],
+    selected: usize,
+    focused: bool,
+) {
+    let mut text = Text::default();
+    text.lines.push(Line::from(Span::styled(
+        "  Sessions for workspace",
+        if focused {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        },
+    )));
+    text.lines.push(Line::from(""));
+
+    if sessions.is_empty() {
+        text.lines.push(Line::from(Span::styled("  (no sessions)", Style::default().fg(Color::DarkGray))));
+    } else {
+        for (i, s) in sessions.iter().enumerate().take(12) {
+            let is_sel = i == selected;
+            let prefix = if is_sel { "▶ " } else { "  " };
+            let style = if is_sel {
+                Style::default().fg(Color::Black).bg(Color::Rgb(0x80, 0xd0, 0xff)).add_modifier(Modifier::BOLD)
+            } else if focused {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+            };
+            let short_id = &s.session_id[..s.session_id.len().min(28)];
+            let label = format!("{}{}  {}", prefix, short_id, &s.updated_at[..s.updated_at.len().min(16)]);
+            text.lines.push(Line::from(Span::styled(truncate_str(&label, area.width as usize - 4), style)));
+        }
+    }
+
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" Sessions ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border_style)
+                .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
 pub fn draw_splash(f: &mut Frame, area: Rect, data: &SplashData<'_>) {
     let mut tmp = Buffer::empty(area);
     render_splash_to_buffer(&mut tmp, area, data);
@@ -1110,10 +1271,18 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
         .split(inner);
 
     let art_style = Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff));
+    // Add extra padding above and to the left of the ASCII raven art
+    let art_area = cols[0];
+    let padded_art = Rect {
+        x: art_area.x + 3,           // extra left padding
+        y: art_area.y + 2,           // extra top padding
+        width: art_area.width.saturating_sub(6),
+        height: art_area.height.saturating_sub(3),
+    };
     Paragraph::new(data.raven_art)
         .style(art_style)
         .wrap(Wrap { trim: false })
-        .render(cols[0], buf);
+        .render(padded_art, buf);
 
     let hint = Style::default().fg(Color::DarkGray);
     let accent = Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff));
@@ -1132,12 +1301,12 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
         Line::from(vec![
             Span::styled("→", key),
             Span::styled("  Right arrow", accent),
-            Span::styled("  enter workspace", hint),
+            Span::styled("  workspace/session picker", hint),
         ]),
         Line::from(vec![
             Span::styled("←", key),
             Span::styled("  Left arrow", accent),
-            Span::styled("  from Conversation / Trace panes", hint),
+            Span::styled("  back from picker / panes", hint),
         ]),
         Line::from(""),
         Line::from(Span::styled(

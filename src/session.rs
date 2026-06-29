@@ -905,3 +905,77 @@ mod tests {
         assert_eq!(make_session_id(&p1), make_session_id(&p2));
     }
 }
+
+/// Info about a previously-used workspace (dir where the harness ran).
+#[derive(Debug, Clone)]
+pub struct WorkspaceEntry {
+    pub path: PathBuf,
+    pub last_used: String,
+    pub session_count: usize,
+}
+
+/// List unique workspaces that have sessions under ~/.raven-hotel/sessions/ , most recent first.
+pub fn list_workspaces() -> Result<Vec<WorkspaceEntry>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut ws_map: std::collections::HashMap<PathBuf, Vec<String>> = std::collections::HashMap::new();
+
+    if let Ok(rd) = fs::read_dir(&base) {
+        for entry in rd {
+            if let Ok(e) = entry {
+                let meta_path = e.path().join("meta.json");
+                if let Ok(data) = fs::read_to_string(&meta_path) {
+                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                        ws_map.entry(meta.workspace.clone())
+                            .or_default()
+                            .push(meta.updated_at.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<WorkspaceEntry> = ws_map
+        .into_iter()
+        .map(|(path, mut times)| {
+            times.sort();
+            let last = times.last().cloned().unwrap_or_default();
+            WorkspaceEntry {
+                path,
+                last_used: last,
+                session_count: times.len(),
+            }
+        })
+        .collect();
+
+    entries.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+    Ok(entries)
+}
+
+/// List sessions (metas) for a given workspace, newest first.
+pub fn list_sessions_for(workspace: &Path) -> Result<Vec<SessionMeta>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
+    let mut out = vec![];
+
+    if let Ok(rd) = fs::read_dir(&base) {
+        for entry in rd {
+            if let Ok(e) = entry {
+                let meta_path = e.path().join("meta.json");
+                if let Ok(data) = fs::read_to_string(&meta_path) {
+                    if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                        if meta.workspace == workspace {
+                            out.push(meta);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(out)
+}

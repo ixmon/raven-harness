@@ -10,10 +10,13 @@ use std::path::PathBuf;
 extern crate raven_tui;
 
 mod desktop;
+mod app_state;
 #[cfg(test)]
 mod eval_scenarios;
 mod input_dispatch;
+mod input_handler;
 mod key_edit;
+mod event_loop;
 mod keystore;
 mod palette;
 mod search;

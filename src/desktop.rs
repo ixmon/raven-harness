@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 pub enum ActiveDesktop {
     Workspace,
     Splash,
+    Picker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,7 +55,11 @@ impl DesktopState {
         self.slide.is_some()
     }
 
+    #[allow(dead_code)]
     pub fn showing_splash(&self) -> bool {
+        if self.active == ActiveDesktop::Picker {
+            return false;
+        }
         match self.slide {
             Some(SlideState {
                 direction: SlideDirection::ToSplash,
@@ -81,6 +86,14 @@ impl DesktopState {
         !self.is_animating() && self.active == ActiveDesktop::Splash
     }
 
+    pub fn showing_picker(&self) -> bool {
+        self.active == ActiveDesktop::Picker && !self.is_animating()
+    }
+
+    pub fn can_enter_picker(&self) -> bool {
+        !self.is_animating() && (self.active == ActiveDesktop::Splash || self.active == ActiveDesktop::Workspace)
+    }
+
     pub fn start_slide_to_splash(&mut self, pane: WorkspacePane) {
         self.workspace_pane = pane;
         self.slide = Some(SlideState {
@@ -96,6 +109,22 @@ impl DesktopState {
             frame: 0,
             pause_until: None,
         });
+    }
+
+    pub fn set_picker(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Picker;
+    }
+
+    pub fn exit_picker_to_splash(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Splash;
+    }
+
+    /// Force active to workspace (used when loading a session from picker).
+    pub fn set_workspace(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Workspace;
     }
 
     /// Advance the slide by one frame. Returns `true` while animation continues.

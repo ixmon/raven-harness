@@ -8,6 +8,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditAction {
     Insert(char),
+    #[allow(dead_code)]
     InsertStr(String),
     Backspace,
     Delete,

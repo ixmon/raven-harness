@@ -589,14 +589,18 @@ fn xml_parameters(block: &str) -> serde_json::Map<String, serde_json::Value> {
 
 pub(crate) fn contains_tool_xml_syntax(text: &str) -> bool {
     let t = text.to_lowercase();
-    if t.contains("<tool_call") || t.contains("</tool_call") ||
+    if t.contains("<tool_call") || t.contains("</tool_call") || t.contains("tool_call") ||
        t.contains("function=") || t.contains("<function=") || t.contains("function>") ||
        t.contains("<parameter") || t.contains("parameter=") || t.contains("parameter ") ||
        t.contains("</parameter") || t.contains("</function") ||
        t.contains("path>") ||
        // partial outputs like "read><parameter" or "read>"
        t.contains("read>") || t.contains("write>") || t.contains("patch>") ||
-       t.contains("exec>") || t.contains("grep>") || t.contains("list>")
+       t.contains("exec>") || t.contains("grep>") || t.contains("list>") ||
+       // Additional common XML / pseudo-XML tool call formats from various servers/models
+       t.contains("<invoke") || t.contains("invoke tool") || t.contains("tool request") ||
+       t.contains("call tool") || t.contains("tool call") || t.contains("name=") ||
+       t.contains("</invoke") || t.contains("xai:")
     {
         return true;
     }
@@ -609,11 +613,12 @@ pub(crate) fn contains_tool_xml_syntax(text: &str) -> bool {
         let l = trimmed.to_lowercase();
         if matches!(
             l.as_str(),
-            "function" | "read" | "write" | "patch" | "exec" | "grep" | "list" | "parameter"
+            "function" | "read" | "write" | "patch" | "exec" | "grep" | "list" | "parameter" | "invoke"
         ) || l == "function"
             || l.starts_with("function")
             || l.starts_with("read>")
             || l.starts_with("write>")
+            || l.starts_with("invoke")
         {
             return true;
         }
@@ -641,7 +646,7 @@ pub fn strip_xml_tool_call_blocks(content: &str) -> String {
     // Use regex for more robust detection of any tool call syntax fragment, including partials and variants like "read><parameter "
     // This is more reliable than a static list of contains for catching model-specific or truncated emissions.
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)(<tool_call|</tool_call|function=|<function=|function>|<parameter|parameter=|parameter |</parameter|</function|path>|read>|write>|patch>|exec>|grep>|list>)").unwrap()
+        regex::Regex::new(r"(?i)(<tool_call|</tool_call|tool_call|function=|<function=|function>|invoke|tool request|call tool|<parameter|parameter=|parameter |</parameter|</function|path>|read>|write>|patch>|exec>|grep>|list>|name=|<invoke|</invoke)") .unwrap()
     });
 
     let mut s = if let Some(mat) = RE.find(content) {
@@ -652,7 +657,7 @@ pub fn strip_xml_tool_call_blocks(content: &str) -> String {
 
     // Aggressively remove any remaining fragments (regex replace for variants)
     static REMOVE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?i)</?tool_call>|</?function[^>]*>|</?parameter[^>]*>|\bfunction=[^>\s]*>|\bpath>[^\s<]*|read>|write>|patch>|exec>|grep>|list>").unwrap()
+        regex::Regex::new(r"(?i)</?tool_call>|</?function[^>]*>|</?parameter[^>]*>|</?invoke[^>]*>|\bfunction=[^>\s]*>|\bpath>[^\s<]*|read>|write>|patch>|exec>|grep>|list>|tool request|call tool|name=").unwrap()
     });
     s = REMOVE_RE.replace_all(&s, "").to_string();
 
