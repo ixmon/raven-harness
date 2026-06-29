@@ -10,8 +10,8 @@ use anyhow::Result;
 use serde_json::json;
 
 pub use self::exec::exec;
-pub use self::fs::{read_file, write_file, patch_file, grep_files, list_dir};
-pub use self::web::{web_search, browse};
+pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
+pub use self::web::{browse, web_search};
 
 pub mod backend;
 
@@ -63,12 +63,13 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read".into(),
-                description: "Read a file's contents. Use lines=\"N-M\" for a specific range. Always read before editing.".into(),
+                description: "Read a file's contents. Use lines=\"N-M\" or full=true to read more/entire file (useful for refactoring). Always read before editing.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
                         "path": { "type": "string", "description": "Path to the file (relative to workspace or absolute)" },
-                        "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" }
+                        "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" },
+                        "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" }
                     },
                     "required": ["path"]
                 }),
@@ -284,7 +285,7 @@ mod tests {
         let t = safe_truncate(s, 3);
         assert!(t.len() <= 3);
         assert!(std::str::from_utf8(t.as_bytes()).is_ok());
-        assert_eq!(t, "caf");  // é skipped cleanly
+        assert_eq!(t, "caf"); // é skipped cleanly
 
         // Multi-char boundary safety
         let emoji = "hello😀world"; // 😀 is 4 bytes

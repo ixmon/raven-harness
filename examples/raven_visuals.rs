@@ -17,8 +17,10 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -27,9 +29,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 use std::f64::consts::PI;
 
-use ratatui_image::{Image, picker::{Picker, ProtocolType}, protocol::Protocol, Resize};
 use ratatui::layout::Rect as LayoutRect;
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine, Points};
+use ratatui_image::{
+    picker::{Picker, ProtocolType},
+    protocol::Protocol,
+    Image, Resize,
+};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup terminal
@@ -93,7 +99,11 @@ impl VisualsApp {
             chosen_protocol,
             in_multiplexer,
             ascii_raven,
-            mode: if in_multiplexer { Mode::AsciiComparison } else { Mode::RavenWithSwirl },
+            mode: if in_multiplexer {
+                Mode::AsciiComparison
+            } else {
+                Mode::RavenWithSwirl
+            },
             frame: 0,
             start_time: Instant::now(),
         }
@@ -154,7 +164,11 @@ fn load_raven_image() -> Result<(Box<dyn Protocol>, ProtocolType), Box<dyn std::
     //   - Save as PNG (preferred) at reasonable resolution (300-600px wide)
     //   - Do **not** run it through the old low-res threshold/dither steps.
 
-    let candidates = ["assets/raven.png", "assets/raven.jpg", "assets/raven_low.bmp"];
+    let candidates = [
+        "assets/raven.png",
+        "assets/raven.jpg",
+        "assets/raven_low.bmp",
+    ];
     let mut dyn_img = None;
 
     for path in candidates {
@@ -163,16 +177,17 @@ fn load_raven_image() -> Result<(Box<dyn Protocol>, ProtocolType), Box<dyn std::
                 println!("Loaded image source: {}", path);
                 dyn_img = Some(img);
                 if path.contains("raven_low") {
-                    println!("WARNING: Using the ASCII-oriented low-res BMP. Results will be poor.");
+                    println!(
+                        "WARNING: Using the ASCII-oriented low-res BMP. Results will be poor."
+                    );
                 }
                 break;
             }
         }
     }
 
-    let dyn_img = dyn_img.ok_or_else(|| {
-        "No raven image found. Place a clean raven.png (or .jpg) in tui/assets/"
-    })?;
+    let dyn_img = dyn_img
+        .ok_or_else(|| "No raven image found. Place a clean raven.png (or .jpg) in tui/assets/")?;
 
     // Auto-detect what the terminal (through any multiplexers) actually supports.
     let mut picker = match Picker::from_termios() {
@@ -201,8 +216,7 @@ fn load_raven_image() -> Result<(Box<dyn Protocol>, ProtocolType), Box<dyn std::
     let src_w = dyn_img.width();
     let src_h = dyn_img.height();
 
-    let scale = (target_px_w as f32 / src_w as f32)
-        .min(target_px_h as f32 / src_h as f32);
+    let scale = (target_px_w as f32 / src_w as f32).min(target_px_h as f32 / src_h as f32);
 
     let fit_w = (src_w as f32 * scale) as u32;
     let fit_h = (src_h as f32 * scale) as u32;
@@ -243,7 +257,9 @@ fn load_raven_image() -> Result<(Box<dyn Protocol>, ProtocolType), Box<dyn std::
     Ok((protocol, chosen))
 }
 
-fn run_visuals(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_visuals(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = VisualsApp::new();
 
     loop {
@@ -306,7 +322,7 @@ fn draw_raven_only(f: &mut Frame, app: &VisualsApp, area: Rect) {
             "No usable raven image loaded.\n\n\
              Put a clean raven.png (recommended) or raven.jpg\n\
              in the assets/ directory and restart the example.\n\n\
-             See comments in load_raven_image() for best results."
+             See comments in load_raven_image() for best results.",
         )
         .style(Style::default().fg(Color::Red));
         f.render_widget(msg, inner);
@@ -411,7 +427,7 @@ fn draw_animated_splash(f: &mut Frame, app: &VisualsApp, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(32),   // enough space for the 40x30 image + swirls
+            Constraint::Min(32), // enough space for the 40x30 image + swirls
             Constraint::Length(3),
         ])
         .split(inner);
@@ -441,7 +457,7 @@ fn draw_animated_splash(f: &mut Frame, app: &VisualsApp, area: Rect) {
             // We start at a larger radius so dots appear *around* the raven, not on top of it.
             for ring in 0..5 {
                 let count = 8 + ring * 4;
-                let base_r = 14.0 + ring as f64 * 3.5;  // start farther out
+                let base_r = 14.0 + ring as f64 * 3.5; // start farther out
                 let speed = 1.1 - ring as f64 * 0.12;
 
                 for i in 0..count {
@@ -488,10 +504,7 @@ fn draw_animated_splash(f: &mut Frame, app: &VisualsApp, area: Rect) {
     if let Some(ref art) = app.ascii_raven {
         let lines: Vec<&str> = art.lines().collect();
         let art_h = lines.len() as u16;
-        let art_w = lines.iter()
-            .map(|l| l.len() as u16)
-            .max()
-            .unwrap_or(20);
+        let art_w = lines.iter().map(|l| l.len() as u16).max().unwrap_or(20);
 
         let img_w = art_w.min(content_area.width);
         let img_h = art_h.min(content_area.height);
@@ -547,8 +560,10 @@ fn draw_ascii_comparison(f: &mut Frame, app: &VisualsApp, area: Rect) {
 
     let note = Text::from(vec![
         Line::from("Detection in this run:"),
-        Line::from(format!("  Graphics protocol: {}", 
-            app.chosen_protocol.map(protocol_name).unwrap_or("none"))),
+        Line::from(format!(
+            "  Graphics protocol: {}",
+            app.chosen_protocol.map(protocol_name).unwrap_or("none")
+        )),
         Line::from(format!("  Inside multiplexer: {}", app.in_multiplexer)),
         Line::from(""),
         Line::from("screen (and often tmux) block Kitty/iTerm2/Sixel."),
@@ -567,9 +582,7 @@ fn draw_ascii_comparison(f: &mut Frame, app: &VisualsApp, area: Rect) {
 }
 
 fn draw_help(f: &mut Frame, area: Rect, app: &VisualsApp) {
-    let proto = app.chosen_protocol
-        .map(protocol_name)
-        .unwrap_or("none");
+    let proto = app.chosen_protocol.map(protocol_name).unwrap_or("none");
 
     let mux_note = if app.in_multiplexer {
         " [limited by screen/tmux]"

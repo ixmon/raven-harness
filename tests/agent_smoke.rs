@@ -1,22 +1,28 @@
-use raven_tui::eval_smoke::{self, SmokeScenario, SmokeExpect, MockLlmTurn, MockLlmToolCall};
+use raven_tui::agent::Agent;
+use raven_tui::agent_driver;
+use raven_tui::chat_backend::ChatBackend;
 use raven_tui::config::Config;
 use raven_tui::config::ContextBudget;
-use raven_tui::chat_backend::ChatBackend;
-use raven_tui::agent_driver;
-use raven_tui::agent::Agent;
-use raven_tui::tools::ToolBackend;
+use raven_tui::eval_smoke::{self, MockLlmToolCall, MockLlmTurn, SmokeExpect, SmokeScenario};
 use raven_tui::tools::backend::MockToolBackend;
+use raven_tui::tools::ToolBackend;
 use serde_json::json;
 
-fn eval_config(scenario: &SmokeScenario, tool_backend: MockToolBackend) -> (Config, std::path::PathBuf) {
+fn eval_config(
+    scenario: &SmokeScenario,
+    tool_backend: MockToolBackend,
+) -> (Config, std::path::PathBuf) {
     let ctx_tokens = scenario.context_tokens.unwrap_or(8192);
     let max_rounds = scenario.max_rounds.unwrap_or(10);
     // Create a unique workspace per test invocation so we get a fresh session
-    let workspace = std::env::temp_dir()
-        .join(format!("raven_smoke_{}_{}", scenario.name, std::process::id()));
+    let workspace = std::env::temp_dir().join(format!(
+        "raven_smoke_{}_{}",
+        scenario.name,
+        std::process::id()
+    ));
     std::fs::create_dir_all(&workspace).ok();
 
-    // Create session 
+    // Create session
     let session = raven_tui::session::Session::init(&workspace).unwrap();
 
     let config = Config {
@@ -63,14 +69,16 @@ async fn test_hello_world() {
 
     let tool_backend = eval_smoke::mock_backend_for(&scenario);
     let (config, workspace) = eval_config(&scenario, tool_backend);
-    
+
     let chat_backend = ChatBackend::Mock(eval_smoke::mock_chat_backend_for(&scenario));
     let mut app = Agent::new(config, chat_backend);
     app.reset();
-    
+
     let mut observer = agent_driver::HeadlessObserver;
-    let result = agent_driver::drive_turn(&mut app, &scenario.prompt, &mut observer).await.unwrap();
-    
+    let result = agent_driver::drive_turn(&mut app, &scenario.prompt, &mut observer)
+        .await
+        .unwrap();
+
     eval_smoke::assert_smoke_result(&scenario, &result, &workspace).unwrap();
 }
 
@@ -99,7 +107,7 @@ async fn test_file_edit() {
             MockLlmTurn {
                 content: "I have created the file test.txt with the content 'hello'.".to_string(),
                 tool_calls: vec![],
-            }
+            },
         ],
         context_tokens: Some(8192),
         max_rounds: Some(5),
@@ -115,13 +123,15 @@ async fn test_file_edit() {
 
     let tool_backend = eval_smoke::mock_backend_for(&scenario);
     let (config, workspace) = eval_config(&scenario, tool_backend);
-    
+
     let chat_backend = ChatBackend::Mock(eval_smoke::mock_chat_backend_for(&scenario));
     let mut app = Agent::new(config, chat_backend);
     app.reset();
-    
+
     let mut observer = agent_driver::HeadlessObserver;
-    let result = agent_driver::drive_turn(&mut app, &scenario.prompt, &mut observer).await.unwrap();
-    
+    let result = agent_driver::drive_turn(&mut app, &scenario.prompt, &mut observer)
+        .await
+        .unwrap();
+
     eval_smoke::assert_smoke_result(&scenario, &result, &workspace).unwrap();
 }

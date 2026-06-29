@@ -1,10 +1,13 @@
 //! Multi-desktop view state (workspace ↔ splash) with fake horizontal slide.
 
+use std::time::{Duration, Instant};
+
 /// Which full-width desktop is active once any slide animation completes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveDesktop {
     Workspace,
     Splash,
+    Picker,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -17,9 +20,12 @@ pub enum SlideDirection {
 struct SlideState {
     direction: SlideDirection,
     frame: u8,
+    /// When set, tick() will hold at current frame until this instant.
+    pause_until: Option<Instant>,
 }
 
-/// Number of animation frames for a desktop transition (~300ms at 50ms idle poll).
+/// Number of animation frames for a desktop transition.
+/// A ~250ms pause is held at the midpoint (half-and-half view) before auto-completing.
 pub const SLIDE_FRAMES: u8 = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -49,11 +55,16 @@ impl DesktopState {
         self.slide.is_some()
     }
 
+    #[allow(dead_code)]
     pub fn showing_splash(&self) -> bool {
+        if self.active == ActiveDesktop::Picker {
+            return false;
+        }
         match self.slide {
             Some(SlideState {
                 direction: SlideDirection::ToSplash,
                 frame,
+                ..
             }) if frame < SLIDE_FRAMES => false,
             Some(SlideState {
                 direction: SlideDirection::ToSplash,
@@ -75,11 +86,20 @@ impl DesktopState {
         !self.is_animating() && self.active == ActiveDesktop::Splash
     }
 
+    pub fn showing_picker(&self) -> bool {
+        self.active == ActiveDesktop::Picker && !self.is_animating()
+    }
+
+    pub fn can_enter_picker(&self) -> bool {
+        !self.is_animating() && (self.active == ActiveDesktop::Splash || self.active == ActiveDesktop::Workspace)
+    }
+
     pub fn start_slide_to_splash(&mut self, pane: WorkspacePane) {
         self.workspace_pane = pane;
         self.slide = Some(SlideState {
             direction: SlideDirection::ToSplash,
             frame: 0,
+            pause_until: None,
         });
     }
 
@@ -87,14 +107,42 @@ impl DesktopState {
         self.slide = Some(SlideState {
             direction: SlideDirection::ToWorkspace,
             frame: 0,
+            pause_until: None,
         });
     }
 
+    pub fn set_picker(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Picker;
+    }
+
+    pub fn exit_picker_to_splash(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Splash;
+    }
+
+    /// Force active to workspace (used when loading a session from picker).
+    pub fn set_workspace(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Workspace;
+    }
+
     /// Advance the slide by one frame. Returns `true` while animation continues.
+    /// Inserts a 250ms pause when reaching the halfway frame so the split view
+    /// is briefly visible before the transition completes automatically.
     pub fn tick(&mut self) -> bool {
-        let Some(mut slide) = self.slide else {
+        let Some(mut slide) = self.slide.take() else {
             return false;
         };
+
+        if let Some(until) = slide.pause_until {
+            if Instant::now() < until && !cfg!(test) {
+                self.slide = Some(slide);
+                return false;
+            }
+            slide.pause_until = None;
+        }
+
         slide.frame = slide.frame.saturating_add(1);
         if slide.frame >= SLIDE_FRAMES {
             self.active = match slide.direction {
@@ -104,6 +152,11 @@ impl DesktopState {
             self.slide = None;
             false
         } else {
+            // At midpoint, pause so user sees the half-and-half transition briefly.
+            let mid = SLIDE_FRAMES / 2;
+            if slide.frame == mid {
+                slide.pause_until = Some(Instant::now() + Duration::from_millis(250));
+            }
             self.slide = Some(slide);
             true
         }

@@ -72,9 +72,7 @@ pub fn model_hint_from_env() -> String {
 
 pub fn probe_llm(base_url: &str) -> LlmStatus {
     let hint = model_hint_from_env();
-    let api_key = std::env::var("LLM_API_KEY")
-        .ok()
-        .filter(|k| !k.is_empty());
+    let api_key = std::env::var("LLM_API_KEY").ok().filter(|k| !k.is_empty());
     let result = probe_server_blocking(base_url, &hint, api_key.as_deref());
     LlmStatus::from_probe(base_url, &hint, result)
 }
@@ -143,6 +141,9 @@ mod tests {
         let status = LlmStatus::from_probe("http://127.0.0.1:8080/v1", "qwen2.5-coder", Ok(probe));
         assert!(status.ready_for_agent);
         assert_eq!(status.model_id.as_deref(), Some("qwen3-coder-next"));
-        assert_eq!(status.matched_by.as_deref(), Some(ProbeMatch::SingleModel.as_str()));
+        assert_eq!(
+            status.matched_by.as_deref(),
+            Some(ProbeMatch::SingleModel.as_str())
+        );
     }
 }

@@ -13,7 +13,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::agent::{Agent, ActionRecord, TurnJudge, TurnResult, TurnMetrics};
+use crate::agent::{ActionRecord, Agent, TurnJudge, TurnMetrics, TurnResult};
 use crate::llm::{StreamChunk, ToolCall, Usage};
 use crate::tools;
 
@@ -78,7 +78,9 @@ pub trait TurnObserver: Send {
     fn on_tool_result(&mut self, _record: &ActionRecord) {}
     /// Should this tool call be allowed to execute?
     /// For interactive use this may prompt the user.
-    async fn approve_tool(&mut self, _tc: &ToolCall) -> bool { true }
+    async fn approve_tool(&mut self, _tc: &ToolCall) -> bool {
+        true
+    }
     /// Model paused to narrate — we're pushing a continuation nudge.
     fn on_nudge(&mut self, _count: u32, _max: u32) {}
     /// Hit round limit; auto-continuing (or exhausted if `exhausted` is true).
@@ -86,7 +88,9 @@ pub trait TurnObserver: Send {
     /// Updated context token estimate.
     fn on_context_usage(&mut self, _tokens: u32) {}
     /// Check if the caller wants to abort the turn (Ctrl+C, etc.).
-    fn should_stop(&self) -> bool { false }
+    fn should_stop(&self) -> bool {
+        false
+    }
 
     /// A live user message was injected mid-turn (interject).
     /// The driver has already called on_new_user_input with it.
@@ -96,11 +100,15 @@ pub trait TurnObserver: Send {
     /// in progress, return it here. The driver will inject it and continue
     /// the loop (fresh model request). This allows live redirection without
     /// ending the overall turn.
-    fn take_interject(&mut self) -> Option<String> { None }
+    fn take_interject(&mut self) -> Option<String> {
+        None
+    }
 
     /// After a denial (or at any point), should further tool calls from the
     /// current model response be skipped? (e.g. after too many user denials)
-    fn stop_tool_processing(&self) -> bool { false }
+    fn stop_tool_processing(&self) -> bool {
+        false
+    }
 
     /// The judge detected unproductive looping. The driver has already
     /// injected guidance so the final output should ask the user for help.
@@ -175,11 +183,16 @@ pub async fn drive_turn(
     // latest user input onto the conversation as a role:user turn so the model
     // has proper alternating history context. (The SESSION CONTEXT injection
     // block also includes "Latest User Message" + summaries + repo for richness.)
-    agent.on_new_user_input(prompt);
+    if !prompt.trim().is_empty() {
+        agent.on_new_user_input(prompt);
+    }
 
     let max_rounds = agent.current_config().max_rounds.clamp(1, MAX_TOOL_ROUNDS);
     let tools_schema = tools::all_tools(&agent.current_config().flags);
-    let tools_for_request = agent.current_config().tools_enabled.then(|| tools_schema.clone());
+    let tools_for_request = agent
+        .current_config()
+        .tools_enabled
+        .then(|| tools_schema.clone());
 
     let mut all_actions: Vec<ActionRecord> = vec![];
     let mut last_assistant_text = String::new();
@@ -194,7 +207,10 @@ pub async fn drive_turn(
     let mut tools_used_this_turn: usize = 0;
 
     // Wall-clock deadline (belt-and-suspenders safety beyond judge/nudge limits)
-    let deadline = agent.current_config().flags.max_duration_secs
+    let deadline = agent
+        .current_config()
+        .flags
+        .max_duration_secs
         .map(|secs| Instant::now() + Duration::from_secs(secs));
 
     // Outer auto-continue loop (mirrors TUI 'auto_continue label)
@@ -225,7 +241,10 @@ pub async fn drive_turn(
             let (raw_round_text, tool_calls, usage, finish_reason, round_thinking) = {
                 let mut attempt = 0u32;
                 loop {
-                    let stream = match agent.send_streaming_request(tools_for_request.clone()).await {
+                    let stream = match agent
+                        .send_streaming_request(tools_for_request.clone())
+                        .await
+                    {
                         Ok(s) => s,
                         Err(_) if attempt < MAX_STREAM_RETRIES => {
                             attempt += 1;
@@ -328,7 +347,11 @@ pub async fn drive_turn(
                     // Exhausted retries for this call. Give the agent a chance
                     // to continue instead of treating the error as completion.
                     if total_llm_rounds < max_rounds {
-                        agent.log_harness_event_with_round("nudge", "llm-stream-error-recovery", total_llm_rounds);
+                        agent.log_harness_event_with_round(
+                            "nudge",
+                            "llm-stream-error-recovery",
+                            total_llm_rounds,
+                        );
                         agent.push_message(
                             "user",
                             "[LLM stream error during request. Please continue using your tools to solve the task.]",
@@ -340,7 +363,11 @@ pub async fn drive_turn(
                 // finish_reason=length → recovery nudge
                 let hit_length = finish_reason.as_deref() == Some("length");
                 if hit_length && total_llm_rounds < max_rounds {
-                    agent.log_harness_event_with_round("nudge", "length-recovery", total_llm_rounds);
+                    agent.log_harness_event_with_round(
+                        "nudge",
+                        "length-recovery",
+                        total_llm_rounds,
+                    );
                     agent.push_message("user", LENGTH_RECOVERY_NUDGE);
                     continue;
                 }
@@ -349,7 +376,10 @@ pub async fn drive_turn(
                 // Use NUDGE_BUDGET. If no criteria yet, proactively remind to call define_done.
                 // When criteria set, judge checks; on Continue offer suggestion and nudge (budgeted).
                 // If budget consumed but judge sees progress, allow one more.
-                let criteria_clone = agent.session.as_ref().and_then(|s| s.meta.completion_criteria.clone());
+                let criteria_clone = agent
+                    .session
+                    .as_ref()
+                    .and_then(|s| s.meta.completion_criteria.clone());
                 if let Some(ref c) = criteria_clone {
                     if !c.trim().is_empty() {
                         let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
@@ -379,9 +409,15 @@ pub async fn drive_turn(
                                 completed_naturally = true;
                                 break;
                             }
-                            TurnJudge::Stuck { reason, suggested_guidance } => {
+                            TurnJudge::Stuck {
+                                reason,
+                                suggested_guidance,
+                            } => {
                                 observer.on_stuck(&reason, &suggested_guidance);
-                                let msg = format!("[JUDGE: stuck with criteria defined. {} {}]", reason, suggested_guidance);
+                                let msg = format!(
+                                    "[JUDGE: stuck with criteria defined. {} {}]",
+                                    reason, suggested_guidance
+                                );
                                 agent.log_harness_event_with_round("stuck", &msg, total_llm_rounds);
                                 agent.push_message("user", &msg);
                                 completed_naturally = true;
@@ -400,20 +436,44 @@ pub async fn drive_turn(
                                     let base_sugg = suggestion.unwrap_or_else(|| {
                                         "focus on minimal source changes that directly address the root cause. Now use tools to satisfy the criteria (read files and patch)".to_string()
                                     });
-                                    let nudge_text = format!("[You defined done as: {}. Suggestion: {}]", c, base_sugg);
-                                    agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/inf: {}", judge_nudges, nudge_text), total_llm_rounds);
+                                    let nudge_text = format!(
+                                        "[You defined done as: {}. Suggestion: {}]",
+                                        c, base_sugg
+                                    );
+                                    agent.log_harness_event_with_round(
+                                        "nudge",
+                                        &format!(
+                                            "criteria-continue nudge {}/inf: {}",
+                                            judge_nudges, nudge_text
+                                        ),
+                                        total_llm_rounds,
+                                    );
                                     agent.push_message("user", &nudge_text);
                                     continue;
                                 } else if total_llm_rounds < max_rounds {
-                                    let nudge_limit = if judge_nudges < NUDGE_BUDGET { NUDGE_BUDGET } else { NUDGE_BUDGET + 1 };
+                                    let nudge_limit = if judge_nudges < NUDGE_BUDGET {
+                                        NUDGE_BUDGET
+                                    } else {
+                                        NUDGE_BUDGET + 1
+                                    };
                                     if judge_nudges < nudge_limit {
                                         judge_nudges += 1;
                                         observer.on_nudge(judge_nudges, nudge_limit);
                                         let base_sugg = suggestion.unwrap_or_else(|| {
                                             "focus on minimal source changes that directly address the root cause. Now use tools to satisfy the criteria (read files and patch)".to_string()
                                         });
-                                        let nudge_text = format!("[You defined done as: {}. Suggestion: {}]", c, base_sugg);
-                                        agent.log_harness_event_with_round("nudge", &format!("criteria-continue nudge {}/{}: {}", judge_nudges, nudge_limit, nudge_text), total_llm_rounds);
+                                        let nudge_text = format!(
+                                            "[You defined done as: {}. Suggestion: {}]",
+                                            c, base_sugg
+                                        );
+                                        agent.log_harness_event_with_round(
+                                            "nudge",
+                                            &format!(
+                                                "criteria-continue nudge {}/{}: {}",
+                                                judge_nudges, nudge_limit, nudge_text
+                                            ),
+                                            total_llm_rounds,
+                                        );
                                         agent.push_message("user", &nudge_text);
                                         continue;
                                     }
@@ -428,7 +488,14 @@ pub async fn drive_turn(
                         judge_nudges += 1;
                         observer.on_nudge(judge_nudges, NUDGE_BUDGET);
                         let msg = "[You have not called define_done() yet to declare what 'done' looks like for this task. Please call it now with a clear, precise definition so progress can be judged.]";
-                        agent.log_harness_event_with_round("nudge", &format!("define-done-reminder nudge {}/{}", judge_nudges, NUDGE_BUDGET), total_llm_rounds);
+                        agent.log_harness_event_with_round(
+                            "nudge",
+                            &format!(
+                                "define-done-reminder nudge {}/{}",
+                                judge_nudges, NUDGE_BUDGET
+                            ),
+                            total_llm_rounds,
+                        );
                         agent.push_message("user", msg);
                         continue;
                     }
@@ -449,23 +516,39 @@ pub async fn drive_turn(
                                         Start working immediately: use list / read / grep (or read_summary) \
                                         to explore the code and make progress on the task.]";
                             // Re-anchor to the original request if available (helps the model if it "forgot")
-                            let reminder = agent.session.as_ref()
+                            let reminder = agent
+                                .session
+                                .as_ref()
                                 .and_then(|s| s.meta.last_user_request.as_deref())
                                 .map(|r| format!("\n\nRemember the original request:\n{}", r))
                                 .unwrap_or_default();
-                            let criteria_reminder = if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
+                            let criteria_reminder = if let Some(c) = &agent
+                                .session
+                                .as_ref()
+                                .and_then(|s| s.meta.completion_criteria.as_ref())
+                            {
                                 format!("\n\nYou defined done as: {}. Read the files in the traceback (schema.py, fields.py etc.) and use patch to make it true.", c)
-                            } else { "".to_string() };
+                            } else {
+                                "".to_string()
+                            };
                             if text_nudges < MAX_TEXT_NUDGES {
                                 let nudge = format!("{}{}{}", base, reminder, criteria_reminder);
-                                agent.log_harness_event("nudge", &format!("empty-recovery nudge {}/{}: {}", text_nudges, MAX_TEXT_NUDGES, nudge));
+                                agent.log_harness_event(
+                                    "nudge",
+                                    &format!(
+                                        "empty-recovery nudge {}/{}: {}",
+                                        text_nudges, MAX_TEXT_NUDGES, nudge
+                                    ),
+                                );
                                 agent.push_message("user", &nudge);
                             } else {
                                 // This is the 3rd nudge: run the judge and decide whether to
                                 // allow it (and effectively increase the nudge allowance).
-                                let recent: Vec<_> = all_actions.iter().rev().take(8).cloned().collect();
+                                let recent: Vec<_> =
+                                    all_actions.iter().rev().take(8).cloned().collect();
                                 let decision = agent.judge_turn(&effective_text, &recent).await;
-                                let summary = format!("⭐ JUDGE ON 3RD EMPTY NUDGE: {:?}", decision);
+                                let summary =
+                                    format!("⭐ JUDGE ON 3RD EMPTY NUDGE: {:?}", decision);
                                 observer.on_tool_result(&ActionRecord {
                                     tool: "system".into(),
                                     args: "".into(),
@@ -488,7 +571,10 @@ pub async fn drive_turn(
                                         completed_naturally = true;
                                         break;
                                     }
-                                    TurnJudge::Stuck { reason, suggested_guidance } => {
+                                    TurnJudge::Stuck {
+                                        reason,
+                                        suggested_guidance,
+                                    } => {
                                         observer.on_stuck(&reason, &suggested_guidance);
                                         let guidance = format!(
                                             "[You appear to be looping without progress after empty responses: {}. \
@@ -501,11 +587,23 @@ pub async fn drive_turn(
                                         break;
                                     }
                                     TurnJudge::Continue { .. } => {
-                                        let criteria_reminder = if let Some(c) = &agent.session.as_ref().and_then(|s| s.meta.completion_criteria.as_ref()) {
+                                        let criteria_reminder = if let Some(c) = &agent
+                                            .session
+                                            .as_ref()
+                                            .and_then(|s| s.meta.completion_criteria.as_ref())
+                                        {
                                             format!(" You defined done as: {}. Now read the key files and patch to satisfy it.", c)
-                                        } else { "".to_string() };
-                                        let nudge = format!("{}{} [JUDGE: Continue despite limit.{}]", base, reminder, criteria_reminder);
-                                        agent.log_harness_event("nudge", &format!("3rd-empty-continue nudge: {}", nudge));
+                                        } else {
+                                            "".to_string()
+                                        };
+                                        let nudge = format!(
+                                            "{}{} [JUDGE: Continue despite limit.{}]",
+                                            base, reminder, criteria_reminder
+                                        );
+                                        agent.log_harness_event(
+                                            "nudge",
+                                            &format!("3rd-empty-continue nudge: {}", nudge),
+                                        );
                                         agent.push_message("user", &nudge);
                                         continue;
                                     }
@@ -521,17 +619,21 @@ pub async fn drive_turn(
                 // actually call the tool. This is common when explicitly asked to "produce a patch".
                 // Force a continuation nudge so it acts instead of completing the turn with text only.
                 let text_lower = effective_text.to_lowercase();
-                let looks_like_plan_narration = tool_calls.is_empty() &&
-                    (text_lower.contains("let me ") ||
-                     text_lower.contains("i will ") ||
-                     text_lower.contains("the fix is") ||
-                     text_lower.contains("implement this") ||
-                     text_lower.contains("re-read the code") ||
-                     (text_lower.contains("implement") && text_lower.contains("fix")));
+                let looks_like_plan_narration = tool_calls.is_empty()
+                    && (text_lower.contains("let me ")
+                        || text_lower.contains("i will ")
+                        || text_lower.contains("the fix is")
+                        || text_lower.contains("implement this")
+                        || text_lower.contains("re-read the code")
+                        || (text_lower.contains("implement") && text_lower.contains("fix")));
                 if looks_like_plan_narration && !is_llm_error && text_nudges < MAX_TEXT_NUDGES {
                     text_nudges += 1;
                     observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
-                    agent.log_harness_event_with_round("nudge", &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES), total_llm_rounds);
+                    agent.log_harness_event_with_round(
+                        "nudge",
+                        &format!("plan-narration nudge {}/{}", text_nudges, MAX_TEXT_NUDGES),
+                        total_llm_rounds,
+                    );
                     agent.push_continuation_nudge();
                     continue;
                 }
@@ -549,10 +651,9 @@ pub async fn drive_turn(
                     .as_ref()
                     .and_then(|s| s.last_assistant_content())
                     .unwrap_or_default();
-                let looks_like_malformed_tool =
-                    (crate::llm::contains_tool_xml_syntax(&round_text)
-                        || crate::llm::contains_tool_xml_syntax(&log_tail))
-                        && tool_calls.is_empty();
+                let looks_like_malformed_tool = (crate::llm::contains_tool_xml_syntax(&round_text)
+                    || crate::llm::contains_tool_xml_syntax(&log_tail))
+                    && tool_calls.is_empty();
 
                 // Rich inference judge: decides fulfillment *and* whether the agent
                 // is looping unproductively and should ask the user for guidance.
@@ -569,14 +670,16 @@ pub async fn drive_turn(
                     // We deliberately do NOT scan recent conversation messages here,
                     // because we push our own nudge/debug messages into the user history
                     // and they contain "exec"/"run" words — that would create a self-loop.
-                    let request_text = agent.session.as_ref()
+                    let request_text = agent
+                        .session
+                        .as_ref()
                         .and_then(|s| s.meta.last_user_request.as_deref())
                         .unwrap_or("")
                         .to_string();
-                    let implies_run = request_text.to_lowercase().contains("run") ||
-                                      request_text.to_lowercase().contains("exec") ||
-                                      request_text.to_lowercase().contains("show") ||
-                                      request_text.to_lowercase().contains("output");
+                    let implies_run = request_text.to_lowercase().contains("run")
+                        || request_text.to_lowercase().contains("exec")
+                        || request_text.to_lowercase().contains("show")
+                        || request_text.to_lowercase().contains("output");
                     let has_exec = recent.iter().any(|a| a.tool == "exec");
 
                     if implies_run && !has_exec {
@@ -608,7 +711,9 @@ pub async fn drive_turn(
                     // Additional safety: if we did a write/patch but the original request
                     // implies a run/show and we still haven't done an exec, nudge once.
                     // Uses the same (clean) implies_run from last_user_request only.
-                    let did_write = recent.iter().any(|a| a.tool == "write" || a.tool == "patch");
+                    let did_write = recent
+                        .iter()
+                        .any(|a| a.tool == "write" || a.tool == "patch");
                     if did_write && implies_run && !has_exec && text_nudges < MAX_TEXT_NUDGES {
                         text_nudges += 1;
                         observer.on_nudge(text_nudges, MAX_TEXT_NUDGES);
@@ -644,7 +749,10 @@ pub async fn drive_turn(
                             completed_naturally = true;
                             break;
                         }
-                        TurnJudge::Stuck { reason, suggested_guidance } => {
+                        TurnJudge::Stuck {
+                            reason,
+                            suggested_guidance,
+                        } => {
                             observer.on_stuck(&reason, &suggested_guidance);
                             let guidance = format!(
                                 "[You appear to be looping without progress: {}. \
@@ -667,17 +775,27 @@ pub async fn drive_turn(
                             break;
                         }
                         TurnJudge::Continue { suggestion } => {
-                            let criteria_active = agent.session.as_ref()
+                            let criteria_active = agent
+                                .session
+                                .as_ref()
                                 .and_then(|s| s.meta.completion_criteria.as_ref())
                                 .is_some_and(|c| !c.trim().is_empty());
                             if agent.enable_judge() && criteria_active {
                                 // Trust judge for progress when --enable-judge: continue (nudge) unbounded.
                                 judge_nudges += 1;
                                 observer.on_nudge(judge_nudges, 999);
-                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/inf (criteria)", judge_nudges), total_llm_rounds);
+                                agent.log_harness_event_with_round(
+                                    "nudge",
+                                    &format!(
+                                        "judge-continue nudge {}/inf (criteria)",
+                                        judge_nudges
+                                    ),
+                                    total_llm_rounds,
+                                );
                                 // Prefer the inference-provided suggestion when we have one.
                                 if let Some(s) = suggestion {
-                                    let nudge_text = format!("[You defined done as the criteria. {}]", s);
+                                    let nudge_text =
+                                        format!("[You defined done as the criteria. {}]", s);
                                     agent.push_message("user", &nudge_text);
                                 } else {
                                     agent.push_continuation_nudge();
@@ -691,11 +809,35 @@ pub async fn drive_turn(
                                 } else {
                                     text_nudges += 1;
                                 }
-                                let display_max = if criteria_active { NUDGE_BUDGET } else { MAX_TEXT_NUDGES };
-                                observer.on_nudge(if criteria_active { judge_nudges } else { text_nudges }, display_max);
-                                agent.log_harness_event_with_round("nudge", &format!("judge-continue nudge {}/{}", if criteria_active { judge_nudges } else { text_nudges }, display_max), total_llm_rounds);
+                                let display_max = if criteria_active {
+                                    NUDGE_BUDGET
+                                } else {
+                                    MAX_TEXT_NUDGES
+                                };
+                                observer.on_nudge(
+                                    if criteria_active {
+                                        judge_nudges
+                                    } else {
+                                        text_nudges
+                                    },
+                                    display_max,
+                                );
+                                agent.log_harness_event_with_round(
+                                    "nudge",
+                                    &format!(
+                                        "judge-continue nudge {}/{}",
+                                        if criteria_active {
+                                            judge_nudges
+                                        } else {
+                                            text_nudges
+                                        },
+                                        display_max
+                                    ),
+                                    total_llm_rounds,
+                                );
                                 if let Some(s) = suggestion {
-                                    let nudge_text = format!("[You defined done as the criteria. {}]", s);
+                                    let nudge_text =
+                                        format!("[You defined done as the criteria. {}]", s);
                                     agent.push_message("user", &nudge_text);
                                 } else {
                                     agent.push_continuation_nudge();
@@ -792,12 +934,12 @@ pub async fn drive_turn(
     let tool_call_count = all_actions.len() as u32;
 
     // Get judge decision from last_judge field (stored when judge event is logged)
-    let judge = agent
-        .session
-        .as_ref()
-        .and_then(|s| {
-            s.meta.last_judge.as_deref().and_then(TurnJudge::from_log_content)
-        });
+    let judge = agent.session.as_ref().and_then(|s| {
+        s.meta
+            .last_judge
+            .as_deref()
+            .and_then(TurnJudge::from_log_content)
+    });
 
     let result = TurnResult {
         final_text,

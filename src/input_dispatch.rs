@@ -1,11 +1,11 @@
 //! Slash-command dispatch and unified navigation key handling (glm.md refactor).
 
-use raven_tui::agent::Agent;
-use raven_tui::config::Config;
 use crate::keystore::Keystore;
 use crate::search::{run_search, SearchState};
 use crate::settings_modal::SettingsModal;
 use crate::tui_render::Pane;
+use raven_tui::agent::Agent;
+use raven_tui::config::Config;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -30,6 +30,8 @@ pub struct SlashContext<'a> {
     pub slash_selected: &'a mut usize,
     pub mode_menu_active: &'a mut bool,
     pub selected_mode_idx: &'a mut usize,
+    pub agent_mode_menu_active: &'a mut bool,
+    pub selected_agent_mode_idx: &'a mut usize,
     pub settings: &'a mut SettingsModal,
     pub search: &'a mut SearchState,
     pub focused_pane: Pane,
@@ -51,7 +53,10 @@ fn clear_slash_input(ctx: &mut SlashContext<'_>) {
     *ctx.cursor_pos = 0;
 }
 
-pub fn filtered_slash_commands<'a>(commands: &'a [SlashCommand], input: &str) -> Vec<&'a SlashCommand> {
+pub fn filtered_slash_commands<'a>(
+    commands: &'a [SlashCommand],
+    input: &str,
+) -> Vec<&'a SlashCommand> {
     if !input.starts_with('/') {
         return vec![];
     }
@@ -120,7 +125,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             SlashDispatch::Handled
         }
         "status" => {
-            let (endpoint_label, model, base_url, workspace, mode_label) =
+            let (endpoint_label, model, base_url, workspace, approval_label, agent_mode) =
                 if let Ok(ag) = ctx.agent.try_lock() {
                     let cfg = ag.current_config();
                     let label = ctx
@@ -135,6 +140,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                         cfg.base_url.clone(),
                         cfg.workspace.display().to_string(),
                         ag.current_exec_mode().label().to_string(),
+                        ag.current_agent_mode(),
                     )
                 } else {
                     (
@@ -143,15 +149,17 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                         ctx.config.base_url.clone(),
                         ctx.config.workspace.display().to_string(),
                         "unknown".to_string(),
+                        "talk".to_string(),
                     )
                 };
             let status = format!(
-                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Exec Mode: {}\n  History:   {} entries",
+                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Approval:  {}\n  Run Mode:  {}\n  History:   {} entries",
                 endpoint_label,
                 model,
                 base_url,
                 workspace,
-                mode_label,
+                approval_label,
+                agent_mode,
                 ctx.left_committed.len()
             );
             ctx.left_committed.push(status);
@@ -160,7 +168,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
-        "mode" => {
+        "approval-mode" => {
             *ctx.mode_menu_active = true;
             *ctx.selected_mode_idx = 0;
             if let Ok(ag) = ctx.agent.try_lock() {
@@ -176,10 +184,58 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             clear_slash_input(ctx);
             *ctx.slash_selected = 0;
             ctx.left_committed.push(
-                "Use ↑/↓ to select execution mode, Enter to confirm, Esc to cancel.".to_string(),
+                "Use ↑/↓ to select approval mode, Enter to confirm, Esc to cancel.".to_string(),
             );
             scroll_left(ctx.left_committed);
             SlashDispatch::Handled
+        }
+        "run-mode" => {
+            let parts: Vec<&str> = prompt
+                .trim_start_matches('/')
+                .split_whitespace()
+                .collect();
+            if parts.len() > 1 {
+                // direct set via arg, e.g. /run-mode research
+                let arg = parts[1].to_lowercase();
+                let normalized = if ["talk", "think", "research", "work", "dream"]
+                    .contains(&arg.as_str())
+                {
+                    arg
+                } else {
+                    "talk".to_string()
+                };
+                if let Ok(mut ag) = ctx.agent.try_lock() {
+                    ag.set_agent_mode(&normalized);
+                    if let Some(s) = &mut ag.session_mut() {
+                        let _ = s.save_meta();
+                    }
+                }
+                ctx.left_committed
+                    .push(format!("Run mode set to: {}", normalized));
+                scroll_left(ctx.left_committed);
+                clear_slash_input(ctx);
+                *ctx.slash_selected = 0;
+                SlashDispatch::Handled
+            } else {
+                *ctx.agent_mode_menu_active = true;
+                *ctx.selected_agent_mode_idx = 0;
+                if let Ok(ag) = ctx.agent.try_lock() {
+                    let current = ag.current_agent_mode();
+                    if let Some(idx) = ["talk", "think", "research", "work", "dream"]
+                        .iter()
+                        .position(|&m| m == current)
+                    {
+                        *ctx.selected_agent_mode_idx = idx;
+                    }
+                }
+                clear_slash_input(ctx);
+                *ctx.slash_selected = 0;
+                ctx.left_committed.push(
+                    "Use ↑/↓ to select run mode, Enter to confirm, Esc to cancel.".to_string(),
+                );
+                scroll_left(ctx.left_committed);
+                SlashDispatch::Handled
+            }
         }
         "settings" => {
             let fallback = if let Ok(ag) = ctx.agent.try_lock() {
@@ -276,8 +332,12 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
             desc: "Show current config and session info",
         },
         SlashCommand {
-            name: "mode",
+            name: "approval-mode",
             desc: "Change execution approval mode",
+        },
+        SlashCommand {
+            name: "run-mode",
+            desc: "Set run mode (talk, think, research, work, dream)",
         },
         SlashCommand {
             name: "settings",
@@ -312,7 +372,6 @@ fn apply_search_scroll(ctx: &mut SlashContext<'_>, line: usize) {
     }
 }
 
-
 pub const HELP_TEXT: &str = "\
 Available commands:
 /help          Show this help
@@ -320,7 +379,8 @@ Available commands:
 /clear-trace   Clear the right trace pane
 /reset         Reset conversation memory (session goals stay)
 /status        Show endpoint, model, workspace
-/mode          Change execution approval mode (Babysitter / Spring Break / Vegas / Thunderdome)
+/approval-mode Change execution approval mode (Babysitter / Spring Break / Vegas / Thunderdome)
+/run-mode      Set run mode (talk, think, research, work, dream)
 /settings      Manage inference endpoints (add/switch/edit/delete)
 /search        Search conversation or trace (or Ctrl-F)
 /quit or /exit Quit the TUI
@@ -377,10 +437,10 @@ pub fn apply_settings_actions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use raven_tui::agent::Agent;
-    use raven_tui::config::{Config, ContextBudget};
     use crate::settings_modal::SettingsModal;
     use crate::tui_render::Pane;
+    use raven_tui::agent::Agent;
+    use raven_tui::config::{Config, ContextBudget};
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex;
@@ -407,10 +467,8 @@ mod tests {
             config.clone(),
             raven_tui::chat_backend::ChatBackend::http(config.clone()),
         )));
-        let ks_path = std::env::temp_dir().join(format!(
-            "raven_slash_test_{}.json",
-            std::process::id()
-        ));
+        let ks_path =
+            std::env::temp_dir().join(format!("raven_slash_test_{}.json", std::process::id()));
         let ks = Keystore::load_or_create(&ks_path).expect("keystore");
         let mut input = "/status".to_string();
         let mut cursor_pos = 45;
@@ -420,6 +478,8 @@ mod tests {
         let mut slash_selected = 0;
         let mut mode_menu_active = false;
         let mut selected_mode_idx = 0;
+        let mut agent_mode_menu_active = false;
+        let mut selected_agent_mode_idx = 0;
         let mut settings = SettingsModal::inactive();
         let mut search = Default::default();
         let mut left_scroll = 0;
@@ -438,6 +498,8 @@ mod tests {
             slash_selected: &mut slash_selected,
             mode_menu_active: &mut mode_menu_active,
             selected_mode_idx: &mut selected_mode_idx,
+            agent_mode_menu_active: &mut agent_mode_menu_active,
+            selected_agent_mode_idx: &mut selected_agent_mode_idx,
             settings: &mut settings,
             search: &mut search,
             focused_pane: Pane::Left,

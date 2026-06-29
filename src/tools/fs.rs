@@ -40,13 +40,22 @@ fn resolve(workspace: &Path, user_path: &str) -> Result<PathBuf, String> {
 
     // Last resort: reject on obvious ..
     if user_path.contains("..") && !candidate.starts_with(workspace) {
-        return Err(format!("Path escapes workspace containment (contains ..): {}", user_path));
+        return Err(format!(
+            "Path escapes workspace containment (contains ..): {}",
+            user_path
+        ));
     }
 
     Ok(candidate)
 }
 
-pub fn read_file(user_path: &str, lines: Option<&str>, workspace: &Path, max_lines: usize) -> String {
+pub fn read_file(
+    user_path: &str,
+    lines: Option<&str>,
+    workspace: &Path,
+    max_lines: usize,
+    full: bool,
+) -> String {
     let path = match resolve(workspace, user_path) {
         Ok(p) => p,
         Err(e) => return format!("❌ {}", e),
@@ -87,13 +96,24 @@ pub fn read_file(user_path: &str, lines: Option<&str>, workspace: &Path, max_lin
             }
 
             // Default: show first max_lines or whole file (the 2MB guard above protects against truly huge files)
+            // full=true allows larger reads (for refactoring etc.)
             let mut out = format!("📄 {} ({} lines)\n", path.display(), all_lines.len());
-            let limit = if all_lines.len() > max_lines { max_lines } else { all_lines.len() };
+            let limit = if full {
+                all_lines.len()
+            } else if all_lines.len() > max_lines {
+                max_lines
+            } else {
+                all_lines.len()
+            };
             for (i, line) in all_lines[..limit].iter().enumerate() {
                 out.push_str(&format!("{:4} | {}\n", i + 1, line));
             }
-            if all_lines.len() > limit {
-                out.push_str(&format!("... ({} more lines, use lines=\"{}-\" to continue)", all_lines.len() - limit, limit + 1));
+            if !full && all_lines.len() > limit {
+                out.push_str(&format!(
+                    "... ({} more lines, use lines=\"{}-\" to continue)",
+                    all_lines.len() - limit,
+                    limit + 1
+                ));
             }
             out
         }
@@ -109,7 +129,11 @@ fn parse_line_range(s: &str) -> Option<(usize, usize)> {
     }
     if let Some((a, b)) = s.split_once('-') {
         let start = if a.is_empty() { 1 } else { a.parse().ok()? };
-        let end = if b.is_empty() { usize::MAX } else { b.parse().ok()? };
+        let end = if b.is_empty() {
+            usize::MAX
+        } else {
+            b.parse().ok()?
+        };
         return Some((start, end));
     }
     if let Ok(n) = s.parse::<usize>() {
@@ -126,7 +150,11 @@ pub fn write_file(user_path: &str, content: &str, workspace: &Path) -> String {
 
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
-            return format!("❌ Failed to create directories for {}: {}", path.display(), e);
+            return format!(
+                "❌ Failed to create directories for {}: {}",
+                path.display(),
+                e
+            );
         }
     }
 
@@ -287,14 +315,23 @@ pub fn grep_files(pattern: &str, path_filter: Option<&str>, workspace: &Path) ->
     }
 
     if matches.is_empty() {
-        format!("🔍 No matches for '{}' in {}", pattern, search_root.display())
+        format!(
+            "🔍 No matches for '{}' in {}",
+            pattern,
+            search_root.display()
+        )
     } else {
         let total = matches.len();
         if total > 50 {
             matches.truncate(50);
             matches.push("... (more matches truncated)".to_string());
         }
-        format!("🔍 {} match(es) for '{}':\n{}", total, pattern, matches.join("\n"))
+        format!(
+            "🔍 {} match(es) for '{}':\n{}",
+            total,
+            pattern,
+            matches.join("\n")
+        )
     }
 }
 
@@ -312,7 +349,10 @@ pub fn list_dir(user_path: &str, workspace: &Path) -> String {
         Ok(rd) => {
             for e in rd.filter_map(|e| e.ok()) {
                 if entries.len() >= MAX_LIST {
-                    entries.push("... (directory has many more entries; use a more specific path or grep)".to_string());
+                    entries.push(
+                        "... (directory has many more entries; use a more specific path or grep)"
+                            .to_string(),
+                    );
                     break;
                 }
                 let name = e.file_name().to_string_lossy().to_string();
@@ -321,7 +361,12 @@ pub fn list_dir(user_path: &str, workspace: &Path) -> String {
                 entries.push(format!("{}{}", name, marker));
             }
             entries.sort();
-            format!("📁 {} ({} entries shown)\n{}", path.display(), entries.len(), entries.join("\n"))
+            format!(
+                "📁 {} ({} entries shown)\n{}",
+                path.display(),
+                entries.len(),
+                entries.join("\n")
+            )
         }
         Err(e) => format!("❌ Cannot list {}: {}", path.display(), e),
     }
@@ -364,15 +409,29 @@ mod tests {
             None,
             &std::env::temp_dir(),
         );
-        assert!(result.contains("Patched"), "single match should patch: {}", result);
+        assert!(
+            result.contains("Patched"),
+            "single match should patch: {}",
+            result
+        );
 
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "line1\nLINE2\nline3\n");
 
         // --- Multiple matches without near_line should warn
         fs::write(&path, "foo\nfoo\nfoo\n").unwrap();
-        let res = patch_file(path.to_str().unwrap(), "foo", "BAR", None, &std::env::temp_dir());
-        assert!(res.contains("appears 3 times"), "ambiguous should be reported: {}", res);
+        let res = patch_file(
+            path.to_str().unwrap(),
+            "foo",
+            "BAR",
+            None,
+            &std::env::temp_dir(),
+        );
+        assert!(
+            res.contains("appears 3 times"),
+            "ambiguous should be reported: {}",
+            res
+        );
 
         // Content should be unchanged
         let c = fs::read_to_string(&path).unwrap();
@@ -380,7 +439,13 @@ mod tests {
 
         // --- Multiple matches + near_line should disambiguate (pick closest)
         // Lines: 1:foo 2:foo 3:foo . We want the one near line 3.
-        let res2 = patch_file(path.to_str().unwrap(), "foo", "BAZ", Some(3), &std::env::temp_dir());
+        let res2 = patch_file(
+            path.to_str().unwrap(),
+            "foo",
+            "BAZ",
+            Some(3),
+            &std::env::temp_dir(),
+        );
         assert!(res2.contains("Patched"), "near_line disambiguate: {}", res2);
         let c2 = fs::read_to_string(&path).unwrap();
         // The last occurrence should have been replaced (closest to line 3)
@@ -388,8 +453,18 @@ mod tests {
         assert_eq!(c2.matches("foo").count(), 2);
 
         // --- No match
-        let res3 = patch_file(path.to_str().unwrap(), "NONEXISTENT", "X", None, &std::env::temp_dir());
-        assert!(res3.contains("not found"), "missing should report: {}", res3);
+        let res3 = patch_file(
+            path.to_str().unwrap(),
+            "NONEXISTENT",
+            "X",
+            None,
+            &std::env::temp_dir(),
+        );
+        assert!(
+            res3.contains("not found"),
+            "missing should report: {}",
+            res3
+        );
 
         let _ = fs::remove_file(&path);
     }
@@ -416,7 +491,10 @@ mod tests {
         assert!(res.is_err(), "escape via .. should be rejected");
         // absolute path outside workspace
         let res = resolve(&ws, "/etc/passwd");
-        assert!(res.is_err(), "absolute path outside workspace should be rejected");
+        assert!(
+            res.is_err(),
+            "absolute path outside workspace should be rejected"
+        );
     }
 
     #[test]
@@ -424,7 +502,10 @@ mod tests {
         let ws = std::env::temp_dir();
         // relative inside workspace
         let res = resolve(&ws, "some/relative/file.txt");
-        assert!(res.is_ok(), "relative path inside workspace should be accepted");
+        assert!(
+            res.is_ok(),
+            "relative path inside workspace should be accepted"
+        );
         // workspace itself
         let res = resolve(&ws, ".");
         assert!(res.is_ok(), "'.' should resolve to workspace");

@@ -5,16 +5,16 @@
 
 use anyhow::Result;
 
-use crate::config::Config;
 use crate::chat_backend::ChatBackend;
+use crate::config::Config;
+use crate::judge::Judge;
 use crate::llm::{ChatRequest, Message, StreamChunk, ToolCall};
 use crate::tools;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio::sync::mpsc;
-use crate::judge::Judge;
+use tokio::sync::Mutex;
 
 fn make_rel_path(p: &str, workspace: &Path) -> String {
     let abs = std::path::Path::new(p);
@@ -22,13 +22,20 @@ fn make_rel_path(p: &str, workspace: &Path) -> String {
         stripped.to_string_lossy().to_string()
     } else if abs.is_absolute() {
         // fallback: last components
-        abs.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| p.to_string())
+        abs.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| p.to_string())
     } else {
         p.to_string()
     }
 }
 
-
+fn normalize_agent_mode(s: &str) -> String {
+    match s.trim().to_lowercase().as_str() {
+        "talk" | "think" | "research" | "work" | "dream" => s.trim().to_lowercase(),
+        _ => "talk".to_string(),
+    }
+}
 
 // Summary and truncation limits (from glm review cleanup)
 const SUMMARY_CHAR_LIMIT: usize = 1600;
@@ -106,7 +113,9 @@ impl TurnJudge {
 
         // Try to parse as Fulfilled { note: "..." }
         if let Some(note) = extract_quoted(content, "Fulfilled { note: \"", "\" }") {
-            return Some(TurnJudge::Fulfilled { note: note.to_string() });
+            return Some(TurnJudge::Fulfilled {
+                note: note.to_string(),
+            });
         }
 
         // Try to parse as Stuck { reason: "...", suggested_guidance: "..." }
@@ -114,7 +123,10 @@ impl TurnJudge {
             extract_quoted(content, "Stuck { reason: \"", "\""),
             extract_quoted(content, "suggested_guidance: \"", "\" }"),
         ) {
-            return Some(TurnJudge::Stuck { reason: reason.to_string(), suggested_guidance: suggested_guidance.to_string() });
+            return Some(TurnJudge::Stuck {
+                reason: reason.to_string(),
+                suggested_guidance: suggested_guidance.to_string(),
+            });
         }
 
         // Try to parse as Continue { suggestion: Some("...") } or Continue { suggestion: None }
@@ -124,7 +136,9 @@ impl TurnJudge {
             } else {
                 None
             };
-            return Some(TurnJudge::Continue { suggestion: suggestion.map(|s| s.to_string()) });
+            return Some(TurnJudge::Continue {
+                suggestion: suggestion.map(|s| s.to_string()),
+            });
         }
 
         None
@@ -264,7 +278,10 @@ impl Agent {
 
     /// After a streaming turn produced tool calls, execute them and append the
     /// tool results to conversation so the next `run_turn_streaming` can continue.
-    pub async fn execute_and_record_tool_calls(&mut self, tool_calls: &[ToolCall]) -> Vec<ActionRecord> {
+    pub async fn execute_and_record_tool_calls(
+        &mut self,
+        tool_calls: &[ToolCall],
+    ) -> Vec<ActionRecord> {
         let mut records = vec![];
         for tc in tool_calls {
             let tool_name = tc.function.name.clone();
@@ -503,7 +520,11 @@ impl Agent {
                     format!("{}\n\n(earlier)\n{}", s.meta.recent_turns_summary, summary)
                 };
                 // Keep it small
-                let trimmed = if combined.len() > RECENT_SUMMARY_TRUNCATE { tools::safe_truncate(&combined, RECENT_SUMMARY_TRUNCATE).to_string() + "..." } else { combined };
+                let trimmed = if combined.len() > RECENT_SUMMARY_TRUNCATE {
+                    tools::safe_truncate(&combined, RECENT_SUMMARY_TRUNCATE).to_string() + "..."
+                } else {
+                    combined
+                };
                 let _ = s.set_recent_turns_summary(&trimmed);
             }
         }
@@ -524,8 +545,16 @@ impl Agent {
                 let role = &m.role;
                 let content = m.content.as_deref().unwrap_or("");
                 let tc = if let Some(tcs) = &m.tool_calls {
-                    format!(" [tool_calls: {}]", tcs.iter().map(|t| t.function.name.as_str()).collect::<Vec<_>>().join(", "))
-                } else { "".to_string() };
+                    format!(
+                        " [tool_calls: {}]",
+                        tcs.iter()
+                            .map(|t| t.function.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    "".to_string()
+                };
                 format!("{role}: {content}{tc}")
             })
             .collect::<Vec<_>>()
@@ -536,13 +565,17 @@ impl Agent {
             let (goal, criteria) = if let Some(s) = &self.session {
                 (
                     s.meta.current_goal.as_str(),
-                    s.meta.completion_criteria.as_deref().unwrap_or("")
+                    s.meta.completion_criteria.as_deref().unwrap_or(""),
                 )
-            } else { ("", "") };
+            } else {
+                ("", "")
+            };
 
             let anchor = if !goal.is_empty() || !criteria.is_empty() {
                 format!("\n\nORIGINAL TASK ANCHOR (summarize ONLY in service of this):\nGoal: {}\nCompletion Criteria: {}\n", goal, criteria)
-            } else { String::new() };
+            } else {
+                String::new()
+            };
 
             format!(
                 r#"The following is older conversation history from an agent working on a coding bug fix task.{}
@@ -583,11 +616,16 @@ History:
             Ok(resp) => resp.content.trim().to_string(),
             Err(_e) => {
                 // Better fallback: simple truncation instead of storing error string forever (glm.md review)
-                let combined: String = msgs.iter()
+                let combined: String = msgs
+                    .iter()
                     .map(|m| m.content.clone().unwrap_or_default())
-                    .collect::<Vec<_>>().join(" ");
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 let fallback = tools::safe_truncate(&combined, 400).to_string();
-                format!("(summarization failed, using truncated fallback) {}", fallback)
+                format!(
+                    "(summarization failed, using truncated fallback) {}",
+                    fallback
+                )
             }
         };
 
@@ -615,18 +653,34 @@ History:
                 if self.config.flags.is_eval {
                     // Eval-specific goal seeding with heuristic to avoid chat fixation
                     let no_initial_goal = self.config.flags.no_initial_goal;
-                    if !no_initial_goal && (s.meta.current_goal.trim().is_empty() || s.meta.current_goal.contains("not yet established")) {
+                    if !no_initial_goal
+                        && (s.meta.current_goal.trim().is_empty()
+                            || s.meta.current_goal.contains("not yet established"))
+                    {
                         let lower = user_input.trim().to_lowercase();
-                        if user_input.len() > 25 && !lower.starts_with("hello") && !lower.starts_with("hi") && !lower.starts_with("hey") && !lower.contains("joke") && !lower.contains("tool") {
+                        if user_input.len() > 25
+                            && !lower.starts_with("hello")
+                            && !lower.starts_with("hi")
+                            && !lower.starts_with("hey")
+                            && !lower.contains("joke")
+                            && !lower.contains("tool")
+                        {
                             let g = tools::safe_truncate(user_input, GOAL_TRUNCATE);
-                            let _ = s.update_goal(&format!("Initial goal from user: {}", g), None, None);
+                            let _ = s.update_goal(
+                                &format!("Initial goal from user: {}", g),
+                                None,
+                                None,
+                            );
                         }
                     }
                 } else {
                     // For normal use with goal tracking enabled: seed from first
-                    if s.meta.current_goal.contains("not yet established") || s.meta.current_goal.trim().is_empty() {
+                    if s.meta.current_goal.contains("not yet established")
+                        || s.meta.current_goal.trim().is_empty()
+                    {
                         let g = tools::safe_truncate(user_input, GOAL_TRUNCATE);
-                        let _ = s.update_goal(&format!("Initial goal from user: {}", g), None, None);
+                        let _ =
+                            s.update_goal(&format!("Initial goal from user: {}", g), None, None);
                     }
                 }
             }
@@ -661,7 +715,9 @@ History:
 
         // Make the define_done instruction explicitly visible in the full log
         // for debugging (e.g. "why didn't the agent call it?").
-        if user_input.contains("define_done") || user_input.contains("Early in the task, call the `define_done`") {
+        if user_input.contains("define_done")
+            || user_input.contains("Early in the task, call the `define_done`")
+        {
             self.log_harness_event(
                 "define_done_instruction",
                 "Initial request contained explicit instruction to call define_done early (once, before heavy tool use / in first or second turn). This is critical for criteria-based judge nudging."
@@ -741,26 +797,47 @@ History:
 
         if name == "update_goal" {
             if let Some(s) = &mut self.session {
-                let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let goal = args
+                    .get("goal")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let tests = args.get("tests").and_then(|v| v.as_array()).map(|a| {
-                    a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>()
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
                 });
                 let pits = args.get("pitfalls").and_then(|v| v.as_array()).map(|a| {
-                    a.iter().filter_map(|x| x.as_str().map(|s| s.to_string())).collect::<Vec<_>>()
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
                 });
                 let _ = s.update_goal(&goal, tests, pits);
-                return Some(format!("Goal, tests and pitfalls updated in session meta. New goal: {}", goal));
+                return Some(format!(
+                    "Goal, tests and pitfalls updated in session meta. New goal: {}",
+                    goal
+                ));
             }
         }
 
         if name == "define_done" {
             if let Some(s) = &mut self.session {
                 if s.meta.completion_criteria.is_none() {
-                    let definition = args.get("definition").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let definition = args
+                        .get("definition")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     if !definition.trim().is_empty() {
                         s.meta.completion_criteria = Some(definition.clone());
                         s.save_meta().ok();
-                        self.log_harness_event("define_done_called", &format!("Agent successfully called define_done. Criteria set to: {}", definition));
+                        self.log_harness_event(
+                            "define_done_called",
+                            &format!(
+                                "Agent successfully called define_done. Criteria set to: {}",
+                                definition
+                            ),
+                        );
                         return Some(format!("Completion criteria defined (set once). Judge will use this to decide when done and clear it on fulfillment: {}", definition));
                     }
                 } else {
@@ -771,7 +848,11 @@ History:
 
         if name == "record_discovery" {
             if let Some(s) = &mut self.session {
-                let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let _ = s.record_discovery(&text);
                 return Some(format!("Discovery recorded in session: {}", text));
             }
@@ -786,15 +867,28 @@ History:
                 }
                 // Cache miss or stale: deliver (capped) raw content + current mtime so the
                 // caller can analyze and later call store_summary(path, mtime, summary).
-                let raw = tools::read_file(path, None, &self.config.workspace, self.config.context_budget.read_line_limit);
-                let mtime = crate::session::current_file_mtime_for_agent(&self.config.workspace.join(&rel));
+                let raw = tools::read_file(
+                    path,
+                    None,
+                    &self.config.workspace,
+                    self.config.context_budget.read_line_limit,
+                    false,
+                );
+                let mtime =
+                    crate::session::current_file_mtime_for_agent(&self.config.workspace.join(&rel));
                 return Some(format!(
                     "📄 {} (mtime={}, stale/missing - analyze below then call store_summary(path=\"{}\", mtime={}, summary=\"your concise summary\")):\n{}",
                     rel, mtime, path, mtime, raw
                 ));
             }
             // Fallback (no session): just do a normal read
-            let raw = tools::read_file(path, None, &self.config.workspace, self.config.context_budget.read_line_limit);
+            let raw = tools::read_file(
+                path,
+                None,
+                &self.config.workspace,
+                self.config.context_budget.read_line_limit,
+                false,
+            );
             return Some(format!("📄 {}:\n{}", rel, raw));
         }
 
@@ -858,8 +952,16 @@ History:
                     let sm = self.summarize_messages(&last_few).await;
                     if let Some(s_mut) = &mut self.session {
                         let prev = &s_mut.meta.recent_turns_summary;
-                        let merged = if prev.is_empty() { sm } else { format!("{}\n{}", prev, sm) };
-                        let trimmed = if merged.len() > SUMMARY_CHAR_LIMIT { tools::safe_truncate(&merged, SUMMARY_CHAR_LIMIT).to_string() + "..." } else { merged };
+                        let merged = if prev.is_empty() {
+                            sm
+                        } else {
+                            format!("{}\n{}", prev, sm)
+                        };
+                        let trimmed = if merged.len() > SUMMARY_CHAR_LIMIT {
+                            tools::safe_truncate(&merged, SUMMARY_CHAR_LIMIT).to_string() + "..."
+                        } else {
+                            merged
+                        };
                         let _ = s_mut.set_recent_turns_summary(&trimmed);
                     }
                 }
@@ -871,20 +973,27 @@ History:
     /// Called at the end of each turn (before sending Done to the UI) to
     /// ensure the session context is fresh for the next restart.
     pub async fn force_flush_session(&mut self) {
-        if self.conversation.len() < 2 { return; }
+        if self.conversation.len() < 2 {
+            return;
+        }
         // Summarize the last several messages
         let recent: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
         let sm = self.summarize_messages(&recent).await;
         if let Some(s) = &mut self.session {
             // Replace (not append) — keep it fresh and relevant
-            let trimmed = if sm.len() > SUMMARY_CHAR_LIMIT { tools::safe_truncate(&sm, SUMMARY_CHAR_LIMIT).to_string() + "..." } else { sm };
+            let trimmed = if sm.len() > SUMMARY_CHAR_LIMIT {
+                tools::safe_truncate(&sm, SUMMARY_CHAR_LIMIT).to_string() + "..."
+            } else {
+                sm
+            };
             let _ = s.set_recent_turns_summary(&trimmed);
         }
     }
 
     /// Current exec approval mode from the session (for UI to decide on dialogs)
     pub fn current_exec_mode(&self) -> crate::session::ExecApprovalMode {
-        self.session.as_ref()
+        self.session
+            .as_ref()
             .map(|s| s.meta.exec_approval_mode)
             .unwrap_or_default()
     }
@@ -894,6 +1003,34 @@ History:
         if let Some(s) = &mut self.session {
             s.meta.exec_approval_mode = mode;
             // note: caller should save_meta if needed
+        }
+    }
+
+    /// Current agent operating mode (talk/think/research/work/dream).
+    pub fn current_agent_mode(&self) -> String {
+        self.session
+            .as_ref()
+            .map(|s| {
+                let m = s.meta.agent_mode.trim();
+                if m.is_empty() {
+                    "talk".to_string()
+                } else {
+                    m.to_string()
+                }
+            })
+            .unwrap_or_else(|| "talk".to_string())
+    }
+
+    /// For Super Judge (work mode) to perform its own LLM calls.
+    pub fn backend(&self) -> Arc<Mutex<ChatBackend>> {
+        self.client.clone()
+    }
+
+    /// Set agent operating mode and persist.
+    pub fn set_agent_mode(&mut self, mode: &str) {
+        let normalized = normalize_agent_mode(mode);
+        if let Some(s) = &mut self.session {
+            s.meta.agent_mode = normalized;
         }
     }
 
@@ -956,10 +1093,16 @@ History:
     /// - whether the model is looping unproductively and should ask the user for help.
     ///
     /// This replaces pure hardcoded nudge/continue counts with smarter judgment.
-    pub async fn judge_turn(&self, last_assistant_text: &str, recent_actions: &[ActionRecord]) -> TurnJudge {
+    pub async fn judge_turn(
+        &self,
+        last_assistant_text: &str,
+        recent_actions: &[ActionRecord],
+    ) -> TurnJudge {
         if let Some(ref judge) = self.judge {
             if let Some(ref s) = self.session {
-                judge.judge_turn(&s.meta, last_assistant_text, recent_actions).await
+                judge
+                    .judge_turn(&s.meta, last_assistant_text, recent_actions)
+                    .await
             } else {
                 TurnJudge::Continue { suggestion: None }
             }
@@ -996,13 +1139,20 @@ fn strip_command_context_blocks(s: &str) -> String {
     let mut depth = 0;
     for line in s.lines() {
         let l = line.trim_start();
-        if l.starts_with("<command_context") || l.starts_with("<task_description") || l.starts_with("<user_query") {
+        if l.starts_with("<command_context")
+            || l.starts_with("<task_description")
+            || l.starts_with("<user_query")
+        {
             in_block = true;
             depth += 1;
             continue;
         }
         if in_block {
-            if l.starts_with("</command_context") || l.starts_with("</task_description") || l.starts_with("</user_query") || l.contains("</command_context>") {
+            if l.starts_with("</command_context")
+                || l.starts_with("</task_description")
+                || l.starts_with("</user_query")
+                || l.contains("</command_context>")
+            {
                 depth -= 1;
                 if depth <= 0 {
                     in_block = false;
@@ -1036,7 +1186,8 @@ fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFl
 1. THINK — Understand the request. What do I already know? What files or information do I need?
 2. ACT — Use the smallest number of tools possible. Prefer reading before writing.
 3. REPORT — Clearly describe what actually happened based on tool output.
-"#.to_string()
+"#
+        .to_string()
     };
 
     let bug_fixes_section = if in_eval {
@@ -1071,7 +1222,7 @@ Use `update_goal` (when intent shifts) and `record_discovery` for high-value fac
     };
 
     let sys = format!(
-r#"You are a sharp, practical coding agent running in a terminal-based agentic environment.
+        r#"You are a sharp, practical coding agent running in a terminal-based agentic environment.
 
 Workspace root: {}{}
 
@@ -1134,7 +1285,11 @@ fn truncate_for_context(s: &str, limit: usize) -> String {
     if s.len() <= limit {
         s.to_string()
     } else {
-        format!("{}...\n... ({} bytes total, truncated for context)", tools::safe_truncate(s, limit), s.len())
+        format!(
+            "{}...\n... ({} bytes total, truncated for context)",
+            tools::safe_truncate(s, limit),
+            s.len()
+        )
     }
 }
 
@@ -1146,10 +1301,8 @@ mod integration_tests {
     use crate::llm::ChatResponse;
     use crate::tools::backend::{MockToolBackend, ToolBackend};
     fn mock_eval_config() -> Config {
-        let workspace = std::env::temp_dir().join(format!(
-            "raven_agent_integ_{}",
-            std::process::id()
-        ));
+        let workspace =
+            std::env::temp_dir().join(format!("raven_agent_integ_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&workspace);
         Config {
             base_url: "http://mock.local/v1".into(),
@@ -1166,11 +1319,9 @@ mod integration_tests {
                 read_line_limit: 80,
                 source: ContextSource::Default,
             },
-            tool_backend: ToolBackend::Mock(MockToolBackend::from_json(
-                &serde_json::json!({
-                    "list": { ".": "README.md\n" }
-                }),
-            )),
+            tool_backend: ToolBackend::Mock(MockToolBackend::from_json(&serde_json::json!({
+                "list": { ".": "README.md\n" }
+            }))),
             tools_enabled: true,
             enable_judge: false,
             flags: crate::runtime::RuntimeFlags::default(),

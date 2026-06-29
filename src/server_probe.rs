@@ -23,7 +23,7 @@ pub enum ProbeMatch {
 
 impl ProbeMatch {
     #[allow(dead_code)]
-pub fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             ProbeMatch::Exact => "exact",
             ProbeMatch::Alias => "alias",
@@ -132,10 +132,7 @@ pub fn resolve_server_probe(body: &Value, model_hint: &str) -> Option<ServerProb
 }
 
 #[allow(dead_code)]
-fn fetch_models_body(
-    base_url: &str,
-    api_key: Option<&str>,
-) -> Result<Value, String> {
+fn fetch_models_body(base_url: &str, api_key: Option<&str>) -> Result<Value, String> {
     let url = format!("{}/models", base_url.trim_end_matches('/'));
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))

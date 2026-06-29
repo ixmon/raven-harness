@@ -34,7 +34,7 @@
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{Connection, params, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
@@ -48,10 +48,10 @@ const SESSIONS_SUBDIR: &str = "sessions";
 
 /// Limits for safe discovery (tunable).
 const MAX_FILE_SIZE_FOR_INDEX: u64 = 1024 * 1024; // 1 MiB
-const MAX_DIR_ENTRIES: usize = 350;                    // if a dir has more immediate children, don't descend
+const MAX_DIR_ENTRIES: usize = 350; // if a dir has more immediate children, don't descend
 const MAX_DEPTH: usize = 7;
 const MAX_INDEXED_FILES: usize = 2000;
-const IMPORTANT_FILE_BOOST: i64 = 10_000;              // mtime bonus for READMEs etc.
+const IMPORTANT_FILE_BOOST: i64 = 10_000; // mtime bonus for READMEs etc.
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RepoCache {
@@ -69,10 +69,10 @@ pub struct RepoCache {
 #[serde(rename_all = "snake_case")]
 pub enum ExecApprovalMode {
     #[default]
-    Babysitter,     // Always Ask
-    SpringBreak,    // Yolo for remainder of this session (reset on restart)
-    Vegas,          // Yolo inside sandbox only (ask for outside)
-    Thunderdome,    // Eternal Yolo for this workspace (persisted)
+    Babysitter, // Always Ask
+    SpringBreak, // Yolo for remainder of this session (reset on restart)
+    Vegas,       // Yolo inside sandbox only (ask for outside)
+    Thunderdome, // Eternal Yolo for this workspace (persisted)
 }
 
 impl ExecApprovalMode {
@@ -84,6 +84,10 @@ impl ExecApprovalMode {
             ExecApprovalMode::Thunderdome => "Thunderdome - eternal Yolo, anytime, anywhere",
         }
     }
+}
+
+fn default_agent_mode() -> String {
+    "talk".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -120,6 +124,11 @@ pub struct SessionMeta {
     /// Controls approval requirements for side-effecting actions (exec, writes, etc.)
     #[serde(default)]
     pub exec_approval_mode: ExecApprovalMode,
+
+    /// Agent operating mode: talk | think | research | work | dream (default: talk).
+    /// Shown in status bar as "Run Mode:". May influence future prompting / behavior.
+    #[serde(default = "default_agent_mode")]
+    pub agent_mode: String,
 
     /// Optional summary of initial analysis done on first trust.
     #[serde(default)]
@@ -181,7 +190,10 @@ impl Session {
             match serde_json::from_str(&data) {
                 Ok(m) => m,
                 Err(e) => {
-                    eprintln!("warning: failed to parse meta.json ({}), starting with fresh session meta", e);
+                    eprintln!(
+                        "warning: failed to parse meta.json ({}), starting with fresh session meta",
+                        e
+                    );
                     SessionMeta::default()
                 }
             }
@@ -252,7 +264,9 @@ impl Session {
         let mut entries: Vec<(String, String)> = vec![];
         for line in data.lines() {
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             let obj: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
                 Err(_) => continue,
@@ -360,7 +374,9 @@ impl Session {
             block.push('\n');
         }
         if !rc.important_paths.is_empty() {
-            block.push_str("High-signal files (recently modified, READMEs, manifests, core sources):\n");
+            block.push_str(
+                "High-signal files (recently modified, READMEs, manifests, core sources):\n",
+            );
             for p in &rc.important_paths {
                 block.push_str(&format!("  • {}\n", p));
             }
@@ -381,7 +397,9 @@ impl Session {
         }
 
         block.push_str("### File Summary Cache\n");
-        block.push_str("A SQLite cache (context.db) stores concise mtime-matched summaries for files. ");
+        block.push_str(
+            "A SQLite cache (context.db) stores concise mtime-matched summaries for files. ",
+        );
         block.push_str("**Always call read_summary(path) before raw read on source files.** ");
         block.push_str("If fresh it returns the summary; if stale/missing it gives you the mtime + capped raw content and tells you to call store_summary after analysis. ");
         block.push_str("This keeps token usage low even on long tasks.\n\n");
@@ -480,9 +498,8 @@ impl Session {
         let current_mtime = current_file_mtime(&abs_path)?;
 
         let conn = self.open_context_db()?;
-        let mut stmt = conn.prepare(
-            "SELECT mtime, summary FROM file_summaries WHERE path = ?1 LIMIT 1",
-        )?;
+        let mut stmt =
+            conn.prepare("SELECT mtime, summary FROM file_summaries WHERE path = ?1 LIMIT 1")?;
         let row = stmt
             .query_row(params![rel_path], |row| {
                 let mtime: i64 = row.get(0)?;
@@ -509,13 +526,7 @@ impl Session {
             INSERT OR REPLACE INTO file_summaries (path, mtime, summary, updated_at, file_size)
             VALUES (?1, ?2, ?3, ?4, ?5)
             "#,
-            params![
-                rel_path,
-                mtime,
-                summary.trim(),
-                now,
-                summary.len() as i64
-            ],
+            params![rel_path, mtime, summary.trim(), now, summary.len() as i64],
         )?;
         Ok(())
     }
@@ -523,7 +534,10 @@ impl Session {
     /// Invalidate any cached summary for a path (call this after write/patch).
     pub fn invalidate_file_summary(&self, rel_path: &str) -> Result<()> {
         let conn = self.open_context_db()?;
-        conn.execute("DELETE FROM file_summaries WHERE path = ?1", params![rel_path])?;
+        conn.execute(
+            "DELETE FROM file_summaries WHERE path = ?1",
+            params![rel_path],
+        )?;
         Ok(())
     }
 }
@@ -565,7 +579,13 @@ fn make_session_id_with_name(workspace: &Path, explicit_name: Option<&str>) -> S
     let name_part = if let Some(name) = explicit_name {
         let clean = name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
             .collect::<String>();
         format!("{}-", clean.trim_matches('-'))
     } else {
@@ -573,7 +593,9 @@ fn make_session_id_with_name(workspace: &Path, explicit_name: Option<&str>) -> S
     };
 
     // Simple non-crypto hash of the absolute path for uniqueness
-    let abs = workspace.canonicalize().unwrap_or_else(|_| workspace.to_path_buf());
+    let abs = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
     let path_str = abs.to_string_lossy();
     let mut hash: u64 = 14695981039346656037; // FNV offset
     for b in path_str.as_bytes() {
@@ -600,8 +622,12 @@ pub fn trust_prompt(workspace: &Path, already_trusted: bool) -> bool {
     // The prompt below will be skipped or non-blocking in practice for pipes.
 
     eprintln!("\nDo you trust the code in {} ?", workspace.display());
-    eprintln!("(This lets Raven build a local repo cache with file tree, sizes, and importance ranking.");
-    eprintln!(" We will never read files >1 MiB or descend into bloated directories during indexing.");
+    eprintln!(
+        "(This lets Raven build a local repo cache with file tree, sizes, and importance ranking."
+    );
+    eprintln!(
+        " We will never read files >1 MiB or descend into bloated directories during indexing."
+    );
     eprintln!(" You can still use tools to inspect anything later. [y/N] ");
 
     let mut line = String::new();
@@ -632,7 +658,17 @@ pub fn build_repo_cache(workspace: &Path, trusted: bool) -> RepoCache {
     let mut dir_child_count: HashMap<PathBuf, usize> = HashMap::new();
     let mut total = 0usize;
 
-    let skip_dirs = [".git", "target", "node_modules", "dist", "build", ".venv", "__pycache__", ".cargo", "out"];
+    let skip_dirs = [
+        ".git",
+        "target",
+        "node_modules",
+        "dist",
+        "build",
+        ".venv",
+        "__pycache__",
+        ".cargo",
+        "out",
+    ];
 
     for entry in WalkDir::new(workspace)
         .max_depth(MAX_DEPTH)
@@ -691,16 +727,30 @@ pub fn build_repo_cache(workspace: &Path, trusted: bool) -> RepoCache {
         .iter()
         .filter(|(_, _, _, is_dir)| !*is_dir)
         .map(|(p, sz, mt, _)| {
-            let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+            let name = p
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_lowercase();
             let mut score = (mt - (now - 86400 * 30)).max(0); // favor last ~30 days
 
             if name.starts_with("readme") || name == "readme.md" {
                 score += IMPORTANT_FILE_BOOST * 3;
             } else if name.ends_with(".md") {
                 score += IMPORTANT_FILE_BOOST;
-            } else if name == "cargo.toml" || name == "package.json" || name == "pyproject.toml" || name == "makefile" || name == "justfile" {
+            } else if name == "cargo.toml"
+                || name == "package.json"
+                || name == "pyproject.toml"
+                || name == "makefile"
+                || name == "justfile"
+            {
                 score += IMPORTANT_FILE_BOOST * 2;
-            } else if name.ends_with(".rs") || name.ends_with(".py") || name.ends_with(".ts") || name.ends_with(".tsx") || name.ends_with(".go") {
+            } else if name.ends_with(".rs")
+                || name.ends_with(".py")
+                || name.ends_with(".ts")
+                || name.ends_with(".tsx")
+                || name.ends_with(".go")
+            {
                 score += 2000; // source is interesting
             }
             // smaller files that are "manifests" already boosted above; penalize huge source a little for ranking
@@ -728,24 +778,38 @@ pub fn build_repo_cache(workspace: &Path, trusted: bool) -> RepoCache {
         .collect();
 
     // Build a compact tree (very rough, top-down, limited branching)
-    let mut tree_lines = vec![format!("{}/", workspace.file_name().unwrap_or_default().to_string_lossy())];
+    let mut tree_lines = vec![format!(
+        "{}/",
+        workspace.file_name().unwrap_or_default().to_string_lossy()
+    )];
     // Group by first two path components for a shallow view
     let mut seen = std::collections::HashSet::new();
-    for (p, sz, _, _) in entries.iter().filter(|(_,_,_,d)| !*d).take(80) {
+    for (p, sz, _, _) in entries.iter().filter(|(_, _, _, d)| !*d).take(80) {
         if let Ok(rel) = p.strip_prefix(workspace) {
-            let parts: Vec<_> = rel.components().map(|c| c.as_os_str().to_string_lossy()).collect();
-            if parts.is_empty() { continue; }
+            let parts: Vec<_> = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
             let key = parts[0].to_string();
             if seen.insert(key.clone()) {
                 let display = if parts.len() > 1 {
                     format!("  {}/... ({} files)", parts[0], /* rough */ 1)
                 } else {
                     let mib = *sz as f64 / 1_048_576.0;
-                    if mib > 0.05 { format!("  {} ({:.1}M)", parts[0], mib) } else { format!("  {}", parts[0]) }
+                    if mib > 0.05 {
+                        format!("  {} ({:.1}M)", parts[0], mib)
+                    } else {
+                        format!("  {}", parts[0])
+                    }
                 };
                 tree_lines.push(display);
             }
-            if tree_lines.len() > 28 { break; }
+            if tree_lines.len() > 28 {
+                break;
+            }
         }
     }
     let tree_text = tree_lines.join("\n");
@@ -754,7 +818,11 @@ pub fn build_repo_cache(workspace: &Path, trusted: bool) -> RepoCache {
     let mut lang = None;
     let mut ptype = None;
     for (p, _, _, _) in &entries {
-        let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let name = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase();
         if name == "cargo.toml" {
             lang = Some("Rust".to_string());
             ptype = Some("rust".to_string());
@@ -775,9 +843,17 @@ pub fn build_repo_cache(workspace: &Path, trusted: bool) -> RepoCache {
     }
 
     let short_summary = if let Some(l) = &lang {
-        format!("{} project (detected from {} and file layout). {} files considered in safe scan.", l, ptype.as_deref().unwrap_or("key files"), total)
+        format!(
+            "{} project (detected from {} and file layout). {} files considered in safe scan.",
+            l,
+            ptype.as_deref().unwrap_or("key files"),
+            total
+        )
     } else {
-        format!("Project with {} interesting files under safe indexing limits.", total)
+        format!(
+            "Project with {} interesting files under safe indexing limits.",
+            total
+        )
     };
 
     RepoCache {
@@ -828,4 +904,74 @@ mod tests {
         let p2 = PathBuf::from("/tmp/myproj");
         assert_eq!(make_session_id(&p1), make_session_id(&p2));
     }
+}
+
+/// Info about a previously-used workspace (dir where the harness ran).
+#[derive(Debug, Clone)]
+pub struct WorkspaceEntry {
+    pub path: PathBuf,
+    pub last_used: String,
+    pub session_count: usize,
+}
+
+/// List unique workspaces that have sessions under ~/.raven-hotel/sessions/ , most recent first.
+pub fn list_workspaces() -> Result<Vec<WorkspaceEntry>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
+    if !base.exists() {
+        return Ok(vec![]);
+    }
+
+    let mut ws_map: std::collections::HashMap<PathBuf, Vec<String>> = std::collections::HashMap::new();
+
+    if let Ok(rd) = fs::read_dir(&base) {
+        for e in rd.flatten() {
+            let meta_path = e.path().join("meta.json");
+            if let Ok(data) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                    ws_map.entry(meta.workspace.clone())
+                        .or_default()
+                        .push(meta.updated_at.clone());
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<WorkspaceEntry> = ws_map
+        .into_iter()
+        .map(|(path, mut times)| {
+            times.sort();
+            let last = times.last().cloned().unwrap_or_default();
+            WorkspaceEntry {
+                path,
+                last_used: last,
+                session_count: times.len(),
+            }
+        })
+        .collect();
+
+    entries.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+    Ok(entries)
+}
+
+/// List sessions (metas) for a given workspace, newest first.
+pub fn list_sessions_for(workspace: &Path) -> Result<Vec<SessionMeta>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
+    let mut out = vec![];
+
+    if let Ok(rd) = fs::read_dir(&base) {
+        for e in rd.flatten() {
+            let meta_path = e.path().join("meta.json");
+            if let Ok(data) = fs::read_to_string(&meta_path) {
+                if let Ok(meta) = serde_json::from_str::<SessionMeta>(&data) {
+                    if meta.workspace == workspace {
+                        out.push(meta);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(out)
 }

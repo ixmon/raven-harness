@@ -109,8 +109,7 @@ pub fn load_registry() -> Result<Registry> {
 }
 
 fn load_scenario_entry(path: &Path) -> Result<Option<TestEntry>> {
-    let data = std::fs::read_to_string(path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let data = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let raw: Value = serde_json::from_str(&data)?;
     let ty = raw.get("type").and_then(|v| v.as_str()).unwrap_or("");
     let id = path
@@ -200,8 +199,8 @@ pub fn find_entry<'a>(reg: &'a Registry, id: &str) -> Option<&'a TestEntry> {
 
 fn load_easy_bench_ids() -> Result<Vec<String>> {
     let path = manifest_dir().join("evals/easy_bench.json");
-    let data = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
+    let data =
+        std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
     let v: Value = serde_json::from_str(&data)?;
     let arr = v
         .get("easy_tests")
@@ -277,7 +276,10 @@ mod tests {
     #[test]
     fn easy_bench_live_profile() {
         let ids = profile_ids("easy-bench-live").expect("profile");
-        assert!(ids.len() >= 3, "easy-bench-live should run a series of >1 easy tests (incl. marshmallow SWE case)");
+        assert!(
+            ids.len() >= 3,
+            "easy-bench-live should run a series of >1 easy tests (incl. marshmallow SWE case)"
+        );
         assert!(ids.contains(&"easy-hello-world".to_string()));
         assert!(ids.contains(&"easy-fizzbuzz".to_string()));
         assert!(ids.contains(&"marshmallow-code__marshmallow-1343".to_string()));

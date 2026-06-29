@@ -10,10 +10,13 @@ use std::path::PathBuf;
 extern crate raven_tui;
 
 mod desktop;
+mod app_state;
 #[cfg(test)]
 mod eval_scenarios;
 mod input_dispatch;
+mod input_handler;
 mod key_edit;
+mod event_loop;
 mod keystore;
 mod palette;
 mod search;
@@ -22,7 +25,10 @@ mod tui_app;
 mod tui_render;
 
 #[derive(Parser, Debug)]
-#[command(name = "raven-tui", about = "Agentic coding TUI powered by local LLMs + tools")]
+#[command(
+    name = "raven-tui",
+    about = "Agentic coding TUI powered by local LLMs + tools"
+)]
 struct Args {
     /// OpenAI-compatible base URL (llama.cpp server, etc.)
     #[arg(long, env = "LLM_BASE_URL", default_value = "http://127.0.0.1:8080/v1")]
@@ -142,7 +148,10 @@ async fn main() -> Result<()> {
     // `PaletteBackend` in `tui_app::run`, so this just primes the cache.
     let color_depth = palette::init();
     if color_depth != palette::ColorDepth::True {
-        eprintln!("raven: terminal color depth detected as {:?} (RGB will be downsampled)", color_depth);
+        eprintln!(
+            "raven: terminal color depth detected as {:?} (RGB will be downsampled)",
+            color_depth
+        );
     }
 
     let eval_mode = raven_tui::eval_smoke::eval_enabled();
@@ -241,7 +250,10 @@ async fn main() -> Result<()> {
                 s.meta.exec_approval_mode = mode;
                 s.save_meta()?;
             } else {
-                eprintln!("warning: unknown approval mode {:?}, falling back to env/default", mode_str);
+                eprintln!(
+                    "warning: unknown approval mode {:?}, falling back to env/default",
+                    mode_str
+                );
             }
         } else if approval_env_thunderdome() {
             s.meta.exec_approval_mode = raven_tui::session::ExecApprovalMode::Thunderdome;
@@ -266,7 +278,13 @@ async fn main() -> Result<()> {
                 "raven session: {} | goal: {} | repo files: {} | trusted: {}",
                 s.id,
                 if flags.goal_tracking {
-                    let g = &s.meta.current_goal; let end = g.len().min(60); let end = (0..=end).rev().find(|&i| g.is_char_boundary(i)).unwrap_or(0); &g[..end]
+                    let g = &s.meta.current_goal;
+                    let end = g.len().min(60);
+                    let end = (0..=end)
+                        .rev()
+                        .find(|&i| g.is_char_boundary(i))
+                        .unwrap_or(0);
+                    &g[..end]
                 } else {
                     "none"
                 },
@@ -281,12 +299,11 @@ async fn main() -> Result<()> {
     // === Encrypted endpoint vault ===
     let raven_home = dirs_next_home().join(".raven-hotel");
     let keystore_path = raven_home.join("endpoints.json");
-    let mut ks = keystore::Keystore::load_or_create(&keystore_path)
-        .unwrap_or_else(|e| {
-            eprintln!("warning: could not load endpoints.json: {}", e);
-            keystore::Keystore::load_or_create(&keystore_path)
-                .expect("FATAL: could not create ~/.raven-hotel/endpoints.json (check permissions)")
-        });
+    let mut ks = keystore::Keystore::load_or_create(&keystore_path).unwrap_or_else(|e| {
+        eprintln!("warning: could not load endpoints.json: {}", e);
+        keystore::Keystore::load_or_create(&keystore_path)
+            .expect("FATAL: could not create ~/.raven-hotel/endpoints.json (check permissions)")
+    });
 
     // If any endpoints have encrypted keys, prompt for vault password
     // Supports RAVEN_VAULT_PASSWORD env var for non-interactive / testing use
@@ -294,7 +311,10 @@ async fn main() -> Result<()> {
         if let Some(pw) = &flags.vault_password {
             match ks.unlock(pw) {
                 Ok(()) => eprintln!("Vault unlocked (from RAVEN_VAULT_PASSWORD)."),
-                Err(e) => eprintln!("RAVEN_VAULT_PASSWORD failed: {}. Encrypted endpoints unavailable.", e),
+                Err(e) => eprintln!(
+                    "RAVEN_VAULT_PASSWORD failed: {}. Encrypted endpoints unavailable.",
+                    e
+                ),
             }
         } else if is_interactive_tui {
             eprintln!("Encrypted API keys found. Enter vault password:");
@@ -362,7 +382,10 @@ async fn main() -> Result<()> {
                     );
                     model = probe.model_id;
                 }
-                raven_tui::config::ContextBudget::from_context_tokens(probe.context_tokens, args.max_rounds)
+                raven_tui::config::ContextBudget::from_context_tokens(
+                    probe.context_tokens,
+                    args.max_rounds,
+                )
             }
             None => {
                 eprintln!(
@@ -415,9 +438,7 @@ async fn main() -> Result<()> {
         } else {
             prompt.clone()
         };
-        let tools_enabled = !smoke_scenario
-            .as_ref()
-            .is_some_and(|s| s.disable_tools);
+        let tools_enabled = !smoke_scenario.as_ref().is_some_and(|s| s.disable_tools);
         let model_label = model.clone();
         let c = raven_tui::config::Config {
             base_url,
@@ -439,7 +460,9 @@ async fn main() -> Result<()> {
             let scenario = smoke_scenario
                 .as_ref()
                 .expect("RAVEN_EVAL_MOCK_LLM requires a smoke scenario");
-            raven_tui::chat_backend::ChatBackend::Mock(raven_tui::eval_smoke::mock_chat_backend_for(scenario))
+            raven_tui::chat_backend::ChatBackend::Mock(
+                raven_tui::eval_smoke::mock_chat_backend_for(scenario),
+            )
         } else {
             raven_tui::chat_backend::ChatBackend::http(c.clone())
         };
@@ -463,17 +486,27 @@ async fn main() -> Result<()> {
             for (i, m) in msgs.iter().enumerate() {
                 let content = m.content.as_deref().unwrap_or("");
                 let tc = if let Some(tcs) = &m.tool_calls {
-                    format!(" [tool_calls: {}]", tcs.iter()
-                        .map(|t| t.function.name.as_str())
-                        .collect::<Vec<_>>().join(", "))
-                } else { String::new() };
+                    format!(
+                        " [tool_calls: {}]",
+                        tcs.iter()
+                            .map(|t| t.function.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                } else {
+                    String::new()
+                };
                 println!("═══ Message {} ═══ role={}{}", i, m.role, tc);
                 println!("{}", content);
                 println!();
             }
-            eprintln!("dump-prompt: {} messages, {} total bytes",
+            eprintln!(
+                "dump-prompt: {} messages, {} total bytes",
                 msgs.len(),
-                msgs.iter().map(|m| m.content.as_ref().map_or(0, |c| c.len())).sum::<usize>());
+                msgs.iter()
+                    .map(|m| m.content.as_ref().map_or(0, |c| c.len()))
+                    .sum::<usize>()
+            );
             return Ok(());
         }
 
@@ -481,7 +514,8 @@ async fn main() -> Result<()> {
 
         // Use drive_turn with HeadlessObserver — same loop as TUI
         let mut observer = raven_tui::agent_driver::HeadlessObserver;
-        let result = raven_tui::agent_driver::drive_turn(&mut app, &effective_prompt, &mut observer).await?;
+        let result =
+            raven_tui::agent_driver::drive_turn(&mut app, &effective_prompt, &mut observer).await?;
 
         if let Some(out) = &harness.metrics_out {
             let _ = raven_tui::eval_metrics::write_turn_metrics(
@@ -537,8 +571,10 @@ async fn main() -> Result<()> {
             println!("{}", content);
             println!();
         }
-        eprintln!("dump-prompt: {} messages (no user prompt — use --prompt to include one)",
-            msgs.len());
+        eprintln!(
+            "dump-prompt: {} messages (no user prompt — use --prompt to include one)",
+            msgs.len()
+        );
         return Ok(());
     }
 
@@ -562,9 +598,13 @@ fn approval_env_thunderdome() -> bool {
 fn parse_approval_mode(s: &str) -> Option<raven_tui::session::ExecApprovalMode> {
     match s.to_ascii_lowercase().as_str() {
         "babysitter" | "ask" | "default" => Some(raven_tui::session::ExecApprovalMode::Babysitter),
-        "springbreak" | "spring-break" | "spring_break" | "yolo-session" => Some(raven_tui::session::ExecApprovalMode::SpringBreak),
+        "springbreak" | "spring-break" | "spring_break" | "yolo-session" => {
+            Some(raven_tui::session::ExecApprovalMode::SpringBreak)
+        }
         "vegas" => Some(raven_tui::session::ExecApprovalMode::Vegas),
-        "thunderdome" | "yolo" | "eternal" | "full-yolo" => Some(raven_tui::session::ExecApprovalMode::Thunderdome),
+        "thunderdome" | "yolo" | "eternal" | "full-yolo" => {
+            Some(raven_tui::session::ExecApprovalMode::Thunderdome)
+        }
         _ => None,
     }
 }

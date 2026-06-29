@@ -6,10 +6,10 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::agent::{TurnResult, TurnJudge};
-use crate::session::Session;
+use crate::agent::{TurnJudge, TurnResult};
 use crate::chat_backend::{mock_tool_call, MockChatBackend};
 use crate::llm::ChatResponse;
+use crate::session::Session;
 use crate::tools::backend::MockToolBackend;
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,7 +90,8 @@ pub fn list_offline_smoke_scenarios() -> Result<Vec<String>> {
             let data = std::fs::read_to_string(&path)?;
             let raw: Value = serde_json::from_str(&data)?;
             if raw.get("type").and_then(|v| v.as_str()) == Some("smoke")
-                && raw.get("llm_turns")
+                && raw
+                    .get("llm_turns")
                     .and_then(|v| v.as_array())
                     .is_some_and(|a| !a.is_empty())
             {
@@ -194,7 +195,11 @@ pub fn mock_chat_backend_for(scenario: &SmokeScenario) -> MockChatBackend {
     MockChatBackend::new(turns)
 }
 
-pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult, workspace: &Path) -> Result<()> {
+pub fn assert_smoke_result(
+    scenario: &SmokeScenario,
+    result: &TurnResult,
+    workspace: &Path,
+) -> Result<()> {
     let text = result.final_text.to_lowercase();
     for needle in &scenario.expect.stdout_contains {
         if !text.contains(&needle.to_lowercase()) {
@@ -272,9 +277,12 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult, worksp
 
     // Check for judge decision in result.judge or system actions
     if let Some(ref want_decision) = scenario.expect.judge_decision {
-        eprintln!("DEBUG: checking for judge decision {:?} in result.judge", want_decision);
+        eprintln!(
+            "DEBUG: checking for judge decision {:?} in result.judge",
+            want_decision
+        );
         eprintln!("DEBUG: result.judge = {:?}", result.judge);
-        
+
         // First check result.judge directly
         let found_in_judge = result.judge.as_ref().is_some_and(|jd| {
             let jd_str = match jd {
@@ -283,7 +291,13 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult, worksp
                 TurnJudge::Stuck { .. } => "STUCK",
             };
             let want_str = want_decision.as_str();
-            eprintln!("DEBUG: judge match check: {:?} vs {:?} = {} (jd_str={})", jd, want_decision, jd_str == want_str, jd_str);
+            eprintln!(
+                "DEBUG: judge match check: {:?} vs {:?} = {} (jd_str={})",
+                jd,
+                want_decision,
+                jd_str == want_str,
+                jd_str
+            );
             jd_str == want_str
         });
 
@@ -295,10 +309,17 @@ pub fn assert_smoke_result(scenario: &SmokeScenario, result: &TurnResult, worksp
                     for line in log_content.lines() {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(line) {
                             if json.get("event").and_then(|e| e.as_str()) == Some("judge") {
-                                if let Some(content) = json.get("content").and_then(|c| c.as_str()) {
-                                    if content.to_uppercase().contains(&want_decision.to_uppercase()) {
+                                if let Some(content) = json.get("content").and_then(|c| c.as_str())
+                                {
+                                    if content
+                                        .to_uppercase()
+                                        .contains(&want_decision.to_uppercase())
+                                    {
                                         found_in_log = true;
-                                        eprintln!("DEBUG: judge decision found in session log: {:?}", content);
+                                        eprintln!(
+                                            "DEBUG: judge decision found in session log: {:?}",
+                                            content
+                                        );
                                         break;
                                     }
                                 }
