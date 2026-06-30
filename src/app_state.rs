@@ -949,7 +949,7 @@ impl App {
         self.left_follow_output = true;
         self.left_scroll = 10_000;
         self.is_processing = false;
-        self.focused_pane = Pane::Left;
+        self.focused_pane = Pane::Input;
 
         // Switch to workspace view for the loaded session
         self.desktop.set_workspace();

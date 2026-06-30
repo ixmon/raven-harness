@@ -717,7 +717,7 @@ fn conversation_entry_styles(entry: &str) -> (Style, Style) {
 }
 
 fn trace_line_style(line: &str) -> Style {
-    // Tool debug: 🔧 only on first line of a tool call block; results use indented ↳ (no brain).
+    // 1 🔧 / 🧠 icon at start of tool/thought block; continuations indented (no repeat icon).
     if line.starts_with("🔧") {
         Style::default().fg(Color::Rgb(0xff, 0xc0, 0x60))
     } else if line.starts_with("🧠") {
@@ -726,6 +726,13 @@ fn trace_line_style(line: &str) -> Style {
             .add_modifier(Modifier::ITALIC)
     } else if line.starts_with("   ↳") {
         Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80))
+    } else if line.starts_with("   ⭐⭐") {
+        Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))
+    } else if line.starts_with("   ") {
+        // Continuation of a brain thought block (only the first line of the block has the 🧠 icon)
+        Style::default()
+            .fg(Color::Rgb(0xa0, 0x80, 0xc0))
+            .add_modifier(Modifier::ITALIC)
     } else if line.starts_with("▶") || line.starts_with("⟳") {
         Style::default().fg(Color::Cyan)
     } else if line.starts_with("⏸") || line.starts_with("⏹") {

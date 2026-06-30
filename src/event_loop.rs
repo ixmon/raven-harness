@@ -366,16 +366,29 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.left_committed.push(to_commit);
                     }
                     if !app.current_thinking.is_empty() {
-                        for line in app.current_thinking.lines() {
-                            // Never prepend brain icon to tool call / debug lines.
-                            // Only real thinking gets 🧠 ; tool output uses 🔧 on first line + indented ↳ .
-                            let l = line.trim_start();
-                            let settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
-                                line.to_string()
+                        // Settle the thinking: 1 brain icon per thought block (not per line),
+                        // 1 tool icon at start of tool blocks. Subsequent lines of a thought
+                        // are indented without repeating the icon.
+                        let lines: Vec<&str> = app.current_thinking.lines().collect();
+                        if !lines.is_empty() {
+                            let first = lines[0];
+                            let l = first.trim_start();
+                            let first_settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
+                                first.to_string()
                             } else {
-                                format!("🧠 {}", line)
+                                format!("🧠 {}", first)
                             };
-                            app.trace_lines.push(settled);
+                            app.trace_lines.push(first_settled);
+
+                            for line in &lines[1..] {
+                                let l = line.trim_start();
+                                let settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
+                                    line.to_string()
+                                } else {
+                                    format!("   {}", line)
+                                };
+                                app.trace_lines.push(settled);
+                            }
                         }
                         app.current_thinking.clear();
                     }
@@ -429,7 +442,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Defensive cleanup: never allow brain icon prepended to tool call/debug lines
-        // (🔧 start or indented ↳ result). Ensures single tool icon on first line of tool output.
+        // (🔧 start or indented ↳ result). Ensures single tool icon at start of each tool block.
         for line in &mut app.trace_lines {
             if line.starts_with("🧠") {
                 let rest = line.trim_start_matches("🧠").trim_start();
@@ -562,10 +575,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
 
                 if show_input {
+                    let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, input_area, &tui_render::InputBarData {
                         input: &app.input, is_processing: app.is_processing,
                         spinner_tick: app.spinner_tick, search_mode: app.search_mode,
-                        focused: app.focused_pane == Pane::Input,
+                        focused: input_focused,
                     });
 
                     tui_render::draw_overlays(
@@ -575,12 +589,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
                     );
 
-                    app.clamp_cursor();
-                    let text_before = &app.input[..app.cursor_pos];
-                    let cursor_line = text_before.matches('\n').count() as u16;
-                    let last_nl = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                    let cursor_col = app.input[last_nl..app.cursor_pos].chars().count() as u16;
-                    f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
+                    if input_focused {
+                        app.clamp_cursor();
+                        let text_before = &app.input[..app.cursor_pos];
+                        let cursor_line = text_before.matches('\n').count() as u16;
+                        let last_nl = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let cursor_col = app.input[last_nl..app.cursor_pos].chars().count() as u16;
+                        f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
+                    }
                 }
 
                 if app.scroll_flash_timer > 0 { app.scroll_flash_timer -= 1; }

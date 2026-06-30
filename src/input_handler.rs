@@ -1,7 +1,7 @@
 //! Input handling logic for key events and editing actions.
 
 use crate::app_state::App;
-use crate::key_edit::{is_paste_key, map_key_to_edit};
+use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
 use crate::settings_modal::handle_settings_key;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -293,11 +293,21 @@ async fn handle_input_key(
         return Ok(true);
     }
 
-    // Map key to edit action (updated API) — only when focused on input
-    if app.focused_pane == crate::app_state::Pane::Input {
-        if let Some(action) = map_key_to_edit(&key) {
+    // Map key to edit action (updated API).
+    // Editing the input (backspace, delete, etc.) is allowed whenever the input
+    // is visible (on workspace). Cursor movement in input only when explicitly
+    // focused on the input pane (otherwise arrows navigate panes).
+    if let Some(action) = map_key_to_edit(&key) {
+        let is_cursor_move = matches!(
+            action,
+            EditAction::Left | EditAction::Right | EditAction::Home | EditAction::End
+        );
+        if !is_cursor_move || app.focused_pane == crate::app_state::Pane::Input {
             app.apply_edit_action(action);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) {
+                app.focused_pane = crate::app_state::Pane::Input;
+            }
             return Ok(true);
         }
     }
@@ -307,6 +317,9 @@ async fn handle_input_key(
         KeyCode::Char(c) => {
             app.insert_char(c);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) {
+                app.focused_pane = crate::app_state::Pane::Input;
+            }
             Ok(true)
         }
         KeyCode::Enter => {
