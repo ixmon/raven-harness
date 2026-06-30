@@ -15,3 +15,4 @@ pub mod server_probe;
 pub mod session;
 pub mod steering;
 pub mod tools;
+pub mod tool_xml;
