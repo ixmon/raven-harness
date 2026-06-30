@@ -287,7 +287,9 @@ async fn handle_input_key(
     }
 
     // Suppress text input editing on splash and picker screens (input bar is hidden there)
+    // except when in adding workspace mode
     if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker)
+        && !app.picker.adding_workspace
         && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
     {
         return Ok(true);
@@ -305,7 +307,7 @@ async fn handle_input_key(
         if !is_cursor_move || app.focused_pane == crate::app_state::Pane::Input {
             app.apply_edit_action(action);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) {
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
                 app.focused_pane = crate::app_state::Pane::Input;
             }
             return Ok(true);
@@ -317,7 +319,7 @@ async fn handle_input_key(
         KeyCode::Char(c) => {
             app.insert_char(c);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) {
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
                 app.focused_pane = crate::app_state::Pane::Input;
             }
             Ok(true)
@@ -336,6 +338,24 @@ async fn handle_input_key(
                     app.submit_queued_interject(app.input.clone(), queued_interject);
                 }
             } else {
+                // Picker add workspace: Enter accepts the path and starts trust confirm
+                if app.desktop.showing_picker() && app.picker.adding_workspace {
+                    let path = app.input.trim().to_string();
+                    app.clear_input();
+                    app.picker.adding_workspace = false;
+                    app.needs_redraw = true;
+                    if !path.is_empty() {
+                        if let Ok(p) = std::fs::canonicalize(&path) {
+                            if p.is_dir() {
+                                app.picker.confirm_trust_path = Some(p.clone());
+                                app.input = format!("Trust {} ? [y/n]", p.display());
+                                app.cursor_pos = app.input.len();
+                            }
+                        }
+                    }
+                    app.needs_redraw = true;
+                    return Ok(true);
+                }
                 // Submit the input. If it is a slash command, dispatch it (may activate
                 // submenus for /approval-mode or /run-mode, or handle instantly).
                 // Only plain prompts go through to the agent driver.
@@ -543,6 +563,9 @@ async fn handle_input_key(
                 app.mode_menu_active = false;
             } else if app.agent_mode_menu_active {
                 app.agent_mode_menu_active = false;
+            } else if app.desktop.showing_picker() && app.picker.adding_workspace {
+                app.picker.adding_workspace = false;
+                app.clear_input();
             } else if !app.input.is_empty() {
                 app.clear_input();
             }

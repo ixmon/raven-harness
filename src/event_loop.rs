@@ -482,7 +482,8 @@ async fn run_app<B: ratatui::backend::Backend>(
         let show_gauge = app.is_processing;
         let gauge_h = if show_gauge { 1 } else { 0 };
         let show_status = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Workspace);
-        let show_input = show_status;
+        let show_input = show_status
+            || (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && app.picker.adding_workspace);
         let status_h = if show_status { 1 } else { 0 };
         let input_line_count = if show_input { app.input.lines().count().max(1) as u16 } else { 0 };
         let input_h = if show_input {
@@ -560,6 +561,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         sessions: &app.picker.sessions,
                         selected_session: app.picker.selected_session,
                         focus: app.picker.focus,
+                        summary: &app.picker.summary,
                     },
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,

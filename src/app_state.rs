@@ -57,6 +57,10 @@ pub struct PickerState {
     pub selected_session: usize,
     pub focus: PickerFocus,
     pub loaded: bool,
+    pub summary: String,
+    // For "Add workspace" flow
+    pub adding_workspace: bool,
+    pub confirm_trust_path: Option<std::path::PathBuf>,
 }
 
 
@@ -834,6 +838,46 @@ impl App {
             self.picker.sessions.clear();
             self.picker.selected_session = 0;
         }
+        self.refresh_picker_summary();
+    }
+
+    pub fn refresh_picker_summary(&mut self) {
+        if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
+            let tests = if meta.achievement_tests.is_empty() {
+                "  (none)".to_string()
+            } else {
+                meta.achievement_tests.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
+            };
+            let pitfalls = if meta.pitfalls.is_empty() {
+                "  (none)".to_string()
+            } else {
+                meta.pitfalls.iter().map(|p| format!("  - {}", p)).collect::<Vec<_>>().join("\n")
+            };
+            let discoveries = if meta.discoveries.is_empty() {
+                "  (none)".to_string()
+            } else {
+                meta.discoveries.iter().map(|d| format!("  - {}", d)).collect::<Vec<_>>().join("\n")
+            };
+            self.picker.summary = format!(
+                "Session: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}",
+                meta.session_id,
+                meta.workspace.display(),
+                meta.agent_mode,
+                meta.updated_at,
+                meta.current_goal,
+                tests,
+                pitfalls,
+                discoveries,
+                meta.recent_turns_summary,
+                meta.repo_cache.short_summary
+            );
+        } else if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
+            self.picker.summary = format!(
+                "Workspace: {}\n\nNo session selected.\n\nUse 'n' to create a new session,\n'a' to add new workspace,\n'd' to delete current."
+            , ws.path.display());
+        } else {
+            self.picker.summary = "No workspaces.\n\nPress 'a' to add a workspace.".to_string();
+        }
     }
 
     /// Switch focus or move selection in picker. Returns true if handled.
@@ -842,6 +886,43 @@ impl App {
         if !self.desktop.showing_picker() {
             return false;
         }
+        // Handle trust confirmation for add workspace
+        if let Some(p) = self.picker.confirm_trust_path.clone() {
+            match key {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.picker.confirm_trust_path = None;
+                    self.clear_input();
+                    // Perform init and trust
+                    match raven_tui::session::Session::init(&p) {
+                        Ok(mut new_sess) => {
+                            // auto-trust since user confirmed in TUI
+                            new_sess.meta.trusted = true;
+                            let _ = new_sess.save_meta();
+                            // build cache
+                            let _ = raven_tui::session::ensure_repo_cache(&mut new_sess);
+                            if let Ok(mut ag) = agent.try_lock() {
+                                *ag.session_mut() = Some(new_sess);
+                            }
+                            // reload lists
+                            self.refresh_picker();
+                            self.needs_redraw = true;
+                        }
+                        Err(e) => {
+                            self.left_committed.push(format!("Error: {}", e));
+                            self.needs_redraw = true;
+                        }
+                    }
+                    return true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.picker.confirm_trust_path = None;
+                    self.clear_input();
+                    self.needs_redraw = true;
+                    return true;
+                }
+                _ => return true,
+            }
+        }
         match key {
             KeyCode::Up | KeyCode::Char('k') => {
                 match self.picker.focus {
@@ -849,11 +930,13 @@ impl App {
                         if self.picker.selected_workspace > 0 {
                             self.picker.selected_workspace -= 1;
                             self.refresh_picker_sessions();
+                            self.refresh_picker_summary();
                         }
                     }
                     PickerFocus::Sessions => {
                         if self.picker.selected_session > 0 {
                             self.picker.selected_session -= 1;
+                            self.refresh_picker_summary();
                         }
                     }
                 }
@@ -866,11 +949,13 @@ impl App {
                         if self.picker.selected_workspace + 1 < self.picker.workspaces.len() {
                             self.picker.selected_workspace += 1;
                             self.refresh_picker_sessions();
+                            self.refresh_picker_summary();
                         }
                     }
                     PickerFocus::Sessions => {
                         if self.picker.selected_session + 1 < self.picker.sessions.len() {
                             self.picker.selected_session += 1;
+                            self.refresh_picker_summary();
                         }
                     }
                 }
@@ -889,6 +974,7 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => {
                 if self.picker.focus == PickerFocus::Workspaces {
                     self.picker.focus = PickerFocus::Sessions;
+                    self.refresh_picker_summary();
                 } else {
                     // Activate selected session
                     self.activate_selected_session(agent);
@@ -901,6 +987,49 @@ impl App {
                     self.activate_selected_session(agent);
                 } else {
                     self.picker.focus = PickerFocus::Sessions;
+                }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.picker.adding_workspace = true;
+                self.input.clear();
+                self.cursor_pos = 0;
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                // New session for current ws
+                if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
+                    let name = format!("new-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+                    if let Ok(_s) = raven_tui::session::Session::init_named(&ws.path, &name) {
+                        self.refresh_picker();
+                        // select the new one? for simplicity refresh will have it at end or sort
+                        if !self.picker.sessions.is_empty() {
+                            self.picker.selected_session = self.picker.sessions.len() - 1;
+                            self.refresh_picker_summary();
+                        }
+                    }
+                }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                // Delete current focus item
+                if self.picker.focus == PickerFocus::Workspaces {
+                    if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
+                        if let Ok(ses) = raven_tui::session::list_sessions_for(&ws.path) {
+                            for s in ses {
+                                let _ = remove_session_dir(&s.session_id);
+                            }
+                        }
+                        self.refresh_picker();
+                    }
+                } else if self.picker.focus == PickerFocus::Sessions {
+                    if let Some(s) = self.picker.sessions.get(self.picker.selected_session) {
+                        let _ = remove_session_dir(&s.session_id);
+                        self.refresh_picker();
+                    }
                 }
                 self.needs_redraw = true;
                 true
@@ -954,5 +1083,18 @@ impl App {
         // Switch to workspace view for the loaded session
         self.desktop.set_workspace();
         self.needs_redraw = true;
+    }
+}
+
+fn remove_session_dir(session_id: &str) -> std::io::Result<()> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let dir = std::path::PathBuf::from(home)
+        .join(".raven-hotel")
+        .join("sessions")
+        .join(session_id);
+    if dir.exists() {
+        std::fs::remove_dir_all(dir)
+    } else {
+        Ok(())
     }
 }

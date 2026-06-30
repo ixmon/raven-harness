@@ -964,6 +964,7 @@ pub struct PickerDrawData<'a> {
     pub sessions: &'a [raven_tui::session::SessionMeta],
     pub selected_session: usize,
     pub focus: crate::app_state::PickerFocus,
+    pub summary: &'a str,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1102,15 +1103,16 @@ pub fn draw_content_desktop(
 pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .constraints([Constraint::Percentage(28), Constraint::Percentage(28), Constraint::Percentage(44)])
         .split(area);
 
     draw_workspace_column(f, cols[0], data.workspaces, data.selected_workspace, data.focus == crate::app_state::PickerFocus::Workspaces);
     draw_sessions_column(f, cols[1], data.sessions, data.selected_session, data.focus == crate::app_state::PickerFocus::Sessions);
+    draw_session_summary(f, cols[2], data.summary, data.focus == crate::app_state::PickerFocus::Sessions /* or always */ );
 
     // subtle hint line at bottom of area if space
     if area.height > 4 {
-        let hint = " ←/→ focus list   ↑/↓ select   →/Enter load   ← back to main ";
+        let hint = " ←/→ focus   ↑/↓ select   a: add ws   n: new sess   d: delete   →/Enter: load   ← back ";
         let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
@@ -1224,6 +1226,44 @@ fn draw_sessions_column(
         .block(
             Block::default()
                 .title(" Sessions ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border_style)
+                .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+fn draw_session_summary(
+    f: &mut Frame,
+    area: Rect,
+    summary: &str,
+    _focused: bool,
+) {
+    let mut text = Text::default();
+    text.lines.push(Line::from(Span::styled(
+        "  Session Summary",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    text.lines.push(Line::from(""));
+
+    if summary.is_empty() {
+        text.lines.push(Line::from(Span::styled("  (no session)", Style::default().fg(Color::DarkGray))));
+    } else {
+        for line in summary.lines() {
+            text.lines.push(Line::from(Span::styled(
+                truncate_str(line, area.width as usize - 4),
+                Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))
+            )));
+        }
+    }
+
+    let border_style = Style::default().fg(Color::Rgb(0x55, 0x55, 0x66));
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" Summary ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style)
