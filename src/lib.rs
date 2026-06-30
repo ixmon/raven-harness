@@ -14,5 +14,6 @@ pub mod sanitize;
 pub mod server_probe;
 pub mod session;
 pub mod steering;
+pub mod super_judge;
 pub mod tools;
 pub mod tool_xml;

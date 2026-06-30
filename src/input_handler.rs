@@ -385,6 +385,7 @@ async fn handle_input_key(
                         tokio::spawn(async move {
                             let mut ag = agent_c.lock().await;
                             let mode = ag.current_exec_mode();
+                            let agent_mode = ag.current_agent_mode();
                             let mut obs = crate::event_loop::TuiObserver {
                                 tx: tx_c.clone(),
                                 approval_req_tx: appr_c,
@@ -398,9 +399,99 @@ async fn handle_input_key(
                             let res = raven_tui::agent_driver::drive_turn(&mut ag, &prompt_c, &mut obs).await;
                             match res {
                                 Ok(r) => {
-                                    let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
-                                        final_text: r.final_text,
-                                    }).await;
+                                    // In "work" mode, run the Super Judge before declaring Done
+                                    if agent_mode == "work" {
+                                        const MAX_SUPER_JUDGE_CYCLES: u32 = 3;
+                                        let mut last_text = r.final_text.clone();
+                                        let mut all_actions = r.actions.clone();
+                                        let mut cycle = 0u32;
+
+                                        loop {
+                                            if cycle >= MAX_SUPER_JUDGE_CYCLES {
+                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                    name: "system".into(),
+                                                    summary: "🔍 Super Judge: max review cycles reached, accepting".into(),
+                                                }).await;
+                                                break;
+                                            }
+                                            cycle += 1;
+
+                                            // Brief pause for UX (shows Processing off briefly)
+                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                            let _ = tx_c.send(crate::event_loop::UiUpdate::SuperJudgeBegin).await;
+                                            let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                name: "system".into(),
+                                                summary: format!("🔍 Super Judge reviewing work (cycle {}/{})", cycle, MAX_SUPER_JUDGE_CYCLES),
+                                            }).await;
+
+                                            // Use the headless Super Judge observer
+                                            let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
+                                            let verdict = raven_tui::super_judge::run_super_judge_with_observer(
+                                                &mut ag, &last_text, &all_actions, &mut sj_obs,
+                                            ).await;
+
+                                            match verdict {
+                                                raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: WORK_COMPLETE — {}", note),
+                                                    }).await;
+                                                    break;
+                                                }
+                                                raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: NEEDS_WORK — nudging agent"),
+                                                    }).await;
+                                                    // Inject feedback and re-run
+                                                    let nudge = format!(
+                                                        "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
+                                                        feedback
+                                                    );
+                                                    match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs).await {
+                                                        Ok(r2) => {
+                                                            last_text = r2.final_text.clone();
+                                                            all_actions.extend(r2.actions);
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = tx_c.send(crate::event_loop::UiUpdate::Error(
+                                                                format!("Super Judge re-run error: {}", e)
+                                                            )).await;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: DEATH_SPIRAL detected — {}", feedback),
+                                                    }).await;
+                                                    // Inject anti-spiral guidance as final message
+                                                    ag.push_message("user", &format!(
+                                                        "[🔍 SUPER JUDGE — DEATH SPIRAL DETECTED]: {}\n\n\
+                                                         Stop repeating the same approach. Try something completely different.",
+                                                        feedback
+                                                    ));
+                                                    break;
+                                                }
+                                                raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
+                                                    }).await;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
+                                            final_text: last_text,
+                                        }).await;
+                                    } else {
+                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
+                                            final_text: r.final_text,
+                                        }).await;
+                                    }
                                     let _ = tx_c.send(crate::event_loop::UiUpdate::Usage {
                                         prompt_tokens: Some(r.metrics.prompt_tokens as u32),
                                         completion_tokens: Some(r.metrics.completion_tokens as u32),

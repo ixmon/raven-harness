@@ -401,6 +401,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.api_total_tokens = total_tokens;
                     app.needs_redraw = true;
                 }
+                UiUpdate::SuperJudgeBegin => {
+                    app.is_processing = true;
+                    app.trace_lines.push("🔍 Super Judge review starting…".to_string());
+                    app.right_follow_output = true;
+                    app.right_scroll = 10_000;
+                    app.needs_redraw = true;
+                }
                 _ => {}
             }
         }
