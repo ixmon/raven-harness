@@ -248,7 +248,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
     let (tx, mut rx) = mpsc::channel::<UiUpdate>(64);
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
-    let (approval_req_tx, _approval_req_rx) = mpsc::channel::<(String, oneshot::Sender<bool>)>(4);
+    let (approval_req_tx, mut approval_req_rx) = mpsc::channel::<(String, oneshot::Sender<bool>)>(4);
     let stop_signal = Arc::new(AtomicBool::new(false));
     let queued_interject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let instant_interject: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -408,6 +408,16 @@ async fn run_app<B: ratatui::backend::Backend>(
         // Balance updates
         while let Ok(label) = balance_rx.try_recv() {
             app.balance_label = label;
+            app.needs_redraw = true;
+        }
+
+        // Tool approval requests from TuiObserver::approve_tool().
+        // The observer sends (description, oneshot::Sender<bool>) when a tool needs
+        // user approval. We store them so the UI can show the popup and the key
+        // handler can respond with Y/N.
+        while let Ok((desc, responder)) = approval_req_rx.try_recv() {
+            app.pending_approval = Some(desc);
+            app.approval_responder = Some(responder);
             app.needs_redraw = true;
         }
 
@@ -578,6 +588,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                 if k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL) {
                     stop_signal.store(true, Ordering::SeqCst);
                     break;
+                }
+                // Handle tool approval popup (Y/N) before general input
+                if app.handle_approval_key(*k) {
+                    app.needs_redraw = true;
+                    continue;
                 }
             }
             let _ = input_handler::handle_key_event(
