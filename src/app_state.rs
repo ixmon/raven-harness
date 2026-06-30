@@ -47,6 +47,14 @@ pub enum PickerFocus {
     #[default]
     Workspaces,
     Sessions,
+    Summary,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WikiLink {
+    pub text: String,
+    pub target: String,
+    pub line: usize,
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +66,15 @@ pub struct PickerState {
     pub focus: PickerFocus,
     pub loaded: bool,
     pub summary: String,
+    pub summary_scroll: usize,
+    // Current file shown in the summary/wiki column (relative to wiki/ dir)
+    pub current_wiki_file: String,
+    pub current_wiki_content: String,
+    pub wiki_links: Vec<WikiLink>,
+    pub active_link_idx: usize,
+    pub wiki_content_start: usize, // line index in summary where wiki content (after --- header) starts
+    pub last_summary_height: u16, // for better visible window in active link calc
+    pub show_wiki_in_summary: bool, // hide wiki preview behind "Wiki" link initially
     // For "Add workspace" flow
     pub adding_workspace: bool,
     pub confirm_trust_path: Option<std::path::PathBuf>,
@@ -248,7 +265,17 @@ impl App {
             cached_agent_mode: "talk".into(),
             desktop: DesktopState::new(),
             raven_art: crate::desktop::load_raven_art(),
-            picker: PickerState::default(),
+            picker: {
+                let mut p = PickerState::default();
+                p.current_wiki_file = "index.md".to_string();
+                p.current_wiki_content = String::new();
+                p.wiki_links = vec![];
+                p.active_link_idx = 0;
+                p.wiki_content_start = 0;
+                p.last_summary_height = 20;
+                p.show_wiki_in_summary = false;
+                p
+            },
         }
     }
 
@@ -479,7 +506,7 @@ impl App {
         };
     }
 
-    fn pane_max_scroll(&self, pane: Pane) -> u16 {
+    pub(crate) fn pane_max_scroll(&self, pane: Pane) -> u16 {
         let (line_count, content_h) = match pane {
             Pane::Left => (
                 self.last_left_line_count,
@@ -858,25 +885,187 @@ impl App {
             } else {
                 meta.discoveries.iter().map(|d| format!("  - {}", d)).collect::<Vec<_>>().join("\n")
             };
+            let wiki_file = if self.picker.current_wiki_file.is_empty() { "index.md".to_string() } else { self.picker.current_wiki_file.clone() };
+            let session_id = meta.session_id.clone();
+            let workspace = meta.workspace.clone();
+            let agent_mode = meta.agent_mode.clone();
+            let updated_at = meta.updated_at.clone();
+            let current_goal = meta.current_goal.clone();
+            let recent_turns_summary = meta.recent_turns_summary.clone();
+            let repo_short = meta.repo_cache.short_summary.clone();
+
+            let wiki_section = if self.picker.show_wiki_in_summary {
+                // Load specific wiki file for multi-doc support (links between pages)
+                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                let path = std::path::PathBuf::from(&home)
+                    .join(".raven-hotel").join("sessions").join(&session_id)
+                    .join("wiki").join(&wiki_file);
+                match std::fs::read_to_string(&path) {
+                    Ok(c) => {
+                        self.picker.current_wiki_content = c.clone();
+                        self.picker.wiki_links = Self::parse_wiki_links(&c);
+
+                        // full when focused on Summary for browsing
+                        let head = if self.picker.focus == PickerFocus::Summary {
+                            c.clone()
+                        } else {
+                            c.lines().take(100).collect::<Vec<_>>().join("\n")
+                        };
+                        format!("\n\n--- {} ---\n{}", wiki_file, head)
+                    }
+                    Err(_) => {
+                        self.picker.current_wiki_content.clear();
+                        self.picker.wiki_links.clear();
+                        self.picker.active_link_idx = 0;
+                        self.picker.wiki_content_start = 0;
+                        self.recompute_active_link();
+                        "\n\n(no wiki content)".to_string()
+                    },
+                }
+            } else {
+                format!("\n\nWiki (press 'w' to view {})", wiki_file)
+            };
+
             self.picker.summary = format!(
-                "Session: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}",
-                meta.session_id,
-                meta.workspace.display(),
-                meta.agent_mode,
-                meta.updated_at,
-                meta.current_goal,
+                "Session: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}{}\n\nLaunch (Enter to open session in main view)",
+                session_id,
+                workspace.display(),
+                agent_mode,
+                updated_at,
+                current_goal,
                 tests,
                 pitfalls,
                 discoveries,
-                meta.recent_turns_summary,
-                meta.repo_cache.short_summary
+                recent_turns_summary,
+                repo_short,
+                wiki_section
             );
+            // Compute where the wiki content starts in the summary lines (after the --- header)
+            let summary_lines: Vec<&str> = self.picker.summary.lines().collect();
+            self.picker.wiki_content_start = summary_lines
+                .iter()
+                .position(|l| l.starts_with("--- "))
+                .map_or(0, |pos| pos + 1);
+            self.recompute_active_link();
         } else if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
             self.picker.summary = format!(
                 "Workspace: {}\n\nNo session selected.\n\nUse 'n' to create a new session,\n'a' to add new workspace,\n'd' to delete current."
             , ws.path.display());
+            self.picker.wiki_content_start = 0;
+            self.picker.wiki_links.clear();
+            self.picker.active_link_idx = 0;
+            self.recompute_active_link();
         } else {
             self.picker.summary = "No workspaces.\n\nPress 'a' to add a workspace.".to_string();
+            self.picker.wiki_content_start = 0;
+            self.picker.wiki_links.clear();
+            self.picker.active_link_idx = 0;
+            self.recompute_active_link();
+        }
+    }
+
+    fn parse_wiki_links(content: &str) -> Vec<WikiLink> {
+        let mut links = vec![];
+        // Standard markdown: [text](target.md)
+        if let Ok(re) = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)") {
+            for (line_idx, line) in content.lines().enumerate() {
+                for cap in re.captures_iter(line) {
+                    let text = cap.get(1).map_or("", |m| m.as_str()).to_string();
+                    let mut target = cap.get(2).map_or("", |m| m.as_str()).to_string();
+                    if let Some(h) = target.find('#') {
+                        target = target[..h].to_string();
+                    }
+                    if !target.ends_with(".md") {
+                        target.push_str(".md");
+                    }
+                    links.push(WikiLink { text, target, line: line_idx });
+                }
+            }
+        }
+        // Wiki style: [[target]] or [[target.md]]
+        if let Ok(re) = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]") {
+            for (line_idx, line) in content.lines().enumerate() {
+                for cap in re.captures_iter(line) {
+                    let mut target = cap.get(1).map_or("", |m| m.as_str()).to_string();
+                    if !target.ends_with(".md") {
+                        target.push_str(".md");
+                    }
+                    links.push(WikiLink {
+                        text: target.clone(),
+                        target,
+                        line: line_idx,
+                    });
+                }
+            }
+        }
+        links
+    }
+
+    fn recompute_active_link(&mut self) {
+        if self.picker.wiki_links.is_empty() {
+            self.picker.active_link_idx = 0;
+            return;
+        }
+        let total_scroll = self.picker.summary_scroll as usize;
+        let wiki_scroll = total_scroll.saturating_sub(self.picker.wiki_content_start);
+        let visible_h = self.picker.last_summary_height.max(5) as usize;
+        self.picker.active_link_idx = 0;
+        for (i, link) in self.picker.wiki_links.iter().enumerate() {
+            if link.line >= wiki_scroll && link.line < wiki_scroll + visible_h {
+                self.picker.active_link_idx = i;
+                break;
+            }
+        }
+    }
+
+    /// Simple link follower for the summary/wiki pane.
+    /// Follows the currently active link (first visible one).
+    fn follow_wiki_link_in_summary(&mut self) {
+        if self.picker.focus != PickerFocus::Summary {
+            return;
+        }
+
+        // Get the currently viewed wiki file for this session
+        let wiki_file = if self.picker.current_wiki_file.is_empty() {
+            "index.md".to_string()
+        } else {
+            self.picker.current_wiki_file.clone()
+        };
+
+        // Load the *actual full content* of the current wiki file for reliable link scanning
+        // (the embedded preview in .summary is truncated)
+        let mut content = String::new();
+        if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            let path = std::path::PathBuf::from(&home)
+                .join(".raven-hotel")
+                .join("sessions")
+                .join(&meta.session_id)
+                .join("wiki")
+                .join(&wiki_file);
+            if let Ok(c) = std::fs::read_to_string(&path) {
+                content = c;
+            }
+        }
+
+        if content.is_empty() {
+            content = self.picker.summary.clone();
+        }
+
+        // Use the active link (first visible one) instead of rescanning
+        if let Some(link) = self.picker.wiki_links.get(self.picker.active_link_idx).cloned() {
+            let mut target = link.target;
+            if let Some(hash) = target.find('#') {
+                target = target[..hash].to_string();
+            }
+            self.picker.current_wiki_file = target;
+            self.picker.summary_scroll = 0;
+            self.refresh_picker_summary();
+        } else if self.picker.current_wiki_file != "index.md" {
+            self.picker.current_wiki_file = "index.md".to_string();
+            self.picker.show_wiki_in_summary = false;
+            self.picker.summary_scroll = 0;
+            self.refresh_picker_summary();
         }
     }
 
@@ -936,8 +1125,16 @@ impl App {
                     PickerFocus::Sessions => {
                         if self.picker.selected_session > 0 {
                             self.picker.selected_session -= 1;
+                            self.picker.summary_scroll = 0;
+                            self.picker.current_wiki_file = "index.md".to_string();
+                            self.picker.show_wiki_in_summary = false;
                             self.refresh_picker_summary();
                         }
+                    }
+                    PickerFocus::Summary => {
+                        self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(1);
+                        self.recompute_active_link();
+                        self.needs_redraw = true;
                     }
                 }
                 self.needs_redraw = true;
@@ -955,38 +1152,73 @@ impl App {
                     PickerFocus::Sessions => {
                         if self.picker.selected_session + 1 < self.picker.sessions.len() {
                             self.picker.selected_session += 1;
+                            self.picker.summary_scroll = 0;
+                            self.picker.current_wiki_file = "index.md".to_string();
+                            self.picker.show_wiki_in_summary = false;
                             self.refresh_picker_summary();
                         }
+                    }
+                    PickerFocus::Summary => {
+                        self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(1);
+                        self.recompute_active_link();
+                        self.needs_redraw = true;
                     }
                 }
                 self.needs_redraw = true;
                 true
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.picker.focus == PickerFocus::Sessions {
-                    self.picker.focus = PickerFocus::Workspaces;
-                } else {
-                    self.exit_picker_to_main();
+                match self.picker.focus {
+                    PickerFocus::Sessions => {
+                        self.picker.focus = PickerFocus::Workspaces;
+                    }
+                    PickerFocus::Summary => {
+                        self.picker.focus = PickerFocus::Sessions;
+                    }
+                    _ => {
+                        self.exit_picker_to_main();
+                    }
                 }
                 self.needs_redraw = true;
                 true
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.picker.focus == PickerFocus::Workspaces {
-                    self.picker.focus = PickerFocus::Sessions;
-                    self.refresh_picker_summary();
-                } else {
-                    // Activate selected session
-                    self.activate_selected_session(agent);
+                match self.picker.focus {
+                    PickerFocus::Workspaces => {
+                        self.picker.focus = PickerFocus::Sessions;
+                        self.refresh_picker_summary();
+                    }
+                    PickerFocus::Sessions => {
+                        self.picker.focus = PickerFocus::Summary;
+                        self.picker.summary_scroll = 0;
+                        self.refresh_picker_summary();  // reload with more lines now that Summary is focused
+                        self.recompute_active_link();
+                    }
+                    PickerFocus::Summary => {
+                        // On summary, right can activate the session (load into workspace)
+                        self.activate_selected_session(agent);
+                    }
                 }
                 self.needs_redraw = true;
                 true
             }
             KeyCode::Enter => {
-                if self.picker.focus == PickerFocus::Sessions {
-                    self.activate_selected_session(agent);
-                } else {
-                    self.picker.focus = PickerFocus::Sessions;
+                match self.picker.focus {
+                    PickerFocus::Sessions => {
+                        self.activate_selected_session(agent);
+                    }
+                    PickerFocus::Summary => {
+                        if self.picker.show_wiki_in_summary {
+                            // follow link inside the wiki
+                            self.follow_wiki_link_in_summary();
+                        } else {
+                            // Launch / activate the session -> main workspace view (conversation + thinking panes)
+                            self.activate_selected_session(agent);
+                        }
+                    }
+                    _ => {
+                        self.picker.focus = PickerFocus::Sessions;
+                    }
                 }
                 self.needs_redraw = true;
                 true
@@ -1034,6 +1266,62 @@ impl App {
                 self.needs_redraw = true;
                 true
             }
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                if self.picker.focus == PickerFocus::Summary {
+                    self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
+                    self.refresh_picker_summary();
+                    self.needs_redraw = true;
+                    return true;
+                } else if self.picker.focus == PickerFocus::Sessions {
+                    if let Some(s) = self.picker.sessions.get(self.picker.selected_session) {
+                        let wiki_file = if self.picker.current_wiki_file.is_empty() {
+                            "index.md".to_string()
+                        } else {
+                            self.picker.current_wiki_file.clone()
+                        };
+                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                        let wiki_path = std::path::PathBuf::from(home)
+                            .join(".raven-hotel").join("sessions").join(&s.session_id)
+                            .join("wiki").join(&wiki_file);
+                        let content = std::fs::read_to_string(&wiki_path)
+                            .unwrap_or_else(|_| format!("(no {wiki_file} yet — agent can create one with write_wiki)"));
+                        self.left_committed.push(format!("=== Wiki: {} ===\n{}", wiki_file, content));
+                        self.left_follow_output = true;
+                        self.left_scroll = 10_000;
+                        self.needs_redraw = true;
+                        return true;
+                    }
+                }
+                true
+            }
+            KeyCode::PageUp => {
+                if self.picker.focus == PickerFocus::Sessions {
+                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(12);
+                    self.recompute_active_link();
+                    self.needs_redraw = true;
+                    return true;
+                } else if self.picker.focus == PickerFocus::Summary {
+                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(12);
+                    self.recompute_active_link();
+                    self.needs_redraw = true;
+                    return true;
+                }
+                false
+            }
+            KeyCode::PageDown => {
+                if self.picker.focus == PickerFocus::Sessions {
+                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(12);
+                    self.recompute_active_link();
+                    self.needs_redraw = true;
+                    return true;
+                } else if self.picker.focus == PickerFocus::Summary {
+                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(12);
+                    self.recompute_active_link();
+                    self.needs_redraw = true;
+                    return true;
+                }
+                false
+            }
             _ => false,
         }
     }
@@ -1049,27 +1337,28 @@ impl App {
         };
 
         // Load (or resume) the session for this workspace.
-        match raven_tui::session::Session::init(&ws_path) {
-            Ok(new_sess) => {
-                if let Ok(mut ag) = agent.try_lock() {
-                    *ag.session_mut() = Some(new_sess);
-                }
-            }
+        let loaded_sess = match raven_tui::session::Session::init(&ws_path) {
+            Ok(s) => s,
             Err(e) => {
                 self.left_committed.push(format!("Error loading session: {}", e));
                 self.needs_redraw = true;
                 return;
             }
+        };
+
+        // Load recent conv history from log for UI display (prevents blank on re-select)
+        self.left_committed.clear();
+        let recent = loaded_sess.load_recent_conversation(25);
+        for (role, content) in recent {
+            let disp = if role == "user" { format!("> {}", content) } else { content.to_string() };
+            self.left_committed.push(disp);
         }
 
-        // Reset visible UI state for the new session context
-        self.left_committed.clear();
-        let banner = format!(
-            "Raven Hotel - Loaded session\nWorkspace: {}\nSession: {}\n\nUse ↑/↓ in panes, arrows to navigate, /help for commands.",
-            ws_path.display(),
-            sess_meta.session_id
-        );
-        self.left_committed.push(banner);
+        if let Ok(mut ag) = agent.try_lock() {
+            *ag.session_mut() = Some(loaded_sess);
+        }
+
+        // Reset other visible UI state
         self.trace_lines.clear();
         self.current_response.clear();
         self.current_thinking.clear();
@@ -1078,7 +1367,14 @@ impl App {
         self.left_follow_output = true;
         self.left_scroll = 10_000;
         self.is_processing = false;
-        self.focused_pane = Pane::Input;
+        self.focused_pane = Pane::Left;
+
+        let banner = format!(
+            "Raven Hotel - Loaded session\nWorkspace: {}\nSession: {}\n\nUse ↑/↓ in panes, arrows to navigate, /help for commands.",
+            ws_path.display(),
+            sess_meta.session_id
+        );
+        self.left_committed.push(banner);
 
         // Switch to workspace view for the loaded session
         self.desktop.set_workspace();

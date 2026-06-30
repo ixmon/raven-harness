@@ -332,12 +332,18 @@ impl TurnObserver for SuperJudgeObserver {
 
     async fn approve_tool(&mut self, tc: &ToolCall) -> bool {
         let name = &tc.function.name;
+        // Allow wiki writes (private scratchpad)
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
+            if v.get("wiki").and_then(|w| w.as_bool()).unwrap_or(false) {
+                return true;
+            }
+        }
         // Allow read-only tools + exec (for verification)
-        // Deny write/patch (Super Judge is a reviewer, not an editor)
+        // Deny workspace write/patch (Super Judge is a reviewer, not an editor)
         match name.as_str() {
             "read" | "read_summary" | "list" | "grep" | "exec" => true,
             "write" | "patch" => {
-                eprintln!("  🔍 DENIED: Super Judge cannot write/patch files");
+                eprintln!("  🔍 DENIED: Super Judge cannot write/patch workspace files");
                 false
             }
             _ => true,

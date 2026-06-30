@@ -151,6 +151,12 @@ impl TurnObserver for TuiObserver {
 
 impl TuiObserver {
     fn needs_approval(&self, name: &str, args: &str) -> bool {
+        // Wiki writes are always safe — private session scratchpad, never touches workspace
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if v.get("wiki").and_then(|w| w.as_bool()).unwrap_or(false) {
+                return false;
+            }
+        }
         let is_mutating = matches!(name, "write" | "patch" | "exec");
         let is_outside = if name == "exec" {
             let cmd = serde_json::from_str::<serde_json::Value>(args).ok()
@@ -492,6 +498,11 @@ async fn run_app<B: ratatui::backend::Backend>(
             0
         };
 
+        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
+            // rough estimate; updated inside draw if possible
+            app.picker.last_summary_height = 25;
+        }
+
         // Draw
         if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 || app.desktop.is_animating() {
             app.needs_redraw = false;
@@ -513,6 +524,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let content_area = vertical[1];
                 let gauge_area = vertical[2];
                 let input_area = vertical[3];
+
+                if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
+                    app.picker.last_summary_height = content_area.height.saturating_sub(4).max(10);
+                }
 
                 let left_focused = app.focused_pane == Pane::Left;
                 let right_focused = app.focused_pane == Pane::Right;
@@ -562,6 +577,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         selected_session: app.picker.selected_session,
                         focus: app.picker.focus,
                         summary: &app.picker.summary,
+                        summary_scroll: app.picker.summary_scroll,
+                        wiki_links: &app.picker.wiki_links,
+                        active_link_idx: app.picker.active_link_idx,
                     },
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,

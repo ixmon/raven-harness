@@ -136,6 +136,7 @@ impl MockToolBackend {
                     safe_truncate(text, 80)
                 ));
             }
+
             "read_summary" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 return Ok(format!("✅ read_summary requested for {}", path));
@@ -256,6 +257,7 @@ async fn real_execute(
                 safe_truncate(text, 80)
             ))
         }
+
         "read_summary" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             Ok(format!("✅ read_summary requested for {}", path))

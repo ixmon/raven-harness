@@ -858,6 +858,43 @@ History:
             }
         }
 
+        // Wiki flag: when wiki=true is set on read/write/patch/list, route to the
+        // session's private wiki directory instead of the workspace.
+        // Wiki writes are always allowed (no approval needed) — it's the agent's own scratchpad.
+        let is_wiki = args.get("wiki").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_wiki && matches!(name, "read" | "write" | "patch" | "list") {
+            if let Some(s) = &self.session {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                match name {
+                    "read" => {
+                        let lines = args.get("lines").and_then(|v| v.as_str());
+                        let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let limit = self.config.context_budget.read_line_limit;
+                        return Some(s.read_wiki_file(path, lines, full, limit));
+                    }
+                    "write" => {
+                        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        let _ = s.ensure_wiki_dir();
+                        return Some(s.write_wiki_file(path, content));
+                    }
+                    "patch" => {
+                        let search = args.get("search").and_then(|v| v.as_str()).unwrap_or("");
+                        let replace = args.get("replace").and_then(|v| v.as_str()).unwrap_or("");
+                        let near_line = args.get("near_line").and_then(|v| v.as_i64());
+                        let _ = s.ensure_wiki_dir();
+                        return Some(s.patch_wiki_file(path, search, replace, near_line));
+                    }
+                    "list" => {
+                        let sub = if path.is_empty() { None } else { Some(path) };
+                        let _ = s.ensure_wiki_dir();
+                        return Some(s.list_wiki(sub));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            return Some(format!("❌ {}(wiki=true): no active session", name));
+        }
+
         if name == "read_summary" {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let rel = make_rel_path(path, &self.config.workspace);
@@ -1242,11 +1279,13 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 - Use `list` and `grep` heavily to explore the project.
 - Use `exec` for building, testing, git, cargo, etc. Keep commands focused.
 - `web_search` finds candidate pages. `browse` reads them. Use search → browse for research.
+- For think/research/dream: use `read(path, wiki=true)` / `write(path, content, wiki=true)` / `patch(path, ..., wiki=true)` / `list(wiki=true)` to maintain a structured external memory (links, papers, experiments, conclusions). Wiki writes never need approval. Always cite sources with URLs.
 - If a tool fails, report the exact error and adapt. Do not pretend it succeeded.
 {}{}
 
 ## Available Tools
 exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
+(read, write, patch, list also accept wiki=true to operate on the session's private research wiki instead of the workspace)
 
 ## Output Style
 - Be concise but complete.

@@ -14,6 +14,17 @@ use ratatui::{
     Frame,
 };
 
+// tui-markdown added for llm-wiki viewer (Phase 4+).
+// Converts markdown (with links, tables, code) into ratatui Text for rendering.
+#[allow(dead_code)]
+fn _wiki_render_markdown(md: &str) -> Text<'static> {
+    // The crate returns Text<'_>; for the stub we own a copy of the input as fallback.
+    // Real viewer code will use the conversion in a context that can hold the borrow
+    // or will map spans to owned.
+    let _ = tui_markdown::from_str(md);
+    Text::from(md.to_string())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pane {
     #[default]
@@ -965,6 +976,9 @@ pub struct PickerDrawData<'a> {
     pub selected_session: usize,
     pub focus: crate::app_state::PickerFocus,
     pub summary: &'a str,
+    pub summary_scroll: usize,
+    pub wiki_links: &'a [crate::app_state::WikiLink],
+    pub active_link_idx: usize,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1108,11 +1122,11 @@ pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
 
     draw_workspace_column(f, cols[0], data.workspaces, data.selected_workspace, data.focus == crate::app_state::PickerFocus::Workspaces);
     draw_sessions_column(f, cols[1], data.sessions, data.selected_session, data.focus == crate::app_state::PickerFocus::Sessions);
-    draw_session_summary(f, cols[2], data.summary, data.focus == crate::app_state::PickerFocus::Sessions /* or always */ );
+    draw_session_summary(f, cols[2], data.summary, data.summary_scroll, data.focus == crate::app_state::PickerFocus::Summary, data.wiki_links, data.active_link_idx);
 
     // subtle hint line at bottom of area if space
     if area.height > 4 {
-        let hint = " ←/→ focus   ↑/↓ select   a: add ws   n: new sess   d: delete   →/Enter: load   ← back ";
+        let hint = " ←/→ focus Summary  w: toggle Wiki  Enter: Launch (or follow when Wiki shown)  a/n/d";
         let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
@@ -1239,7 +1253,10 @@ fn draw_session_summary(
     f: &mut Frame,
     area: Rect,
     summary: &str,
-    _focused: bool,
+    scroll: usize,
+    focused: bool,
+    wiki_links: &[crate::app_state::WikiLink],
+    active_link_idx: usize,
 ) {
     let mut text = Text::default();
     text.lines.push(Line::from(Span::styled(
@@ -1248,18 +1265,101 @@ fn draw_session_summary(
     )));
     text.lines.push(Line::from(""));
 
-    if summary.is_empty() {
-        text.lines.push(Line::from(Span::styled("  (no session)", Style::default().fg(Color::DarkGray))));
+    let start = scroll;
+    let max_lines = (area.height as usize).saturating_sub(3);
+    let all_lines: Vec<String> = if summary.is_empty() {
+        vec!["  (no session)".to_string()]
     } else {
-        for line in summary.lines() {
+        summary.lines().map(|l| l.to_string()).collect()
+    };
+    let visible: Vec<_> = all_lines.iter().skip(start).take(max_lines).collect();
+
+    // Find the active link's line (relative to full wiki content)
+    let active_line = wiki_links.get(active_link_idx).map(|l| l.line).unwrap_or(usize::MAX);
+
+    // Determine where the wiki section starts in the summary lines (after the meta)
+    let wiki_section_start = all_lines.iter().position(|l| l.starts_with("--- ")).unwrap_or(0);
+
+    for (vis_idx, line) in visible.iter().enumerate() {
+        let global_line_in_all = start + vis_idx;
+        let is_wiki_line = global_line_in_all >= wiki_section_start;
+        let wiki_line_num = if is_wiki_line {
+            global_line_in_all.saturating_sub(wiki_section_start + 1)
+        } else {
+            usize::MAX
+        };
+
+        let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
+
+        // Build spans for the line, highlighting the full markdown link
+        let mut spans = vec![];
+        let mut remaining = line.as_str();
+
+        let line_links: Vec<_> = wiki_links.iter().filter(|l| l.line == wiki_line_num).collect();
+
+        for link in &line_links {
+            if let Some(text_pos) = remaining.find(&link.text) {
+                // Expand to full link: look backwards for '[' and forwards for ')'
+                let mut link_start = text_pos;
+                while link_start > 0 && remaining.as_bytes().get(link_start - 1) != Some(&b'[') {
+                    link_start -= 1;
+                }
+                if link_start > 0 && remaining.as_bytes().get(link_start - 1) == Some(&b'[') {
+                    link_start -= 1;
+                }
+
+                let mut link_end = text_pos + link.text.len();
+                while link_end < remaining.len() && remaining.as_bytes().get(link_end) != Some(&b')') {
+                    link_end += 1;
+                }
+                if link_end < remaining.len() && remaining.as_bytes().get(link_end) == Some(&b')') {
+                    link_end += 1;
+                }
+
+                if link_start < text_pos + link.text.len() && link_end > link_start {
+                    // before
+                    if link_start > 0 {
+                        spans.push(Span::styled(remaining[..link_start].to_string(), base_style));
+                    }
+
+                    let full_link = &remaining[link_start..link_end];
+                    let is_active = wiki_line_num == active_line;
+                    let link_style = if is_active {
+                        Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)
+                    };
+                    spans.push(Span::styled(full_link.to_string(), link_style));
+
+                    remaining = &remaining[link_end..];
+                }
+            }
+        }
+        if !remaining.is_empty() {
+            spans.push(Span::styled(remaining.to_string(), base_style));
+        }
+
+        if spans.is_empty() {
+            let mut style = base_style;
+            if is_wiki_line && wiki_line_num == active_line {
+                style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            } else if is_wiki_line && !line_links.is_empty() {
+                style = Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
+            }
             text.lines.push(Line::from(Span::styled(
                 truncate_str(line, area.width as usize - 4),
-                Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))
+                style
             )));
+        } else {
+            text.lines.push(Line::from(spans));
         }
     }
 
-    let border_style = Style::default().fg(Color::Rgb(0x55, 0x55, 0x66));
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
     let para = Paragraph::new(text)
         .block(
             Block::default()

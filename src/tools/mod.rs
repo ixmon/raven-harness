@@ -63,13 +63,14 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read".into(),
-                description: "Read a file's contents. Use lines=\"N-M\" or full=true to read more/entire file (useful for refactoring). Always read before editing.".into(),
+                description: "Read a file's contents. Use lines=\"N-M\" or full=true to read more/entire file (useful for refactoring). Always read before editing. Set wiki=true to read from your private session wiki instead of the workspace.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path to the file (relative to workspace or absolute)" },
+                        "path": { "type": "string", "description": "Path to the file (relative to workspace, or relative to wiki/ if wiki=true)" },
                         "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" },
-                        "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" }
+                        "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" },
+                        "wiki": { "type": "boolean", "description": "If true, path is relative to the session's private research wiki (not the workspace)" }
                     },
                     "required": ["path"]
                 }),
@@ -79,12 +80,13 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "write".into(),
-                description: "Write (overwrite) a file. Prefer patch for modifications to existing code.".into(),
+                description: "Write (overwrite) a file. Prefer patch for modifications to existing code. Set wiki=true to write to your private session wiki (always allowed, no approval needed).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Destination path" },
-                        "content": { "type": "string", "description": "Full file content to write" }
+                        "path": { "type": "string", "description": "Destination path (or relative to wiki/ if wiki=true)" },
+                        "content": { "type": "string", "description": "Full file content to write" },
+                        "wiki": { "type": "boolean", "description": "If true, writes to the session's private research wiki (always allowed, no approval needed)" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -94,14 +96,15 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Safe search-and-replace edit. Strongly preferred over write for modifications. Use near_line when the search text appears multiple times.".into(),
+                description: "Safe search-and-replace edit. Strongly preferred over write for modifications. Use near_line when the search text appears multiple times. Set wiki=true to patch a file in your private session wiki.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File to edit" },
+                        "path": { "type": "string", "description": "File to edit (or relative to wiki/ if wiki=true)" },
                         "search": { "type": "string", "description": "Exact text to find and replace (must match precisely)" },
                         "replace": { "type": "string", "description": "Replacement text" },
-                        "near_line": { "type": "integer", "description": "Optional hint: the approximate line number of the occurrence you want (1-based)" }
+                        "near_line": { "type": "integer", "description": "Optional hint: the approximate line number of the occurrence you want (1-based)" },
+                        "wiki": { "type": "boolean", "description": "If true, patches a file in the session's private research wiki" }
                     },
                     "required": ["path", "search", "replace"]
                 }),
@@ -126,11 +129,12 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "list".into(),
-                description: "List files and directories in a path (relative to workspace). Great for exploration.".into(),
+                description: "List files and directories in a path (relative to workspace). Great for exploration. Set wiki=true to list the session's private research wiki.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory to list (default: workspace root)" }
+                        "path": { "type": "string", "description": "Directory to list (default: workspace root, or wiki root if wiki=true)" },
+                        "wiki": { "type": "boolean", "description": "If true, lists the session's private research wiki directory" }
                     },
                     "required": []
                 }),
@@ -212,6 +216,8 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
                 }),
             },
         },
+        // Wiki tools have been folded into read/write/patch/list via the wiki=true flag.
+        // The wiki is a private per-session markdown store for research/think/dream modes.
         // File summary cache tools — use these to avoid repeatedly reading large or unchanged source files.
         // The cache lives in ~/.raven-hotel/{session}/context.db and is keyed by (relative_path, mtime).
         ToolDef {
