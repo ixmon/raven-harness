@@ -84,11 +84,20 @@ pub struct WikiLink {
     pub line: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NavItemKind {
+    #[default]
+    Header,
+    Link,
+    Back,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct WikiNavItem {
     pub label: String,
     pub target_file: String,
     pub scroll_to: usize,
+    pub kind: NavItemKind,
 }
 
 #[derive(Debug, Default)]
@@ -969,18 +978,41 @@ impl App {
     fn rebuild_wiki_viewer_nav(&mut self) {
         let mut items: Vec<WikiNavItem> = vec![];
         let cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
-        // Always offer sibling markdown files for navigation/switching
-        for f in self.wiki_viewer.files.iter() {
-            let tf = Self::normalize_wiki_path(f);
+
+        // Back entry (unless we're on index.md)
+        if cur != "index.md" {
             items.push(WikiNavItem {
-                label: format!("📄 {}", f),
-                target_file: tf,
+                label: "⬆ Back (index.md)".into(),
+                target_file: "index.md".to_string(),
                 scroll_to: 0,
+                kind: NavItemKind::Back,
             });
         }
+
         let content = &self.wiki_viewer.content;
-        // Outgoing links come before full headings so Tab reaches them quickly for current doc
-        // Outgoing markdown links [text](*.md) and [[wiki]]
+
+        // Headings from current document (h1-h3, indented by level)
+        for (i, line) in content.lines().enumerate() {
+            let entry = if let Some(h) = line.strip_prefix("# ") {
+                Some((format!("# {}", h.trim()), 0))
+            } else if let Some(h) = line.strip_prefix("## ") {
+                Some((format!("  ## {}", h.trim()), 0))
+            } else if let Some(h) = line.strip_prefix("### ") {
+                Some((format!("    ### {}", h.trim()), 0))
+            } else {
+                None
+            };
+            if let Some((label, _)) = entry {
+                items.push(WikiNavItem {
+                    label,
+                    target_file: cur.clone(),
+                    scroll_to: i,
+                    kind: NavItemKind::Header,
+                });
+            }
+        }
+
+        // Outgoing markdown links [text](*.md)
         if let Ok(re) = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)") {
             for (i, line) in content.lines().enumerate() {
                 for cap in re.captures_iter(line) {
@@ -989,43 +1021,40 @@ impl App {
                     if let Some(hpos) = tgt.find('#') { tgt = tgt[..hpos].to_string(); }
                     let clean_tgt = Self::normalize_wiki_path(&tgt);
                     items.push(WikiNavItem {
-                        label: format!("[{}]", text),
+                        label: format!("→ {}", text),
                         target_file: clean_tgt,
                         scroll_to: i,
+                        kind: NavItemKind::Link,
                     });
                 }
             }
         }
+        // Wiki-style links [[target]]
         if let Ok(re) = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]") {
             for (i, line) in content.lines().enumerate() {
                 for cap in re.captures_iter(line) {
-                    let mut tgt = cap.get(1).map_or("", |m| m.as_str()).to_string();
+                    let tgt = cap.get(1).map_or("", |m| m.as_str()).to_string();
                     let clean_tgt = Self::normalize_wiki_path(&tgt);
                     items.push(WikiNavItem {
-                        label: format!("[[{}]]", clean_tgt.trim_end_matches(".md")),
+                        label: format!("→ {}", clean_tgt.trim_end_matches(".md")),
                         target_file: clean_tgt,
                         scroll_to: i,
+                        kind: NavItemKind::Link,
                     });
                 }
             }
         }
-        // Headings (support up to h3 for nav)
-        for (i, line) in content.lines().enumerate() {
-            let label = if let Some(h) = line.strip_prefix("# ") {
-                Some(format!("# {}", h.trim()))
-            } else if let Some(h) = line.strip_prefix("## ") {
-                Some(format!("## {}", h.trim()))
-            } else if let Some(h) = line.strip_prefix("### ") {
-                Some(format!("### {}", h.trim()))
-            } else { None };
-            if let Some(lab) = label {
-                items.push(WikiNavItem { label: lab, target_file: cur.clone(), scroll_to: i });
-            }
-        }
+
         if items.is_empty() {
-            items.push(WikiNavItem { label: "(index)".into(), target_file: cur.clone(), scroll_to: 0 });
+            items.push(WikiNavItem {
+                label: "(empty document)".into(),
+                target_file: cur.clone(),
+                scroll_to: 0,
+                kind: NavItemKind::Header,
+            });
         }
-        // de-dup preserving order (simple)
+
+        // de-dup preserving order
         let mut seen = std::collections::HashSet::new();
         let mut deduped = vec![];
         for it in items {
@@ -1048,27 +1077,23 @@ impl App {
         self.wiki_viewer.selected_nav = idx;
         let clean_target = Self::normalize_wiki_path(&item.target_file);
         let clean_cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
-        // Only treat 📄 entries as file switchers. Link/heading nav items stay in current doc
-        // and just scroll/highlight their mention or definition in the current right pane.
-        let file_changed = item.label.starts_with("📄") && clean_target != clean_cur;
-        if file_changed {
+
+        // Back or Link targeting a different file → load that file
+        let is_cross_file = clean_target != clean_cur
+            && matches!(item.kind, NavItemKind::Back | NavItemKind::Link);
+
+        if is_cross_file {
             self.wiki_viewer.current_file = clean_target;
-            // load will also rebuild nav for the new file
             self.load_wiki_viewer_content();
-            // after rebuild, prefer to land on first in-doc nav for the file (skip the file list prefix if possible)
-            if let Some(first) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == self.wiki_viewer.current_file && !it.label.starts_with("📄")) {
+            // After rebuild, select first header if available
+            if let Some(first) = self.wiki_viewer.nav_items.iter().position(|it| it.kind == NavItemKind::Header) {
                 self.wiki_viewer.selected_nav = first;
-            } else if let Some(first_file) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == self.wiki_viewer.current_file) {
-                self.wiki_viewer.selected_nav = first_file;
             } else {
                 self.wiki_viewer.selected_nav = 0;
             }
-            if self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav).map(|i| i.scroll_to).unwrap_or(0) == 0 {
-                self.wiki_viewer.scroll = 0;
-            } else {
-                self.wiki_viewer.scroll = self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav).map(|i| i.scroll_to).unwrap_or(0);
-            }
+            self.wiki_viewer.scroll = 0;
         } else {
+            // Same-file heading or link — just scroll to position
             self.wiki_viewer.scroll = item.scroll_to;
         }
     }
@@ -1190,30 +1215,8 @@ impl App {
                 if self.wiki_viewer.focus == WikiFocus::Nav {
                     if !self.wiki_viewer.nav_items.is_empty() {
                         let idx = self.wiki_viewer.selected_nav;
-                        let item = self.wiki_viewer.nav_items.get(idx).cloned();
-                        let clean_t = item.as_ref().map(|it| Self::normalize_wiki_path(&it.target_file)).unwrap_or_default();
-                        let clean_c = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
-                        if let Some(it) = item {
-                            if it.label.starts_with("📄") || clean_t == clean_c {
-                                self.apply_wiki_nav_selection(idx);
-                            } else {
-                                // Enter on a cross-file link nav element: follow it
-                                self.wiki_viewer.current_file = clean_t;
-                                self.load_wiki_viewer_content();
-                                self.rebuild_wiki_viewer_nav();
-                                // land on first non-file or file entry in the target
-                                if let Some(p) = self.wiki_viewer.nav_items.iter().position(|x| x.target_file == self.wiki_viewer.current_file && !x.label.starts_with("📄")) {
-                                    self.wiki_viewer.selected_nav = p;
-                                } else if let Some(p) = self.wiki_viewer.nav_items.iter().position(|x| x.target_file == self.wiki_viewer.current_file) {
-                                    self.wiki_viewer.selected_nav = p;
-                                } else {
-                                    self.wiki_viewer.selected_nav = 0;
-                                }
-                                self.wiki_viewer.scroll = 0;
-                            }
-                        }
+                        self.apply_wiki_nav_selection(idx);
                     }
-                    self.wiki_viewer.focus = WikiFocus::Content;
                     self.needs_redraw = true;
                 }
                 true

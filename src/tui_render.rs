@@ -1232,7 +1232,8 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
     let mut nav_text = Text::default();
-    nav_text.lines.push(Line::from(Span::styled(" Nav (Tab/↑↓) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    let title_label = format!(" {} ", viewer.current_file);
+    nav_text.lines.push(Line::from(Span::styled(title_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
     let sel = viewer.selected_nav;
     let nitems = viewer.nav_items.len();
     let nav_vis = (nav_area.height as usize).saturating_sub(2).max(1);
@@ -1246,13 +1247,14 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     };
     for (i, item) in viewer.nav_items.iter().enumerate().skip(nav_off).take(nav_vis) {
         let is_sel = i == sel;
-        let is_file = item.label.starts_with("📄");
         let style = if is_sel {
             Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-        } else if is_file {
-            Style::default().fg(Color::Rgb(0x99, 0xaa, 0xcc))
         } else {
-            Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))
+            match item.kind {
+                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
+                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
+                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
+            }
         };
         let prefix = if is_sel { "▶ " } else { "  " };
         let shown = truncate_str(&format!("{}{}", prefix, item.label), nav_area.width as usize - 4);
@@ -1286,16 +1288,18 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     };
     let mut md_text = wiki_render_markdown(&md);
 
-    // Determine active search text from selected nav (for link text or heading)
-    let active_label = viewer.nav_items.get(sel).map(|it| it.label.as_str()).unwrap_or("");
-    let search = if active_label.starts_with('[') && active_label.ends_with(']') {
-        active_label.trim_matches(|c| c=='[' || c==']').to_string()
-    } else if active_label.starts_with('#') {
-        active_label.trim_start_matches('#').trim().to_string()
-    } else if active_label.starts_with("[[") {
-        active_label.trim_matches(|c| c=='[' || c==']').to_string()
-    } else {
-        active_label.to_string()
+    // Extract search text from active nav item for content highlighting
+    let active_item = viewer.nav_items.get(sel);
+    let search = match active_item.map(|it| &it.kind) {
+        Some(crate::app_state::NavItemKind::Header) => {
+            // Strip leading indent + # markers to get bare heading text
+            active_item.map(|it| it.label.trim().trim_start_matches('#').trim().to_string()).unwrap_or_default()
+        }
+        Some(crate::app_state::NavItemKind::Link) => {
+            // Strip "→ " prefix
+            active_item.map(|it| it.label.trim_start_matches("→ ").trim().to_string()).unwrap_or_default()
+        }
+        _ => String::new(),
     };
 
     // Post-style: highlight matching text or the line near scroll start for the selected nav target
