@@ -1346,17 +1346,22 @@ fn draw_sessions_column(
 }
 
 fn draw_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
-    let (fg, bg) = if focused {
-        (Color::Black, Color::Cyan)
+    let (fg, border_fg) = if focused {
+        (Color::Cyan, Color::Cyan)
     } else {
-        (Color::White, Color::Blue)
+        (Color::DarkGray, Color::Rgb(0x44, 0x44, 0x55))
     };
-    let style = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    let style = if focused {
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(fg)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if focused { Color::Cyan } else { Color::DarkGray }))
-        .style(style);
-    let para = Paragraph::new(format!("[ {} ]", label))
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(border_fg));
+    let para = Paragraph::new(label)
+        .style(style)
         .block(block)
         .alignment(Alignment::Center);
     f.render_widget(para, area);
@@ -1559,11 +1564,15 @@ fn draw_session_summary(
         height: buttons_area.height,
     };
 
-    let wiki_focused = focused && summary_action == crate::app_state::SummaryAction::ViewWiki;
-    let launch_focused = focused && summary_action == crate::app_state::SummaryAction::Launch;
+    // Button focus is driven by active_link_idx:
+    // idx == wiki_links.len()     => Wiki button focused
+    // idx == wiki_links.len() + 1 => Launch button focused
+    let n_links = wiki_links.len();
+    let wiki_btn_focused = focused && active_link_idx == n_links;
+    let launch_btn_focused = focused && active_link_idx == n_links + 1;
 
-    draw_button(f, wiki_area, "Wiki", wiki_focused);
-    draw_button(f, launch_area, "Launch", launch_focused);
+    draw_button(f, wiki_area, "Wiki", wiki_btn_focused);
+    draw_button(f, launch_area, "Launch", launch_btn_focused);
 }
 
 pub fn draw_splash(f: &mut Frame, area: Rect, data: &SplashData<'_>) {

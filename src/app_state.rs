@@ -1238,22 +1238,27 @@ impl App {
                         self.activate_selected_session(agent);
                     }
                     PickerFocus::Summary => {
-                        match self.picker.summary_action {
-                            SummaryAction::ViewWiki => {
-                                if self.picker.show_wiki_in_summary && !self.picker.wiki_links.is_empty() {
-                                    // Wiki is showing and has links — follow the active one
-                                    self.follow_wiki_link_in_summary();
-                                } else {
-                                    // Toggle wiki view on/off
-                                    self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
-                                    if self.picker.show_wiki_in_summary {
-                                        self.refresh_picker_summary();
-                                        self.recompute_active_link();
-                                    }
-                                }
+                        let n_links = self.picker.wiki_links.len();
+                        let idx = self.picker.active_link_idx;
+                        if self.picker.show_wiki_in_summary && idx < n_links && n_links > 0 {
+                            // Active item is a wiki link — follow it
+                            self.follow_wiki_link_in_summary();
+                        } else if idx == n_links {
+                            // Wiki button
+                            self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
+                            if self.picker.show_wiki_in_summary {
+                                self.refresh_picker_summary();
+                                self.recompute_active_link();
                             }
-                            SummaryAction::Launch => {
-                                self.activate_selected_session(agent);
+                        } else if idx == n_links + 1 {
+                            // Launch button
+                            self.activate_selected_session(agent);
+                        } else {
+                            // No links, default: toggle wiki
+                            self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
+                            if self.picker.show_wiki_in_summary {
+                                self.refresh_picker_summary();
+                                self.recompute_active_link();
                             }
                         }
                     }
@@ -1265,21 +1270,30 @@ impl App {
                 true
             }
             KeyCode::Tab => {
-                // Cycle active link in wiki mode
-                if self.picker.focus == PickerFocus::Summary
-                    && self.picker.show_wiki_in_summary
-                    && !self.picker.wiki_links.is_empty()
-                {
-                    self.picker.active_link_idx =
-                        (self.picker.active_link_idx + 1) % self.picker.wiki_links.len();
-                    // Scroll to make the active link visible
-                    if let Some(link) = self.picker.wiki_links.get(self.picker.active_link_idx) {
-                        let visible_h = self.picker.last_summary_height.max(5) as usize;
-                        if link.line < self.picker.summary_scroll
-                            || link.line >= self.picker.summary_scroll + visible_h
-                        {
-                            self.picker.summary_scroll = link.line.saturating_sub(2);
+                // Cycle through: wiki links → Wiki button → Launch button → back to links
+                if self.picker.focus == PickerFocus::Summary {
+                    let n_links = self.picker.wiki_links.len();
+                    let total = n_links + 2; // +2 for Wiki and Launch buttons
+                    self.picker.active_link_idx = (self.picker.active_link_idx + 1) % total;
+                    let idx = self.picker.active_link_idx;
+
+                    if idx < n_links {
+                        // On a link — update summary_action to ViewWiki and scroll to it
+                        self.picker.summary_action = SummaryAction::ViewWiki;
+                        if let Some(link) = self.picker.wiki_links.get(idx) {
+                            let visible_h = self.picker.last_summary_height.max(5) as usize;
+                            if link.line < self.picker.summary_scroll
+                                || link.line >= self.picker.summary_scroll + visible_h
+                            {
+                                self.picker.summary_scroll = link.line.saturating_sub(2);
+                            }
                         }
+                    } else if idx == n_links {
+                        // Wiki button
+                        self.picker.summary_action = SummaryAction::ViewWiki;
+                    } else {
+                        // Launch button
+                        self.picker.summary_action = SummaryAction::Launch;
                     }
                     self.needs_redraw = true;
                 }
