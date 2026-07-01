@@ -15,114 +15,292 @@ use ratatui::{
     Frame,
 };
 
-// tui-markdown: converts markdown → ratatui Text with styled headings, code, links, lists.
-// ratatui 0.29 + tui-markdown 0.3.8 share ratatui-core 0.1.2 so types are identical.
-// We only need to convert borrowed Cow::Borrowed spans to owned for 'static lifetime.
+// ── Raven markdown renderer ──────────────────────────────────────────────────
+// Replaces tui_markdown with a purpose-built renderer that directly produces
+// ratatui types. Handles: headings, bold/italic/code, links, lists, code
+// blocks, blockquotes, tables (box-drawn), and horizontal rules.
 
-/// Custom style sheet for Raven's dark TUI theme.
-/// The default tui-markdown styles (white-on-cyan H1, blue links) look off on our
-/// dark background (#1a1a22). This gives us headings and links that fit.
-#[derive(Clone, Copy, Debug, Default)]
-struct RavenStyleSheet;
-
-impl tui_markdown::StyleSheet for RavenStyleSheet {
-    fn heading(&self, level: u8) -> ratatui_core::style::Style {
-        match level {
-            1 => ratatui_core::style::Style::new().light_cyan().bold().underlined(),
-            2 => ratatui_core::style::Style::new().cyan().bold(),
-            3 => ratatui_core::style::Style::new().cyan().italic(),
-            _ => ratatui_core::style::Style::new().light_cyan().italic(),
-        }
-    }
-    fn code(&self) -> ratatui_core::style::Style {
-        // Subtle dark bg for code blocks/inline code
-        ratatui_core::style::Style::new().fg(ratatui_core::style::Color::Rgb(0xc0, 0xc0, 0xd0)).bg(ratatui_core::style::Color::Rgb(0x28, 0x28, 0x35))
-    }
-    fn link(&self) -> ratatui_core::style::Style {
-        ratatui_core::style::Style::new().cyan().underlined()
-    }
-    fn blockquote(&self) -> ratatui_core::style::Style {
-        ratatui_core::style::Style::new().fg(ratatui_core::style::Color::Rgb(0x80, 0xb0, 0x80)).italic()
-    }
-    fn heading_meta(&self) -> ratatui_core::style::Style {
-        ratatui_core::style::Style::new().dim()
-    }
-    fn metadata_block(&self) -> ratatui_core::style::Style {
-        ratatui_core::style::Style::new().fg(ratatui_core::style::Color::Rgb(0xaa, 0xaa, 0x60))
-    }
+/// Styles for our dark TUI theme (#1a1a22 background).
+mod md_style {
+    use ratatui::style::{Color, Modifier, Style};
+    pub fn h1() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) }
+    pub fn h2() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) }
+    pub fn h3() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC) }
+    pub fn h_other() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::ITALIC) }
+    pub fn bold() -> Style { Style::default().add_modifier(Modifier::BOLD) }
+    pub fn italic() -> Style { Style::default().add_modifier(Modifier::ITALIC) }
+    pub fn bold_italic() -> Style { Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC) }
+    pub fn code() -> Style { Style::default().fg(Color::Rgb(0xc0, 0xc0, 0xd0)).bg(Color::Rgb(0x28, 0x28, 0x35)) }
+    pub fn link() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED) }
+    pub fn blockquote() -> Style { Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80)).add_modifier(Modifier::ITALIC) }
+    pub fn table_border() -> Style { Style::default().fg(Color::DarkGray) }
+    pub fn table_header() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD) }
+    pub fn rule() -> Style { Style::default().fg(Color::DarkGray) }
+    pub fn list_marker() -> Style { Style::default().fg(Color::DarkGray) }
 }
 
 fn wiki_render_markdown(md: &str) -> Text<'static> {
-    // Pre-process: convert markdown tables to box-drawn text (tui_markdown doesn't support tables)
-    let processed = preprocess_tables(md);
-    let opts = tui_markdown::Options::new(RavenStyleSheet);
-    let text = tui_markdown::from_str_with_options(&processed, &opts);
-    // Convert ratatui_core types to ratatui types (structurally identical but separate types)
-    let lines: Vec<Line<'static>> = text
-        .lines
-        .into_iter()
-        .map(|line| {
-            let spans: Vec<Span<'static>> = line
-                .spans
-                .into_iter()
-                .map(|span| {
-                    let s = convert_core_style(span.style);
-                    let content = span.content.to_string();
-                    // Strip "# " prefixes from heading spans — the style already indicates level
-                    let cleaned = strip_heading_hashes(&content);
-                    Span::styled(cleaned, s)
-                })
-                .collect();
-            Line::from(spans)
-        })
-        .collect();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let src_lines: Vec<&str> = md.lines().collect();
+    let n = src_lines.len();
+    let mut i = 0;
+    let mut in_code_block = false;
+
+    while i < n {
+        let raw = src_lines[i];
+
+        // ── Code blocks ──
+        if raw.trim_start().starts_with("```") {
+            if in_code_block {
+                // End code block
+                in_code_block = false;
+                i += 1;
+                continue;
+            } else {
+                // Start code block — show language label if present
+                let lang = raw.trim_start().trim_start_matches('`').trim();
+                if !lang.is_empty() {
+                    lines.push(Line::from(Span::styled(format!("  {}", lang), md_style::code())));
+                }
+                in_code_block = true;
+                i += 1;
+                continue;
+            }
+        }
+        if in_code_block {
+            lines.push(Line::from(Span::styled(format!("  {}", raw), md_style::code())));
+            i += 1;
+            continue;
+        }
+
+        let trimmed = raw.trim();
+
+        // ── Empty line ──
+        if trimmed.is_empty() {
+            lines.push(Line::default());
+            i += 1;
+            continue;
+        }
+
+        // ── Horizontal rule ──
+        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
+            && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
+            && trimmed.len() >= 3
+        {
+            lines.push(Line::from(Span::styled("────────────────────────────────", md_style::rule())));
+            i += 1;
+            continue;
+        }
+
+        // ── Tables ──
+        if is_table_row(raw) && i + 1 < n && is_separator_row(src_lines[i + 1]) {
+            let table_lines = render_table_lines(&src_lines, &mut i);
+            lines.extend(table_lines);
+            continue;
+        }
+
+        // ── Headings ──
+        if trimmed.starts_with('#') {
+            let level = trimmed.chars().take_while(|c| *c == '#').count();
+            let text = trimmed[level..].trim();
+            let style = match level {
+                1 => md_style::h1(),
+                2 => md_style::h2(),
+                3 => md_style::h3(),
+                _ => md_style::h_other(),
+            };
+            if !lines.is_empty() {
+                lines.push(Line::default()); // spacing before heading
+            }
+            lines.push(Line::from(Span::styled(text.to_string(), style)));
+            i += 1;
+            continue;
+        }
+
+        // ── Blockquotes ──
+        if trimmed.starts_with('>') {
+            let content = trimmed[1..].trim_start();
+            let mut spans = vec![Span::styled("▎ ", md_style::blockquote())];
+            spans.extend(parse_inline(content, md_style::blockquote()));
+            lines.push(Line::from(spans));
+            i += 1;
+            continue;
+        }
+
+        // ── Unordered lists ──
+        if (trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")) {
+            let indent = raw.len() - raw.trim_start().len();
+            let content = &trimmed[2..];
+            let prefix = " ".repeat(indent) + "• ";
+            let mut spans = vec![Span::styled(prefix, md_style::list_marker())];
+            spans.extend(parse_inline(content, Style::default()));
+            lines.push(Line::from(spans));
+            i += 1;
+            continue;
+        }
+
+        // ── Ordered lists ──
+        if let Some(rest) = try_ordered_list(trimmed) {
+            let indent = raw.len() - raw.trim_start().len();
+            // Find the number prefix
+            let num_end = trimmed.find('.').unwrap_or(0);
+            let num = &trimmed[..num_end + 1];
+            let prefix = " ".repeat(indent) + num + " ";
+            let mut spans = vec![Span::styled(prefix, md_style::list_marker())];
+            spans.extend(parse_inline(rest, Style::default()));
+            lines.push(Line::from(spans));
+            i += 1;
+            continue;
+        }
+
+        // ── Normal paragraph text ──
+        let spans = parse_inline(trimmed, Style::default());
+        lines.push(Line::from(spans));
+        i += 1;
+    }
+
     Text::from(lines)
 }
 
-/// Strip leading `#` markers from heading text.
-/// tui_markdown outputs headings as "# " + text; the style already differentiates levels.
-fn strip_heading_hashes(s: &str) -> String {
-    let trimmed = s.trim_start();
-    if trimmed.starts_with('#') {
-        // Only strip if it's purely hash+space prefix (e.g. "## " or "### ")
-        let after_hashes = trimmed.trim_start_matches('#');
-        if after_hashes.is_empty() || after_hashes.starts_with(' ') {
-            return after_hashes.trim_start().to_string();
+/// Parse inline markdown formatting: **bold**, *italic*, ***both***, `code`, [links](url)
+fn parse_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let chars: Vec<char> = text.chars().collect();
+    let len = chars.len();
+    let mut pos = 0;
+    let mut buf = String::new();
+
+    while pos < len {
+        // ── Inline code: `...` ──
+        if chars[pos] == '`' {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
+            }
+            pos += 1;
+            let mut code = String::new();
+            while pos < len && chars[pos] != '`' {
+                code.push(chars[pos]);
+                pos += 1;
+            }
+            if pos < len { pos += 1; } // skip closing `
+            spans.push(Span::styled(code, md_style::code()));
+            continue;
         }
+
+        // ── Links: [text](url) ──
+        if chars[pos] == '[' {
+            // Look ahead for ](url)
+            if let Some((link_text, url, end_pos)) = try_parse_link(&chars, pos) {
+                if !buf.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut buf), base_style));
+                }
+                spans.push(Span::styled(link_text, md_style::link()));
+                pos = end_pos;
+                // Store url in a dimmed span for reference
+                let _ = url; // We display link text styled, url is implicit for TUI
+                continue;
+            }
+        }
+
+        // ── Bold+italic: ***...*** ──
+        if pos + 2 < len && chars[pos] == '*' && chars[pos+1] == '*' && chars[pos+2] == '*' {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
+            }
+            pos += 3;
+            let mut inner = String::new();
+            while pos + 2 < len && !(chars[pos] == '*' && chars[pos+1] == '*' && chars[pos+2] == '*') {
+                inner.push(chars[pos]);
+                pos += 1;
+            }
+            if pos + 2 < len { pos += 3; }
+            spans.push(Span::styled(inner, md_style::bold_italic()));
+            continue;
+        }
+
+        // ── Bold: **...** ──
+        if pos + 1 < len && chars[pos] == '*' && chars[pos+1] == '*' {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
+            }
+            pos += 2;
+            let mut inner = String::new();
+            while pos + 1 < len && !(chars[pos] == '*' && chars[pos+1] == '*') {
+                inner.push(chars[pos]);
+                pos += 1;
+            }
+            if pos + 1 < len { pos += 2; }
+            spans.push(Span::styled(inner, md_style::bold()));
+            continue;
+        }
+
+        // ── Italic: *...* (single) ──
+        if chars[pos] == '*' && (pos + 1 < len && chars[pos+1] != '*') {
+            if !buf.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
+            }
+            pos += 1;
+            let mut inner = String::new();
+            while pos < len && chars[pos] != '*' {
+                inner.push(chars[pos]);
+                pos += 1;
+            }
+            if pos < len { pos += 1; }
+            spans.push(Span::styled(inner, md_style::italic()));
+            continue;
+        }
+
+        buf.push(chars[pos]);
+        pos += 1;
     }
-    s.to_string()
+
+    if !buf.is_empty() {
+        spans.push(Span::styled(buf, base_style));
+    }
+    spans
 }
 
-/// Pre-process markdown tables into box-drawn text for TUI display.
-/// Converts `| A | B |` style tables into aligned columns with unicode borders.
-fn preprocess_tables(md: &str) -> String {
-    let mut result = String::new();
-    let lines: Vec<&str> = md.lines().collect();
-    let mut i = 0;
-    while i < lines.len() {
-        // Detect table: line with pipes, followed by separator line (|---|---|)
-        if i + 1 < lines.len() && is_table_row(lines[i]) && is_separator_row(lines[i + 1]) {
-            // Collect all table rows
-            let mut table_rows: Vec<Vec<String>> = vec![];
-            let header = parse_table_row(lines[i]);
-            table_rows.push(header);
-            i += 1; // skip header
-            i += 1; // skip separator
-            while i < lines.len() && is_table_row(lines[i]) && !is_separator_row(lines[i]) {
-                table_rows.push(parse_table_row(lines[i]));
-                i += 1;
-            }
-            // Render the table with box drawing
-            result.push_str(&render_box_table(&table_rows));
-            result.push('\n');
-        } else {
-            result.push_str(lines[i]);
-            result.push('\n');
-            i += 1;
+/// Try to parse a markdown link at position `start` (which should be '[').
+/// Returns (link_text, url, end_position) if successful.
+fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
+    let len = chars.len();
+    if start >= len || chars[start] != '[' { return None; }
+    let mut pos = start + 1;
+    let mut text = String::new();
+    // Find closing ]
+    while pos < len && chars[pos] != ']' {
+        text.push(chars[pos]);
+        pos += 1;
+    }
+    if pos >= len { return None; }
+    pos += 1; // skip ]
+    // Expect (
+    if pos >= len || chars[pos] != '(' { return None; }
+    pos += 1;
+    let mut url = String::new();
+    while pos < len && chars[pos] != ')' {
+        url.push(chars[pos]);
+        pos += 1;
+    }
+    if pos >= len { return None; }
+    pos += 1; // skip )
+    Some((text, url, pos))
+}
+
+/// Try to match an ordered list item: "1. text", "2. text", etc.
+fn try_ordered_list(trimmed: &str) -> Option<&str> {
+    let dot_pos = trimmed.find('.')?;
+    let num_part = &trimmed[..dot_pos];
+    if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
+        let rest = &trimmed[dot_pos + 1..];
+        if rest.starts_with(' ') {
+            return Some(rest.trim_start());
         }
     }
-    result
+    None
 }
+
+// ── Table rendering ──────────────────────────────────────────────────────────
 
 fn is_table_row(line: &str) -> bool {
     let t = line.trim();
@@ -139,107 +317,73 @@ fn parse_table_row(line: &str) -> Vec<String> {
     t.split('|').map(|cell| cell.trim().to_string()).collect()
 }
 
-fn render_box_table(rows: &[Vec<String>]) -> String {
-    if rows.is_empty() {
-        return String::new();
+/// Render a markdown table starting at `src_lines[*i]` into styled Lines.
+/// Advances `*i` past the table.
+fn render_table_lines(src_lines: &[&str], i: &mut usize) -> Vec<Line<'static>> {
+    let mut rows: Vec<Vec<String>> = vec![];
+    rows.push(parse_table_row(src_lines[*i]));
+    *i += 1; // skip header
+    *i += 1; // skip separator
+    while *i < src_lines.len() && is_table_row(src_lines[*i]) && !is_separator_row(src_lines[*i]) {
+        rows.push(parse_table_row(src_lines[*i]));
+        *i += 1;
     }
+
+    if rows.is_empty() { return vec![]; }
     let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    // Calculate column widths
     let mut widths = vec![0usize; ncols];
-    for row in rows {
+    for row in &rows {
         for (j, cell) in row.iter().enumerate() {
-            if j < ncols {
-                widths[j] = widths[j].max(cell.len());
-            }
+            if j < ncols { widths[j] = widths[j].max(cell.len()); }
         }
     }
-    // Minimum width
-    for w in &mut widths {
-        *w = (*w).max(3);
-    }
+    for w in &mut widths { *w = (*w).max(3); }
 
-    let mut out = String::new();
+    let border = md_style::table_border();
+    let header_style = md_style::table_header();
+    let mut out: Vec<Line<'static>> = Vec::new();
+
     // Top border: ┌───┬───┐
-    out.push('┌');
+    let mut top = String::from("┌");
     for (j, w) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(*w + 2));
-        if j + 1 < ncols { out.push('┬'); }
+        top.push_str(&"─".repeat(*w + 2));
+        if j + 1 < ncols { top.push('┬'); }
     }
-    out.push_str("┐\n");
+    top.push('┐');
+    out.push(Line::from(Span::styled(top, border)));
 
-    for (i, row) in rows.iter().enumerate() {
-        // Data row: │ val │ val │
-        out.push('│');
+    for (ri, row) in rows.iter().enumerate() {
+        let cell_style = if ri == 0 { header_style } else { Style::default() };
+        let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
         for (j, w) in widths.iter().enumerate() {
             let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            out.push_str(&format!(" {:<width$} │", cell, width = w));
+            spans.push(Span::styled(format!(" {:<width$} ", cell, width = w), cell_style));
+            spans.push(Span::styled("│", border));
         }
-        out.push('\n');
+        out.push(Line::from(spans));
 
-        if i == 0 && rows.len() > 1 {
-            // Header separator: ├───┼───┤
-            out.push('├');
+        // Header separator
+        if ri == 0 && rows.len() > 1 {
+            let mut sep = String::from("├");
             for (j, w) in widths.iter().enumerate() {
-                out.push_str(&"─".repeat(*w + 2));
-                if j + 1 < ncols { out.push('┼'); }
+                sep.push_str(&"─".repeat(*w + 2));
+                if j + 1 < ncols { sep.push('┼'); }
             }
-            out.push_str("┤\n");
+            sep.push('┤');
+            out.push(Line::from(Span::styled(sep, border)));
         }
     }
 
     // Bottom border: └───┴───┘
-    out.push('└');
+    let mut bot = String::from("└");
     for (j, w) in widths.iter().enumerate() {
-        out.push_str(&"─".repeat(*w + 2));
-        if j + 1 < ncols { out.push('┴'); }
+        bot.push_str(&"─".repeat(*w + 2));
+        if j + 1 < ncols { bot.push('┴'); }
     }
-    out.push_str("┘\n");
+    bot.push('┘');
+    out.push(Line::from(Span::styled(bot, border)));
 
     out
-}
-
-/// Convert ratatui_core::style::Style → ratatui::style::Style.
-/// These are structurally identical but different types due to the ratatui / ratatui-core split.
-fn convert_core_style(cs: ratatui_core::style::Style) -> Style {
-    let mut s = Style::default();
-    if let Some(fg) = cs.fg {
-        s = s.fg(convert_core_color(fg));
-    }
-    if let Some(bg) = cs.bg {
-        s = s.bg(convert_core_color(bg));
-    }
-    s = s.add_modifier(convert_core_modifier(cs.add_modifier));
-    s = s.remove_modifier(convert_core_modifier(cs.sub_modifier));
-    s
-}
-
-fn convert_core_color(c: ratatui_core::style::Color) -> Color {
-    match c {
-        ratatui_core::style::Color::Reset => Color::Reset,
-        ratatui_core::style::Color::Black => Color::Black,
-        ratatui_core::style::Color::Red => Color::Red,
-        ratatui_core::style::Color::Green => Color::Green,
-        ratatui_core::style::Color::Yellow => Color::Yellow,
-        ratatui_core::style::Color::Blue => Color::Blue,
-        ratatui_core::style::Color::Magenta => Color::Magenta,
-        ratatui_core::style::Color::Cyan => Color::Cyan,
-        ratatui_core::style::Color::Gray => Color::Gray,
-        ratatui_core::style::Color::DarkGray => Color::DarkGray,
-        ratatui_core::style::Color::LightRed => Color::LightRed,
-        ratatui_core::style::Color::LightGreen => Color::LightGreen,
-        ratatui_core::style::Color::LightYellow => Color::LightYellow,
-        ratatui_core::style::Color::LightBlue => Color::LightBlue,
-        ratatui_core::style::Color::LightMagenta => Color::LightMagenta,
-        ratatui_core::style::Color::LightCyan => Color::LightCyan,
-        ratatui_core::style::Color::White => Color::White,
-        ratatui_core::style::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
-        ratatui_core::style::Color::Indexed(i) => Color::Indexed(i),
-    }
-}
-
-fn convert_core_modifier(m: ratatui_core::style::Modifier) -> Modifier {
-    // Modifier is a bitflag; the bits are identical between ratatui and ratatui_core
-    Modifier::from_bits_truncate(m.bits())
 }
 
 
