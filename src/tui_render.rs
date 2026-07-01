@@ -1532,8 +1532,7 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
         nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
     }
     let nav_para = Paragraph::new(nav_text)
-        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))))
-        .wrap(Wrap { trim: false });
+        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))));
     f.render_widget(nav_para, nav_area);
 
     // Content pane - larger wiki display; highlight active nav target where possible
