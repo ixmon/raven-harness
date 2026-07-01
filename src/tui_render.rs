@@ -53,8 +53,10 @@ impl tui_markdown::StyleSheet for RavenStyleSheet {
 }
 
 fn wiki_render_markdown(md: &str) -> Text<'static> {
+    // Pre-process: convert markdown tables to box-drawn text (tui_markdown doesn't support tables)
+    let processed = preprocess_tables(md);
     let opts = tui_markdown::Options::new(RavenStyleSheet);
-    let text = tui_markdown::from_str_with_options(md, &opts);
+    let text = tui_markdown::from_str_with_options(&processed, &opts);
     // Convert ratatui_core types to ratatui types (structurally identical but separate types)
     let lines: Vec<Line<'static>> = text
         .lines
@@ -65,13 +67,135 @@ fn wiki_render_markdown(md: &str) -> Text<'static> {
                 .into_iter()
                 .map(|span| {
                     let s = convert_core_style(span.style);
-                    Span::styled(span.content.to_string(), s)
+                    let content = span.content.to_string();
+                    // Strip "# " prefixes from heading spans — the style already indicates level
+                    let cleaned = strip_heading_hashes(&content);
+                    Span::styled(cleaned, s)
                 })
                 .collect();
             Line::from(spans)
         })
         .collect();
     Text::from(lines)
+}
+
+/// Strip leading `#` markers from heading text.
+/// tui_markdown outputs headings as "# " + text; the style already differentiates levels.
+fn strip_heading_hashes(s: &str) -> String {
+    let trimmed = s.trim_start();
+    if trimmed.starts_with('#') {
+        // Only strip if it's purely hash+space prefix (e.g. "## " or "### ")
+        let after_hashes = trimmed.trim_start_matches('#');
+        if after_hashes.is_empty() || after_hashes.starts_with(' ') {
+            return after_hashes.trim_start().to_string();
+        }
+    }
+    s.to_string()
+}
+
+/// Pre-process markdown tables into box-drawn text for TUI display.
+/// Converts `| A | B |` style tables into aligned columns with unicode borders.
+fn preprocess_tables(md: &str) -> String {
+    let mut result = String::new();
+    let lines: Vec<&str> = md.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        // Detect table: line with pipes, followed by separator line (|---|---|)
+        if i + 1 < lines.len() && is_table_row(lines[i]) && is_separator_row(lines[i + 1]) {
+            // Collect all table rows
+            let mut table_rows: Vec<Vec<String>> = vec![];
+            let header = parse_table_row(lines[i]);
+            table_rows.push(header);
+            i += 1; // skip header
+            i += 1; // skip separator
+            while i < lines.len() && is_table_row(lines[i]) && !is_separator_row(lines[i]) {
+                table_rows.push(parse_table_row(lines[i]));
+                i += 1;
+            }
+            // Render the table with box drawing
+            result.push_str(&render_box_table(&table_rows));
+            result.push('\n');
+        } else {
+            result.push_str(lines[i]);
+            result.push('\n');
+            i += 1;
+        }
+    }
+    result
+}
+
+fn is_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.ends_with('|') && t.len() > 2
+}
+
+fn is_separator_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.contains("---")
+}
+
+fn parse_table_row(line: &str) -> Vec<String> {
+    let t = line.trim().trim_matches('|');
+    t.split('|').map(|cell| cell.trim().to_string()).collect()
+}
+
+fn render_box_table(rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    // Calculate column widths
+    let mut widths = vec![0usize; ncols];
+    for row in rows {
+        for (j, cell) in row.iter().enumerate() {
+            if j < ncols {
+                widths[j] = widths[j].max(cell.len());
+            }
+        }
+    }
+    // Minimum width
+    for w in &mut widths {
+        *w = (*w).max(3);
+    }
+
+    let mut out = String::new();
+    // Top border: ┌───┬───┐
+    out.push('┌');
+    for (j, w) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(*w + 2));
+        if j + 1 < ncols { out.push('┬'); }
+    }
+    out.push_str("┐\n");
+
+    for (i, row) in rows.iter().enumerate() {
+        // Data row: │ val │ val │
+        out.push('│');
+        for (j, w) in widths.iter().enumerate() {
+            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
+            out.push_str(&format!(" {:<width$} │", cell, width = w));
+        }
+        out.push('\n');
+
+        if i == 0 && rows.len() > 1 {
+            // Header separator: ├───┼───┤
+            out.push('├');
+            for (j, w) in widths.iter().enumerate() {
+                out.push_str(&"─".repeat(*w + 2));
+                if j + 1 < ncols { out.push('┼'); }
+            }
+            out.push_str("┤\n");
+        }
+    }
+
+    // Bottom border: └───┴───┘
+    out.push('└');
+    for (j, w) in widths.iter().enumerate() {
+        out.push_str(&"─".repeat(*w + 2));
+        if j + 1 < ncols { out.push('┴'); }
+    }
+    out.push_str("┘\n");
+
+    out
 }
 
 /// Convert ratatui_core::style::Style → ratatui::style::Style.
