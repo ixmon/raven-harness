@@ -898,21 +898,26 @@ impl App {
             self.wiki_viewer.scroll = 0;
             self.wiki_viewer.selected_nav = 0;
 
-            // Load list of wiki files (best effort)
+            // Load list of wiki files (best effort) -- recursive to support subdirs the agent may create (e.g. research/)
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             let wiki_dir = std::path::PathBuf::from(home)
                 .join(".raven-hotel").join("sessions").join(&id).join("wiki");
-            let mut files = vec![];
-            if let Ok(rd) = std::fs::read_dir(&wiki_dir) {
-                for e in rd.flatten() {
-                    let p = e.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                        if let Ok(rel) = p.strip_prefix(&wiki_dir) {
-                            files.push(rel.display().to_string());
+            fn collect_md(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+                if let Ok(rd) = std::fs::read_dir(dir) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        if p.is_dir() {
+                            collect_md(&p, base, out);
+                        } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                            if let Ok(rel) = p.strip_prefix(base) {
+                                out.push(rel.display().to_string());
+                            }
                         }
                     }
                 }
             }
+            let mut files = vec![];
+            collect_md(&wiki_dir, &wiki_dir, &mut files);
             files.sort();
             if files.is_empty() {
                 files.push("index.md".to_string());

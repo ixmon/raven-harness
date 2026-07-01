@@ -270,7 +270,10 @@ async fn real_execute(
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             Ok(format!("✅ store_summary requested for {}", path))
         }
-        other => Ok(format!("❌ Unknown tool: {}", other)),
+        "edit" | "str_replace" | "search_replace" | "modify" => {
+            Ok("❌ There is no 'edit' tool (or str_replace, etc.). Use the `patch` tool for search/replace edits (args: path, search, replace, optional near_line and wiki). Or use `write` for full file replacement. Always call `read` first for context.".to_string())
+        }
+        other => Ok(format!("❌ Unknown tool: {}. Valid tools: exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary. (For file edits use patch or write; there is no 'edit' tool.)", other)),
     }
 }
 

@@ -62,6 +62,9 @@ AutoHarness aligns with and extends concepts from other papers:
 - **Code as Agent Harness**: AutoHarness is an example of harness interface + mechanisms
 - **AHE**: AutoHarness uses iterative refinement with feedback, similar to AHE's observability-driven evolution
 - **Meta-Harness**: Both use filesystem access to track and improve harness variants
+- **Agent Capabilities**: AutoHarness's self-synthesized harnesses align with the agent capabilities framework
+- **Agent Capabilities**: See [Agent Capabilities](./research/agent-capabilities.md) for TUI implementation details and patterns
+- **TUI Agent Capabilities**: See [Agent Capabilities](./research/agent-capabilities.md) for implementation details on the agent loop, turn metrics, session persistence, and integration concepts.
 
 ## Implementation Considerations
 

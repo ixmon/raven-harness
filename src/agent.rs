@@ -858,10 +858,16 @@ History:
             }
         }
 
+        // Catch common hallucinated tool names early with a helpful message
+        // (before falling through to normal tool execution).
+        if matches!(name, "edit" | "str_replace" | "search_replace" | "modify_file") {
+            return Some("❌ There is no 'edit' tool. The correct tool for search/replace edits is `patch` (parameters: path, search, replace, optional near_line; add wiki=true for the session wiki). Use `read` first to get exact text to search for.".to_string());
+        }
+
         // Wiki flag: when wiki=true is set on read/write/patch/list, route to the
         // session's private wiki directory instead of the workspace.
         // Wiki writes are always allowed (no approval needed) — it's the agent's own scratchpad.
-        let is_wiki = args.get("wiki").map_or(false, |v| {
+        let mut is_wiki = args.get("wiki").map_or(false, |v| {
             if let Some(b) = v.as_bool() {
                 b
             } else if let Some(s) = v.as_str() {
@@ -872,6 +878,16 @@ History:
                 false
             }
         });
+        // Auto-detect: if path starts with "wiki/" but wiki=true wasn't set,
+        // the model forgot the flag. Route to wiki anyway (strip_wiki_prefix handles cleanup).
+        if !is_wiki && matches!(name, "read" | "write" | "patch" | "list") {
+            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                let trimmed = p.trim().trim_start_matches("./");
+                if trimmed.starts_with("wiki/") || trimmed.starts_with("wiki\\") || trimmed == "wiki" {
+                    is_wiki = true;
+                }
+            }
+        }
         if is_wiki && matches!(name, "read" | "write" | "patch" | "list") {
             if let Some(s) = &self.session {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
@@ -1289,17 +1305,20 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 ## Tool Discipline (critical)
 - NEVER claim a file was read/written/edited unless a tool call just confirmed it.
 - For any edit to existing code, prefer the `patch` tool over `write`. `patch` is safer and supports disambiguation via `near_line`.
-- Before patching, call `read` (or `read` with a line range) so you have the exact text.
+- **You MUST call `read` (or `read` with a precise `lines` range) *immediately before* any `patch` call** to obtain the *exact current text*. Never patch based on memory from earlier turns. The `search` value must be a verbatim contiguous substring that exists right now.
+- After the fresh read, inspect the content: if the desired change (link, section, text) is *already present*, do NOT patch — just note it and move on. Only patch when fresh read confirms the old text exists and the new text does not.
 - Use `list` and `grep` heavily to explore the project.
 - Use `exec` for building, testing, git, cargo, etc. Keep commands focused.
 - `web_search` finds candidate pages. `browse` reads them. Use search → browse for research.
 - For think/research/dream: ALWAYS use wiki=true with read/write/patch/list. The wiki root is implicit (already exists per session). Path must be bare relative e.g. "index.md" or "research/ideas.md" — NEVER "wiki/..." and NEVER mkdir wiki or wiki/wiki. Example: read({{"path":"index.md","wiki":true}}). Wiki ops always succeed (no sandbox/approval).
-- If a tool fails, report the exact error and adapt. Do not pretend it succeeded.
+- **Never call a tool that is not in the Available Tools list.** There is no `edit`, `str_replace`, `modify_file`, `search_replace`, or similar. Use `patch` (search/replace) or `write` (full content) for file changes. If you are unsure of the exact tool name or arguments, use `list` or `grep` first or just describe what you want to do.
+- If a tool fails (e.g. "Search text not found"), immediately do a fresh `read` of the relevant section, then decide: re-issue a corrected `patch` with verbatim text from the read, or skip if the change is already there. Never repeat the same failing call.
 {}{}
 
 ## Available Tools
 exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
-(read/write/patch/list: pass wiki=true (bool) to target the session's private wiki instead of workspace. Path: bare relative only e.g. "index.md" — do NOT prefix "wiki/" and do not mkdir wiki dirs.)
+
+**No other tools exist.** (Use patch for edits, not "edit". read/write/patch/list accept wiki=true for the session wiki; path is always relative to wiki root or workspace, never prefix "wiki/".)
 
 ## Output Style
 - Be concise but complete.

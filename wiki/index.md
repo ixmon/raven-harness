@@ -88,6 +88,10 @@ See [Test Document](./test.md) for details.
 - **Judge/Super Judge** → Feedback-driven control
 - **Execution approval modes** → Safety/observability
 - **Context budget probing** → Token-aware optimization
+- **Agent capabilities** → See [agent-capabilities.md](./agent-capabilities.md) for detailed agent architecture documentation
+- **Agent capabilities documentation** → Implementation details and patterns
+
+See [TUI Agent Capabilities](./research/agent-capabilities.md) for implementation details on the agent loop, turn metrics, session persistence, and integration with AutoHarness/VeriGuard concepts.
 
 ### Potential Enhancements from Research
 

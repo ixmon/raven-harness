@@ -42,6 +42,7 @@ VeriGuard provides **formal verification capabilities** while maintaining the fl
 | **Self-Correction** | VeriGuard can be seen as a formalized self-correction framework with verification guarantees |
 | **Chain-of-Thought** | VeriGuard can verify CoT reasoning traces for safety properties |
 | **Red Teaming** | The verifier component serves a similar function to red teaming but with formal verification guarantees |
+| **TUI Agent Capabilities** | See [Agent Capabilities](./research/agent-capabilities.md) for implementation details on the agent loop, turn metrics, session persistence, and integration concepts. |
 
 ## Implications for Raven Harness
 

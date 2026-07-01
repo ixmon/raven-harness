@@ -2,6 +2,7 @@
 //!
 //! We deliberately keep the surface small and high-signal for agentic coding:
 //! exec, read, write, patch, grep, list, web_search, browse.
+//! There is **no** `edit` tool — use `patch` for search/replace edits.
 //!
 //! Tool schemas are the standard OpenAI function format so they work with
 //! llama.cpp and other OpenAI-compatible servers (including the one used by Raven Hotel).
@@ -96,7 +97,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Search/replace edit. Set wiki=true for wiki root (path e.g. 'index.md' -- no 'wiki/' prefix).".into(),
+                description: "Search/replace edit (this is the 'patch' tool for modifying files). Set wiki=true for wiki root (path e.g. 'index.md' -- no 'wiki/' prefix). Never call a tool named 'edit'.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
