@@ -97,7 +97,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Search/replace edit (this is the 'patch' tool for modifying files). Set wiki=true for wiki root (path e.g. 'index.md' -- no 'wiki/' prefix). Never call a tool named 'edit'.".into(),
+                description: "Search/replace edit. Set wiki=true for wiki files (path e.g. 'index.md').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
