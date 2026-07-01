@@ -1163,6 +1163,12 @@ pub fn draw_content_desktop(
             *last_left_area = Rect::default();
             *last_right_area = Rect::default();
         }
+        ActiveDesktop::WikiViewer => {
+            // Drawing is handled in the caller (event_loop) with full state access for now.
+            // Avoid double draw here.
+            *last_left_area = Rect::default();
+            *last_right_area = Rect::default();
+        }
         ActiveDesktop::Workspace => {
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
@@ -1210,6 +1216,123 @@ pub fn draw_content_desktop(
     }
 }
 
+pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(area);
+
+    let nav_area = cols[0];
+    let content_area = cols[1];
+
+    // Nav pane with navigational elements (links + headings + files)
+    let nav_border = if viewer.focus == crate::app_state::WikiFocus::Nav {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let mut nav_text = Text::default();
+    nav_text.lines.push(Line::from(Span::styled(" Nav (Tab/↑↓) ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    let sel = viewer.selected_nav;
+    let nitems = viewer.nav_items.len();
+    let nav_vis = (nav_area.height as usize).saturating_sub(2).max(1);
+    // auto scroll the nav view so the selected element is visible (centered-ish)
+    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
+        0
+    } else if sel + nav_vis / 2 >= nitems {
+        nitems.saturating_sub(nav_vis)
+    } else {
+        sel.saturating_sub(nav_vis / 2)
+    };
+    for (i, item) in viewer.nav_items.iter().enumerate().skip(nav_off).take(nav_vis) {
+        let is_sel = i == sel;
+        let is_file = item.label.starts_with("📄");
+        let style = if is_sel {
+            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else if is_file {
+            Style::default().fg(Color::Rgb(0x99, 0xaa, 0xcc))
+        } else {
+            Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))
+        };
+        let prefix = if is_sel { "▶ " } else { "  " };
+        let shown = truncate_str(&format!("{}{}", prefix, item.label), nav_area.width as usize - 4);
+        nav_text.lines.push(Line::from(Span::styled(shown, style)));
+    }
+    if viewer.nav_items.is_empty() {
+        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
+    }
+    let nav_para = Paragraph::new(nav_text)
+        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))))
+        .wrap(Wrap { trim: false });
+    f.render_widget(nav_para, nav_area);
+
+    // Content pane - larger wiki display; highlight active nav target where possible
+    let content_border = if viewer.focus == crate::app_state::WikiFocus::Content {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let mut content_text = Text::default();
+    content_text.lines.push(Line::from(Span::styled(
+        format!("  {}", viewer.current_file),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    content_text.lines.push(Line::from(""));
+
+    let md = if viewer.content.is_empty() {
+        "(empty wiki file)".to_string()
+    } else {
+        viewer.content.clone()
+    };
+    let mut md_text = wiki_render_markdown(&md);
+
+    // Determine active search text from selected nav (for link text or heading)
+    let active_label = viewer.nav_items.get(sel).map(|it| it.label.as_str()).unwrap_or("");
+    let search = if active_label.starts_with('[') && active_label.ends_with(']') {
+        active_label.trim_matches(|c| c=='[' || c==']').to_string()
+    } else if active_label.starts_with('#') {
+        active_label.trim_start_matches('#').trim().to_string()
+    } else if active_label.starts_with("[[") {
+        active_label.trim_matches(|c| c=='[' || c==']').to_string()
+    } else {
+        active_label.to_string()
+    };
+
+    // Post-style: highlight matching text or the line near scroll start for the selected nav target
+    let start = viewer.scroll;
+    let max = (content_area.height as usize).saturating_sub(4);
+    for (src_idx, line) in md_text.lines.iter_mut().enumerate().skip(start).take(max) {
+        let is_active_region = if !search.is_empty() {
+            line.spans.iter().any(|s| s.content.contains(&search))
+        } else {
+            // fallback: highlight around current scroll position
+            src_idx == start || src_idx == start.saturating_add(1)
+        };
+        for span in &mut line.spans {
+            let matches = !search.is_empty() && span.content.contains(&search);
+            if matches || is_active_region {
+                let mut st = span.style;
+                st = st.fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED);
+                span.style = st;
+            }
+        }
+    }
+
+    for line in md_text.lines.into_iter().skip(start).take(max) {
+        let tline = Line::from(
+            line.spans.into_iter().map(|s| {
+                Span::styled(truncate_str(&s.content, content_area.width as usize - 4), s.style)
+            }).collect::<Vec<_>>()
+        );
+        content_text.lines.push(tline);
+    }
+
+    let content_para = Paragraph::new(content_text)
+        .block(Block::default().title(" Wiki ").borders(Borders::ALL).border_style(content_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))))
+        .wrap(Wrap { trim: false });
+    f.render_widget(content_para, content_area);
+}
+
 pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -1222,7 +1345,7 @@ pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
 
     // subtle hint line at bottom of area if space
     if area.height > 4 {
-        let hint = " ←/→ focus Summary  w: toggle Wiki  Enter: Launch (or follow when Wiki shown)  a/n/d";
+        let hint = " ←/→ focus Summary  w: toggle Wiki  Enter: full Wiki viewer or Launch  a/n/d  (right on Summary -> wiki view)";
         let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),

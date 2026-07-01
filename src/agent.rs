@@ -1279,13 +1279,13 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 - Use `list` and `grep` heavily to explore the project.
 - Use `exec` for building, testing, git, cargo, etc. Keep commands focused.
 - `web_search` finds candidate pages. `browse` reads them. Use search → browse for research.
-- For think/research/dream: use `read(path, wiki=true)` / `write(path, content, wiki=true)` / `patch(path, ..., wiki=true)` / `list(wiki=true)` to maintain a structured external memory (links, papers, experiments, conclusions). Wiki writes never need approval. Always cite sources with URLs.
+- For think/research/dream: ALWAYS use wiki=true with read/write/patch/list. The wiki root is implicit (already exists per session). Path must be bare relative e.g. "index.md" or "research/ideas.md" — NEVER "wiki/..." and NEVER mkdir wiki or wiki/wiki. Example: read({{"path":"index.md","wiki":true}}). Wiki ops always succeed (no sandbox/approval).
 - If a tool fails, report the exact error and adapt. Do not pretend it succeeded.
 {}{}
 
 ## Available Tools
 exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
-(read, write, patch, list also accept wiki=true to operate on the session's private research wiki instead of the workspace)
+(read/write/patch/list: pass wiki=true (bool) to target the session's private wiki instead of workspace. Path: bare relative only e.g. "index.md" — do NOT prefix "wiki/" and do not mkdir wiki dirs.)
 
 ## Output Style
 - Be concise but complete.

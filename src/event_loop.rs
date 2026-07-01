@@ -553,7 +553,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                     });
                 }
 
-                tui_render::draw_content_desktop(
+                if app.desktop.showing_wiki_viewer() {
+                    tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                } else {
+                    tui_render::draw_content_desktop(
                     f, content_area, &app.desktop,
                     &tui_render::WorkspaceDrawData {
                         left_committed: &app.left_committed,
@@ -587,15 +590,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                     &mut app.left_scroll, &mut app.right_scroll,
                     app.left_follow_output, app.right_follow_output,
                 );
+                }
 
-                if show_gauge {
+                if show_gauge && !app.desktop.showing_wiki_viewer() {
                     tui_render::draw_context_gauge(f, gauge_area, &tui_render::ContextGaugeData {
                         turn_rounds: app.turn_rounds, max_rounds: config.max_rounds,
                         tool_calls_this_turn: app.tool_calls_this_turn,
                     });
                 }
 
-                if show_input {
+                if show_input && !app.desktop.showing_wiki_viewer() {
                     let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, input_area, &tui_render::InputBarData {
                         input: &app.input, is_processing: app.is_processing,
@@ -603,14 +607,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                         focused: input_focused,
                     });
 
-                    tui_render::draw_overlays(
-                        f, size, input_area, &app.settings, app.pending_approval.as_deref(),
-                        &app.slash_commands, &app.input, app.slash_selected,
-                        app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
-                        app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
-                    );
+                    if !app.desktop.showing_wiki_viewer() {
+                        tui_render::draw_overlays(
+                            f, size, input_area, &app.settings, app.pending_approval.as_deref(),
+                            &app.slash_commands, &app.input, app.slash_selected,
+                            app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
+                            app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
+                        );
+                    }
 
-                    if input_focused {
+                    if input_focused && !app.desktop.showing_wiki_viewer() {
                         app.clamp_cursor();
                         let text_before = &app.input[..app.cursor_pos];
                         let cursor_line = text_before.matches('\n').count() as u16;

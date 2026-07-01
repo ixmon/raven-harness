@@ -57,11 +57,38 @@ pub enum SummaryAction {
     Launch,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WikiFocus {
+    #[default]
+    Nav,
+    Content,
+}
+
+#[derive(Debug, Default)]
+pub struct WikiViewerState {
+    pub session_id: String,
+    pub current_file: String,
+    pub scroll: usize,
+    pub files: Vec<String>,
+    pub focus: WikiFocus,
+    pub content: String,
+    // Navigational elements (files + parsed links/headings from current wiki md)
+    pub nav_items: Vec<WikiNavItem>,
+    pub selected_nav: usize,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WikiLink {
     pub text: String,
     pub target: String,
     pub line: usize,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WikiNavItem {
+    pub label: String,
+    pub target_file: String,
+    pub scroll_to: usize,
 }
 
 #[derive(Debug, Default)]
@@ -191,6 +218,9 @@ pub struct App {
 
     // Session / workspace picker (new screen to the right of splash)
     pub picker: PickerState,
+
+    // Full wiki viewer screen
+    pub wiki_viewer: WikiViewerState,
 }
 
 #[allow(dead_code)]
@@ -285,6 +315,7 @@ impl App {
                 p.summary_action = SummaryAction::ViewWiki;
                 p
             },
+            wiki_viewer: WikiViewerState::default(),
         }
     }
 
@@ -848,6 +879,353 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Enter the full wiki viewer for the currently selected session in the picker.
+    pub fn enter_wiki_viewer(&mut self) {
+        if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
+            let id = meta.session_id.clone();
+            self.wiki_viewer.session_id = id.clone();
+            self.wiki_viewer.current_file = "index.md".to_string();
+            self.wiki_viewer.focus = WikiFocus::Nav;
+            self.wiki_viewer.scroll = 0;
+            self.wiki_viewer.selected_nav = 0;
+
+            // Load list of wiki files (best effort)
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+            let wiki_dir = std::path::PathBuf::from(home)
+                .join(".raven-hotel").join("sessions").join(&id).join("wiki");
+            let mut files = vec![];
+            if let Ok(rd) = std::fs::read_dir(&wiki_dir) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                        if let Ok(rel) = p.strip_prefix(&wiki_dir) {
+                            files.push(rel.display().to_string());
+                        }
+                    }
+                }
+            }
+            files.sort();
+            if files.is_empty() {
+                files.push("index.md".to_string());
+            } else {
+                // Put the entrypoint index.md first in nav for easier "up" access
+                if let Some(pos) = files.iter().position(|f| f == "index.md" || f.ends_with("/index.md") || f.ends_with("index.md")) {
+                    let f = files.remove(pos);
+                    files.insert(0, f);
+                }
+            }
+            self.wiki_viewer.files = files;
+
+            // Load initial content and build nav elements (links + headings)
+            self.load_wiki_viewer_content();
+            self.rebuild_wiki_viewer_nav();
+            // Prefer nav selection on an entry for the starting file
+            if let Some(pos) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == self.wiki_viewer.current_file) {
+                self.wiki_viewer.selected_nav = pos;
+            }
+
+            self.desktop.set_wiki_viewer();
+            self.needs_redraw = true;
+        }
+    }
+
+    fn load_wiki_viewer_content(&mut self) {
+        if self.wiki_viewer.session_id.is_empty() {
+            return;
+        }
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let clean = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+        let path = std::path::PathBuf::from(home)
+            .join(".raven-hotel")
+            .join("sessions")
+            .join(&self.wiki_viewer.session_id)
+            .join("wiki")
+            .join(&clean);
+        self.wiki_viewer.content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|_| format!("(could not read {})", clean));
+        self.wiki_viewer.current_file = clean;
+        // nav rebuilt by caller after content change in most paths; safe to call here too
+        self.rebuild_wiki_viewer_nav();
+    }
+
+    fn normalize_wiki_path(p: &str) -> String {
+        let mut s = p.trim().to_string();
+        // strip common relative junk the model or links may introduce
+        while s.starts_with("./") {
+            s = s[2..].to_string();
+        }
+        s = s.trim_start_matches(|c: char| c == '/' || c == '\\').to_string();
+        if s.is_empty() {
+            return "index.md".to_string();
+        }
+        if !s.ends_with(".md") {
+            if !s.contains('.') || s.ends_with('/') {
+                s.push_str(".md");
+            }
+        }
+        s
+    }
+
+    fn rebuild_wiki_viewer_nav(&mut self) {
+        let mut items: Vec<WikiNavItem> = vec![];
+        let cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+        // Always offer sibling markdown files for navigation/switching
+        for f in self.wiki_viewer.files.iter() {
+            let tf = Self::normalize_wiki_path(f);
+            items.push(WikiNavItem {
+                label: format!("📄 {}", f),
+                target_file: tf,
+                scroll_to: 0,
+            });
+        }
+        let content = &self.wiki_viewer.content;
+        // Outgoing links come before full headings so Tab reaches them quickly for current doc
+        // Outgoing markdown links [text](*.md) and [[wiki]]
+        if let Ok(re) = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)") {
+            for (i, line) in content.lines().enumerate() {
+                for cap in re.captures_iter(line) {
+                    let text = cap.get(1).map_or("", |m| m.as_str()).to_string();
+                    let mut tgt = cap.get(2).map_or("", |m| m.as_str()).to_string();
+                    if let Some(hpos) = tgt.find('#') { tgt = tgt[..hpos].to_string(); }
+                    let clean_tgt = Self::normalize_wiki_path(&tgt);
+                    items.push(WikiNavItem {
+                        label: format!("[{}]", text),
+                        target_file: clean_tgt,
+                        scroll_to: i,
+                    });
+                }
+            }
+        }
+        if let Ok(re) = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]") {
+            for (i, line) in content.lines().enumerate() {
+                for cap in re.captures_iter(line) {
+                    let mut tgt = cap.get(1).map_or("", |m| m.as_str()).to_string();
+                    let clean_tgt = Self::normalize_wiki_path(&tgt);
+                    items.push(WikiNavItem {
+                        label: format!("[[{}]]", clean_tgt.trim_end_matches(".md")),
+                        target_file: clean_tgt,
+                        scroll_to: i,
+                    });
+                }
+            }
+        }
+        // Headings (support up to h3 for nav)
+        for (i, line) in content.lines().enumerate() {
+            let label = if let Some(h) = line.strip_prefix("# ") {
+                Some(format!("# {}", h.trim()))
+            } else if let Some(h) = line.strip_prefix("## ") {
+                Some(format!("## {}", h.trim()))
+            } else if let Some(h) = line.strip_prefix("### ") {
+                Some(format!("### {}", h.trim()))
+            } else { None };
+            if let Some(lab) = label {
+                items.push(WikiNavItem { label: lab, target_file: cur.clone(), scroll_to: i });
+            }
+        }
+        if items.is_empty() {
+            items.push(WikiNavItem { label: "(index)".into(), target_file: cur.clone(), scroll_to: 0 });
+        }
+        // de-dup preserving order (simple)
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = vec![];
+        for it in items {
+            let key = (it.label.clone(), it.target_file.clone());
+            if seen.insert(key) {
+                deduped.push(it);
+            }
+        }
+        self.wiki_viewer.nav_items = deduped;
+        if self.wiki_viewer.selected_nav >= self.wiki_viewer.nav_items.len() {
+            self.wiki_viewer.selected_nav = 0;
+        }
+    }
+
+    fn apply_wiki_nav_selection(&mut self, idx: usize) {
+        if idx >= self.wiki_viewer.nav_items.len() {
+            return;
+        }
+        let item = self.wiki_viewer.nav_items[idx].clone();
+        self.wiki_viewer.selected_nav = idx;
+        let clean_target = Self::normalize_wiki_path(&item.target_file);
+        let clean_cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+        // Only treat 📄 entries as file switchers. Link/heading nav items stay in current doc
+        // and just scroll/highlight their mention or definition in the current right pane.
+        let file_changed = item.label.starts_with("📄") && clean_target != clean_cur;
+        if file_changed {
+            self.wiki_viewer.current_file = clean_target;
+            // load will also rebuild nav for the new file
+            self.load_wiki_viewer_content();
+            // after rebuild, prefer to land on first in-doc nav for the file (skip the file list prefix if possible)
+            if let Some(first) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == self.wiki_viewer.current_file && !it.label.starts_with("📄")) {
+                self.wiki_viewer.selected_nav = first;
+            } else if let Some(first_file) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == self.wiki_viewer.current_file) {
+                self.wiki_viewer.selected_nav = first_file;
+            } else {
+                self.wiki_viewer.selected_nav = 0;
+            }
+            if self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav).map(|i| i.scroll_to).unwrap_or(0) == 0 {
+                self.wiki_viewer.scroll = 0;
+            } else {
+                self.wiki_viewer.scroll = self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav).map(|i| i.scroll_to).unwrap_or(0);
+            }
+        } else {
+            self.wiki_viewer.scroll = item.scroll_to;
+        }
+    }
+
+    fn align_picker_to_wiki_session(&mut self) {
+        let want = self.wiki_viewer.session_id.clone();
+        // find in current sessions list
+        if let Some(pos) = self.picker.sessions.iter().position(|m| m.session_id == want) {
+            if self.picker.selected_session != pos {
+                self.picker.selected_session = pos;
+            }
+            return;
+        }
+        // may need refresh
+        self.refresh_picker_sessions();
+        if let Some(pos) = self.picker.sessions.iter().position(|m| m.session_id == want) {
+            self.picker.selected_session = pos;
+        }
+    }
+
+    /// Handle keys when in the full wiki viewer screen.
+    /// Returns true if handled.
+    pub fn handle_wiki_viewer_key(&mut self, key: KeyCode, _agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) -> bool {
+        if !self.desktop.showing_wiki_viewer() {
+            return false;
+        }
+
+        match key {
+            KeyCode::Left | KeyCode::Char('h') => {
+                if self.wiki_viewer.focus == WikiFocus::Nav {
+                    self.desktop.exit_wiki_viewer_to_picker();
+                    self.needs_redraw = true;
+                    return true;
+                } else {
+                    // move to nav
+                    self.wiki_viewer.focus = WikiFocus::Nav;
+                    self.needs_redraw = true;
+                    return true;
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.wiki_viewer.focus == WikiFocus::Content {
+                    // Rightmost pane — move to workspace screen
+                    self.desktop.exit_wiki_viewer_to_workspace();
+                    self.needs_redraw = true;
+                    return true;
+                } else {
+                    self.wiki_viewer.focus = WikiFocus::Content;
+                    self.needs_redraw = true;
+                    return true;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.wiki_viewer.focus == WikiFocus::Nav {
+                    if !self.wiki_viewer.nav_items.is_empty() {
+                        let n = self.wiki_viewer.nav_items.len();
+                        let idx = if self.wiki_viewer.selected_nav == 0 { n - 1 } else { self.wiki_viewer.selected_nav - 1 };
+                        self.apply_wiki_nav_selection(idx);
+                        self.needs_redraw = true;
+                    }
+                } else {
+                    self.wiki_viewer.scroll = self.wiki_viewer.scroll.saturating_sub(1);
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.wiki_viewer.focus == WikiFocus::Nav {
+                    if !self.wiki_viewer.nav_items.is_empty() {
+                        let n = self.wiki_viewer.nav_items.len();
+                        let idx = (self.wiki_viewer.selected_nav + 1) % n;
+                        self.apply_wiki_nav_selection(idx);
+                        self.needs_redraw = true;
+                    }
+                } else {
+                    self.wiki_viewer.scroll = self.wiki_viewer.scroll.saturating_add(1);
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Tab => {
+                if self.wiki_viewer.focus == WikiFocus::Nav && !self.wiki_viewer.nav_items.is_empty() {
+                    let n = self.wiki_viewer.nav_items.len();
+                    let next = (self.wiki_viewer.selected_nav + 1) % n;
+                    if next == 0 {
+                        // Wrapped around — switch to Content pane
+                        self.wiki_viewer.focus = WikiFocus::Content;
+                    } else {
+                        self.wiki_viewer.selected_nav = next;
+                        self.apply_wiki_nav_selection(next);
+                    }
+                    self.needs_redraw = true;
+                } else {
+                    // From Content pane, Tab goes back to Nav
+                    self.wiki_viewer.focus = WikiFocus::Nav;
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Enter => {
+                if self.wiki_viewer.focus == WikiFocus::Nav {
+                    if !self.wiki_viewer.nav_items.is_empty() {
+                        let idx = self.wiki_viewer.selected_nav;
+                        let item = self.wiki_viewer.nav_items.get(idx).cloned();
+                        let clean_t = item.as_ref().map(|it| Self::normalize_wiki_path(&it.target_file)).unwrap_or_default();
+                        let clean_c = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+                        if let Some(it) = item {
+                            if it.label.starts_with("📄") || clean_t == clean_c {
+                                self.apply_wiki_nav_selection(idx);
+                            } else {
+                                // Enter on a cross-file link nav element: follow it
+                                self.wiki_viewer.current_file = clean_t;
+                                self.load_wiki_viewer_content();
+                                self.rebuild_wiki_viewer_nav();
+                                // land on first non-file or file entry in the target
+                                if let Some(p) = self.wiki_viewer.nav_items.iter().position(|x| x.target_file == self.wiki_viewer.current_file && !x.label.starts_with("📄")) {
+                                    self.wiki_viewer.selected_nav = p;
+                                } else if let Some(p) = self.wiki_viewer.nav_items.iter().position(|x| x.target_file == self.wiki_viewer.current_file) {
+                                    self.wiki_viewer.selected_nav = p;
+                                } else {
+                                    self.wiki_viewer.selected_nav = 0;
+                                }
+                                self.wiki_viewer.scroll = 0;
+                            }
+                        }
+                    }
+                    self.wiki_viewer.focus = WikiFocus::Content;
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                // Navigate back to index.md
+                if self.wiki_viewer.current_file != "index.md" {
+                    self.wiki_viewer.current_file = "index.md".to_string();
+                    self.wiki_viewer.scroll = 0;
+                    self.load_wiki_viewer_content();
+                    self.rebuild_wiki_viewer_nav();
+                    if let Some(pos) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == "index.md") {
+                        self.wiki_viewer.selected_nav = pos;
+                    } else {
+                        self.wiki_viewer.selected_nav = 0;
+                    }
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                // reload current
+                self.load_wiki_viewer_content();
+                self.needs_redraw = true;
+                true
+            }
+            _ => true, // consume all keys — don't leak to workspace navigation
+        }
+    }
+
     pub fn refresh_picker(&mut self) {
         if let Ok(wss) = raven_tui::session::list_workspaces() {
             self.picker.workspaces = wss;
@@ -1215,7 +1593,8 @@ impl App {
                         self.recompute_active_link();
                     }
                     PickerFocus::Summary => {
-                        // Already rightmost pane — no-op (use Tab for buttons)
+                        // Right from Summary -> full wiki viewer for selected session
+                        self.enter_wiki_viewer();
                     }
                 }
                 self.needs_redraw = true;
@@ -1233,22 +1612,14 @@ impl App {
                             // Active item is a wiki link — follow it
                             self.follow_wiki_link_in_summary();
                         } else if idx == n_links {
-                            // Wiki button
-                            self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
-                            if self.picker.show_wiki_in_summary {
-                                self.refresh_picker_summary();
-                                self.recompute_active_link();
-                            }
+                            // Wiki button -> full dedicated wiki viewer screen
+                            self.enter_wiki_viewer();
                         } else if idx == n_links + 1 {
                             // Launch button
                             self.activate_selected_session(agent);
                         } else {
-                            // No links, default: toggle wiki
-                            self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
-                            if self.picker.show_wiki_in_summary {
-                                self.refresh_picker_summary();
-                                self.recompute_active_link();
-                            }
+                            // No links, default to wiki viewer
+                            self.enter_wiki_viewer();
                         }
                     }
                     _ => {

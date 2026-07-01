@@ -63,11 +63,11 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read".into(),
-                description: "Read a file's contents. Use lines=\"N-M\" or full=true to read more/entire file (useful for refactoring). Always read before editing. Set wiki=true to read from your private session wiki instead of the workspace.".into(),
+                description: "Read a file's contents. Set wiki=true to target the session wiki root (path relative e.g. \"index.md\"; NEVER prefix 'wiki/' or mkdir wiki/wiki). Use lines=... .".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path to the file (relative to workspace, or relative to wiki/ if wiki=true)" },
+                        "path": { "type": "string", "description": "Relative path. If wiki=true then relative to the wiki ROOT ONLY (do not use 'wiki/xxx', 'wiki/wiki/xxx' or any prefix; just 'index.md' or 'notes/x.md')" },
                         "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" },
                         "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" },
                         "wiki": { "type": "boolean", "description": "If true, path is relative to the session's private research wiki (not the workspace)" }
@@ -80,13 +80,13 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "write".into(),
-                description: "Write (overwrite) a file. Prefer patch for modifications to existing code. Set wiki=true to write to your private session wiki (always allowed, no approval needed).".into(),
+                description: "Write a file. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Destination path (or relative to wiki/ if wiki=true)" },
+                        "path": { "type": "string", "description": "Path relative to workspace or (if wiki=true) to wiki ROOT. NEVER start with 'wiki/' or 'wiki/wiki/'." },
                         "content": { "type": "string", "description": "Full file content to write" },
-                        "wiki": { "type": "boolean", "description": "If true, writes to the session's private research wiki (always allowed, no approval needed)" }
+                        "wiki": { "type": "boolean", "description": "Target the session wiki (relative paths, no 'wiki/' prefix)" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -96,11 +96,11 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Safe search-and-replace edit. Strongly preferred over write for modifications. Use near_line when the search text appears multiple times. Set wiki=true to patch a file in your private session wiki.".into(),
+                description: "Search/replace edit. Set wiki=true for wiki root (path e.g. 'index.md' -- no 'wiki/' prefix).".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File to edit (or relative to wiki/ if wiki=true)" },
+                        "path": { "type": "string", "description": "File path (relative to wiki ROOT if wiki=true; NEVER start with 'wiki/' or 'wiki/wiki/')" },
                         "search": { "type": "string", "description": "Exact text to find and replace (must match precisely)" },
                         "replace": { "type": "string", "description": "Replacement text" },
                         "near_line": { "type": "integer", "description": "Optional hint: the approximate line number of the occurrence you want (1-based)" },
@@ -129,12 +129,12 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "list".into(),
-                description: "List files and directories in a path (relative to workspace). Great for exploration. Set wiki=true to list the session's private research wiki.".into(),
+                description: "List dir. wiki=true lists session wiki ROOT (path relative to it, e.g. '' or 'subdir'; do not use path='wiki/..').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory to list (default: workspace root, or wiki root if wiki=true)" },
-                        "wiki": { "type": "boolean", "description": "If true, lists the session's private research wiki directory" }
+                        "path": { "type": "string", "description": "Subdir relative (or to wiki ROOT if wiki=true). NEVER prefix 'wiki/' or 'wiki/wiki/'." },
+                        "wiki": { "type": "boolean", "description": "List the wiki directory instead" }
                     },
                     "required": []
                 }),

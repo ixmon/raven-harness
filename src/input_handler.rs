@@ -240,8 +240,14 @@ async fn handle_input_key(
         return Ok(true);
     }
 
+    // Full wiki viewer screen
+    if app.desktop.showing_wiki_viewer() && app.handle_wiki_viewer_key(key.code, agent) {
+        return Ok(true);
+    }
+
     // When focused on content panes (Left/Right), use arrows for focus or desktop slide
-    if app.focused_pane != crate::app_state::Pane::Input {
+    // (skip when wiki viewer owns the screen — its handler already processed or rejected the key)
+    if app.focused_pane != crate::app_state::Pane::Input && !app.desktop.showing_wiki_viewer() {
         match key.code {
             KeyCode::Left => {
                 if app.desktop.showing_picker() {
@@ -255,11 +261,15 @@ async fn handle_input_key(
                         app.needs_redraw = true;
                         return Ok(true);
                     } else if app.focused_pane == crate::app_state::Pane::Left {
-                        // on Conversation, left goes to 2nd screen (picker) focused on session pane
-                        app.desktop.set_picker();
-                        app.picker.focus = crate::app_state::PickerFocus::Sessions;
-                        if !app.picker.loaded {
-                            app.refresh_picker();
+                        // on Conversation, left goes to wiki viewer if possible, else picker
+                        if !app.wiki_viewer.session_id.is_empty() {
+                            app.desktop.set_wiki_viewer();
+                        } else {
+                            app.desktop.set_picker();
+                            app.picker.focus = crate::app_state::PickerFocus::Sessions;
+                            if !app.picker.loaded {
+                                app.refresh_picker();
+                            }
                         }
                         app.needs_redraw = true;
                         return Ok(true);

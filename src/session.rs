@@ -406,9 +406,18 @@ impl Session {
 
         // Wiki (private research memory) — always mentioned so the agent knows the path.
         block.push_str("### Private Research Wiki (use for think/research/dream modes)\n");
-        block.push_str(&format!("Wiki directory: {}/wiki/ — access via `read/write/patch/list` with `wiki=true`\n", self.dir.display()));
-        block.push_str("Maintain links, papers, experiment results, hypotheses, and findings as markdown. ");
-        block.push_str("Wiki writes never need approval. Re-read sections before editing. Record sources with full URLs.\n\n");
+        block.push_str("The session has a private wiki directory that is ALREADY the target when you use wiki=true.\n");
+        block.push_str("CRITICAL:\n");
+        block.push_str("- ALWAYS pass wiki=true (as boolean) on read / write / patch / list to target the session wiki.\n");
+        block.push_str("- 'path' MUST be relative only: \"index.md\", \"notes/experiments.md\", \"foo/bar.md\" etc.\n");
+        block.push_str("- NEVER include the string \"wiki\" (or \"wiki/\") in the path value. NEVER mkdir wiki or wiki/wiki.\n");
+        block.push_str("Correct tool use examples (do not escape args):\n");
+        block.push_str("  read  path=index.md                 wiki=true\n");
+        block.push_str("  write path=research/findings.md     wiki=true   content=...\n");
+        block.push_str("  list  wiki=true   (or path=some/subdir + wiki=true)\n");
+        block.push_str("  patch path=index.md wiki=true search=\"...\" replace=\"...\"\n");
+        block.push_str("list with wiki=true lists the wiki root. Use it to keep research notes, links, results, hypotheses. Wiki writes bypass approval.\n");
+        block.push_str("Re-read before editing. Record sources/URLs in the md.\n\n");
 
         if flags.goal_tracking && !flags.disable_goal_tool {
             block.push_str("---\nUse the structure and goal above to stay on track. Call update_goal(...) if the user's intent clearly shifts.\n");
@@ -565,10 +574,11 @@ impl Session {
     /// Read a wiki file. Returns a formatted result string (similar to read tool output).
     pub fn read_wiki_file(&self, rel: &str, line_range: Option<&str>, full: bool, max_lines: usize) -> String {
         let root = self.wiki_root();
-        let clean_rel = if rel.trim().is_empty() || rel.trim() == "." || rel.trim() == "/" {
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = if r.is_empty() || r == "." || r == "/" {
             "index.md".to_string()
         } else {
-            rel.trim_start_matches(|c| matches!(c, '/' | '\\')).to_string()
+            r
         };
         let target = root.join(&clean_rel);
 
@@ -599,7 +609,8 @@ impl Session {
     /// Write a file under wiki/. Creates parent dirs. Returns ack string.
     pub fn write_wiki_file(&self, rel: &str, content: &str) -> String {
         let root = self.wiki_root();
-        let clean_rel = rel.trim_start_matches(|c| matches!(c, '/' | '\\')).to_string();
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = r;
         if clean_rel.is_empty() {
             return "❌ write_wiki requires a non-empty path (e.g. 'index.md')".into();
         }
@@ -626,7 +637,8 @@ impl Session {
         near_line: Option<i64>,
     ) -> String {
         let root = self.wiki_root();
-        let clean_rel = rel.trim_start_matches(|c| matches!(c, '/' | '\\')).to_string();
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = r;
         if clean_rel.is_empty() {
             return "❌ patch_wiki requires a non-empty relative path (e.g. 'index.md')".into();
         }
@@ -714,9 +726,11 @@ impl Session {
     /// List wiki dir (relative subpath optional).
     pub fn list_wiki(&self, sub: Option<&str>) -> String {
         let root = self.wiki_root();
-        let target = match sub {
-            Some(s) if !s.trim().is_empty() => root.join(s.trim_start_matches(|c| matches!(c, '/' | '\\'))),
-            _ => root.clone(),
+        let r = Self::strip_wiki_prefix(sub.unwrap_or(""));
+        let target = if r.is_empty() {
+            root.clone()
+        } else {
+            root.join(r.trim_start_matches(|c| matches!(c, '/' | '\\')))
         };
         match fs::read_dir(&target) {
             Ok(rd) => {
@@ -727,13 +741,35 @@ impl Session {
                 }).collect();
                 entries.sort();
                 if entries.is_empty() {
-                    format!("wiki/{} (empty)", sub.unwrap_or(""))
+                    format!("wiki/{} (empty)", if r.is_empty() { "" } else { &r })
                 } else {
-                    format!("wiki/{}:\n{}", sub.unwrap_or(""), entries.join("\n"))
+                    format!("wiki/{}:\n{}", if r.is_empty() { "" } else { &r }, entries.join("\n"))
                 }
             }
             Err(e) => format!("❌ list_wiki error: {}", e),
         }
+    }
+
+    fn strip_wiki_prefix(rel: &str) -> String {
+        let mut s = rel.trim().to_string();
+        // Aggressively strip any "wiki/" the model might paste (from seeing ROOT or absolute paths)
+        for _ in 0..4 {
+            let before = s.clone();
+            if s.starts_with("wiki/") {
+                s = s[5..].to_string();
+            } else if s.starts_with("./wiki/") {
+                s = s[7..].to_string();
+            } else if let Some(pos) = s.find("/wiki/") {
+                s = s[pos + 6..].to_string();
+            } else if let Some(pos) = s.find("/sessions/") {
+                // e.g. .../sessions/<id>/wiki/xxx -> take after /wiki/
+                if let Some(w) = s[pos..].find("/wiki/") {
+                    s = s[pos + w + 6..].to_string();
+                }
+            }
+            if s == before { break; }
+        }
+        s.trim_start_matches(|c: char| matches!(c, '/' | '\\' | '.')).to_string()
     }
 }
 

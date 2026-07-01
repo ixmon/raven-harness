@@ -8,6 +8,7 @@ pub enum ActiveDesktop {
     Workspace,
     Splash,
     Picker,
+    WikiViewer,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +95,14 @@ impl DesktopState {
         !self.is_animating() && (self.active == ActiveDesktop::Splash || self.active == ActiveDesktop::Workspace)
     }
 
+    pub fn showing_wiki_viewer(&self) -> bool {
+        self.active == ActiveDesktop::WikiViewer && !self.is_animating()
+    }
+
+    pub fn can_enter_wiki_viewer(&self) -> bool {
+        !self.is_animating() && (self.active == ActiveDesktop::Picker || self.active == ActiveDesktop::Workspace)
+    }
+
     pub fn start_slide_to_splash(&mut self, pane: WorkspacePane) {
         self.workspace_pane = pane;
         self.slide = Some(SlideState {
@@ -123,6 +132,21 @@ impl DesktopState {
 
     /// Force active to workspace (used when loading a session from picker).
     pub fn set_workspace(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Workspace;
+    }
+
+    pub fn set_wiki_viewer(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::WikiViewer;
+    }
+
+    pub fn exit_wiki_viewer_to_picker(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Picker;
+    }
+
+    pub fn exit_wiki_viewer_to_workspace(&mut self) {
         self.slide = None;
         self.active = ActiveDesktop::Workspace;
     }

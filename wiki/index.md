@@ -75,6 +75,11 @@ See [AutoHarness Details](./autoharness.md) for a comprehensive overview of the 
 
 See [VeriGuard Details](./veriguard.md) for a comprehensive overview of the technique and its implications.
 
+### 7. Test Document
+A test markdown page demonstrating various markdown features including headers, code blocks, lists, tables, and task lists.
+
+See [Test Document](./test.md) for details.
+
 ## Implications for Raven Harness
 
 ### Current Raven Features (Aligned with Research)
