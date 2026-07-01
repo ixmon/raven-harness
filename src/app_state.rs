@@ -1188,17 +1188,12 @@ impl App {
                 true
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.picker.focus == PickerFocus::Summary {
-                    self.picker.summary_action = SummaryAction::ViewWiki;
-                    self.needs_redraw = true;
-                    return true;
-                }
                 match self.picker.focus {
-                    PickerFocus::Sessions => {
-                        self.picker.focus = PickerFocus::Workspaces;
-                    }
                     PickerFocus::Summary => {
                         self.picker.focus = PickerFocus::Sessions;
+                    }
+                    PickerFocus::Sessions => {
+                        self.picker.focus = PickerFocus::Workspaces;
                     }
                     _ => {
                         self.exit_picker_to_main();
@@ -1208,11 +1203,6 @@ impl App {
                 true
             }
             KeyCode::Right | KeyCode::Char('l') => {
-                if self.picker.focus == PickerFocus::Summary {
-                    self.picker.summary_action = SummaryAction::Launch;
-                    self.needs_redraw = true;
-                    return true;
-                }
                 match self.picker.focus {
                     PickerFocus::Workspaces => {
                         self.picker.focus = PickerFocus::Sessions;
@@ -1221,12 +1211,11 @@ impl App {
                     PickerFocus::Sessions => {
                         self.picker.focus = PickerFocus::Summary;
                         self.picker.summary_scroll = 0;
-                        self.refresh_picker_summary();  // reload with more lines now that Summary is focused
+                        self.refresh_picker_summary();
                         self.recompute_active_link();
                     }
                     PickerFocus::Summary => {
-                        // On summary, right can activate the session (load into workspace)
-                        self.activate_selected_session(agent);
+                        // Already rightmost pane — no-op (use Tab for buttons)
                     }
                 }
                 self.needs_redraw = true;

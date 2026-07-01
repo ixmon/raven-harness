@@ -1403,17 +1403,21 @@ fn draw_session_summary(
     if is_wiki_mode {
         // Pure wiki markdown content (no session meta text)
         let md_text = wiki_render_markdown(summary);
-        let active_line = wiki_links.get(active_link_idx).map(|l| l.line).unwrap_or(usize::MAX);
-        let active_text = wiki_links.get(active_link_idx).map(|l| l.text.as_str()).unwrap_or("");
+        // Determine which link text is the active one (for highlight)
+        let active_link_text = if active_link_idx < wiki_links.len() {
+            wiki_links.get(active_link_idx).map(|l| l.text.as_str()).unwrap_or("")
+        } else {
+            "" // button is focused, no link highlight
+        };
 
         for (idx, mut raw_line) in md_text.lines.into_iter().skip(start).take(max_lines).enumerate() {
-            let this_line = start + idx;
+            let _this_line = start + idx;
 
-            // Re-apply hyperlink styling on top of markdown (cyan for links, special for active)
-            if let Some(link) = wiki_links.iter().find(|l| l.line == this_line) {
-                for span in &mut raw_line.spans {
+            // Highlight links by matching span content against known link texts
+            for span in &mut raw_line.spans {
+                for link in wiki_links.iter() {
                     if span.content.contains(&link.text) {
-                        if this_line == active_line && span.content.contains(active_text) {
+                        if link.text == active_link_text && !active_link_text.is_empty() {
                             span.style = Style::default()
                                 .fg(Color::Magenta)
                                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED);
@@ -1422,6 +1426,7 @@ fn draw_session_summary(
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::UNDERLINED);
                         }
+                        break;
                     }
                 }
             }
@@ -1432,7 +1437,6 @@ fn draw_session_summary(
                     if span.style.fg.is_none() || span.style.fg == Some(Color::Reset) {
                         span.style = span.style.fg(Color::LightCyan);
                     }
-                    // keep BOLD
                 }
             }
 
