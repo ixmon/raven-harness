@@ -740,11 +740,17 @@ impl Session {
                     if ft.map(|t| t.is_dir()).unwrap_or(false) { format!("{}/", name) } else { name }
                 }).collect();
                 entries.sort();
+                let header = if r.is_empty() { "wiki/" } else { &format!("wiki/{}", r) };
                 if entries.is_empty() {
-                    format!("wiki/{} (empty)", if r.is_empty() { "" } else { &r })
+                    format!("📁 {} (0 entries)\n(empty)", header)
                 } else {
-                    format!("wiki/{}:\n{}", if r.is_empty() { "" } else { &r }, entries.join("\n"))
+                    format!("📁 {} ({} entries)\n{}", header, entries.len(), entries.join("\n"))
                 }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Non-existent subdir under wiki: report as empty (agent may list before write)
+                let header = if r.is_empty() { "wiki/" } else { &format!("wiki/{}", r) };
+                format!("📁 {} (0 entries)\n(empty)", header)
             }
             Err(e) => format!("❌ list_wiki error: {}", e),
         }

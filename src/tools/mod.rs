@@ -114,12 +114,16 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "grep".into(),
-                description: "Search for a pattern across files in the workspace. Returns matching lines with context.".into(),
+                description: "Search for a pattern across files in the workspace. Returns matching lines with context. Use include to filter by file type (e.g. '*.rs', '*.py').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Regex or literal pattern (case-insensitive)" },
-                        "path": { "type": "string", "description": "Optional subdirectory or file to limit the search" }
+                        "pattern": { "type": "string", "description": "Regex or literal pattern (case-insensitive). Use fixed=true for literal strings containing special chars." },
+                        "path": { "type": "string", "description": "Optional subdirectory or file to limit the search" },
+                        "include": { "type": "string", "description": "Glob filter e.g. '*.rs', '*.py', '*.toml'. Only search files matching this pattern." },
+                        "context": { "type": "integer", "description": "Lines of context around each match (default 0, max 5)" },
+                        "files_only": { "type": "boolean", "description": "If true, only list filenames containing matches (not the matching lines)" },
+                        "fixed": { "type": "boolean", "description": "If true, treat pattern as a literal string (no regex). Useful for searching code with special chars like foo.bar() or arr[0]." }
                     },
                     "required": ["pattern"]
                 }),

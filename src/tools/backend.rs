@@ -216,7 +216,11 @@ async fn real_execute(
         "grep" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = args.get("path").and_then(|v| v.as_str());
-            Ok(grep_files(pattern, path, workspace))
+            let include = args.get("include").and_then(|v| v.as_str());
+            let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let files_only = args.get("files_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fixed = args.get("fixed").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(grep_files(pattern, path, include, context.min(5), files_only, fixed, workspace))
         }
         "list" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");

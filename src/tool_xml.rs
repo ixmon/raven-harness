@@ -136,11 +136,31 @@ fn xml_parameters(block: &str) -> serde_json::Map<String, serde_json::Value> {
         };
         let value = value_block[..value_end].trim();
         if !value.is_empty() {
-            map.insert(key, serde_json::Value::String(value.to_string()));
+            let v = parse_xml_value(value);
+            map.insert(key, v);
         }
         cursor = &value_block[value_end..];
     }
     map
+}
+
+fn parse_xml_value(s: &str) -> serde_json::Value {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("true") {
+        return serde_json::Value::Bool(true);
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return serde_json::Value::Bool(false);
+    }
+    if let Ok(n) = t.parse::<i64>() {
+        return serde_json::Value::Number(n.into());
+    }
+    if let Ok(n) = t.parse::<f64>() {
+        if let Some(num) = serde_json::Number::from_f64(n) {
+            return serde_json::Value::Number(num);
+        }
+    }
+    serde_json::Value::String(t.to_string())
 }
 
 // ── Detection ────────────────────────────────────────────────────────────────

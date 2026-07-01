@@ -265,7 +265,15 @@ pub fn patch_file(
     }
 }
 
-pub fn grep_files(pattern: &str, path_filter: Option<&str>, workspace: &Path) -> String {
+pub fn grep_files(
+    pattern: &str,
+    path_filter: Option<&str>,
+    include: Option<&str>,
+    context: usize,
+    files_only: bool,
+    fixed: bool,
+    workspace: &Path,
+) -> String {
     let search_root = if let Some(p) = path_filter {
         match resolve(workspace, p) {
             Ok(pp) => pp,
@@ -275,8 +283,9 @@ pub fn grep_files(pattern: &str, path_filter: Option<&str>, workspace: &Path) ->
         workspace.to_path_buf()
     };
 
-    let mut matches = vec![];
-    let re = match regex::RegexBuilder::new(pattern)
+    // Build regex (escaped if fixed-string mode)
+    let pat = if fixed { regex::escape(pattern) } else { pattern.to_string() };
+    let re = match regex::RegexBuilder::new(&pat)
         .case_insensitive(true)
         .build()
     {
@@ -284,54 +293,151 @@ pub fn grep_files(pattern: &str, path_filter: Option<&str>, workspace: &Path) ->
         Err(e) => return format!("❌ Bad regex: {}", e),
     };
 
-    let walker = ignore::WalkBuilder::new(&search_root)
-        .standard_filters(true)
-        .build();
+    // Build walker with optional glob include filter
+    let mut builder = ignore::WalkBuilder::new(&search_root);
+    builder.standard_filters(true);
 
-    'files: for entry in walker.filter_map(|e| e.ok()) {
-        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
-            continue;
-        }
-        let path = entry.path();
-
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(_) => continue,
-        };
-        let reader = BufReader::new(file);
-        for (i, line_result) in reader.lines().enumerate() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if re.is_match(&line) {
-                let rel = path.strip_prefix(workspace).unwrap_or(path);
-                matches.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
-                if matches.len() >= GREP_MAX_MATCHES {
-                    break 'files;
+    // Apply glob include via the overrides mechanism
+    if let Some(glob) = include {
+        let mut ovr = ignore::overrides::OverrideBuilder::new(&search_root);
+        // Support comma-separated globs: "*.rs,*.toml"
+        for g in glob.split(',') {
+            let g = g.trim();
+            if !g.is_empty() {
+                if let Err(e) = ovr.add(g) {
+                    return format!("❌ Bad glob '{}': {}", g, e);
                 }
             }
         }
+        match ovr.build() {
+            Ok(o) => { builder.overrides(o); }
+            Err(e) => return format!("❌ Glob build error: {}", e),
+        }
     }
 
-    if matches.is_empty() {
-        format!(
-            "🔍 No matches for '{}' in {}",
-            pattern,
-            search_root.display()
-        )
-    } else {
-        let total = matches.len();
-        if total > 50 {
-            matches.truncate(50);
-            matches.push("... (more matches truncated)".to_string());
+    let walker = builder.build();
+    let context = context.min(5); // hard cap
+
+    if files_only {
+        // ── files-only mode: just list matching filenames ──
+        let mut file_matches: Vec<String> = vec![];
+        for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let reader = BufReader::new(file);
+            for line_result in reader.lines() {
+                let line = match line_result {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if re.is_match(&line) {
+                    let rel = path.strip_prefix(workspace).unwrap_or(path);
+                    file_matches.push(rel.display().to_string());
+                    break; // one match per file is enough
+                }
+            }
+            if file_matches.len() >= GREP_MAX_MATCHES {
+                break;
+            }
         }
-        format!(
-            "🔍 {} match(es) for '{}':\n{}",
-            total,
-            pattern,
-            matches.join("\n")
-        )
+
+        if file_matches.is_empty() {
+            format!("🔍 No files match '{}' in {}", pattern, search_root.display())
+        } else {
+            let total = file_matches.len();
+            format!(
+                "🔍 {} file(s) matching '{}':\n{}",
+                total, pattern, file_matches.join("\n")
+            )
+        }
+    } else {
+        // ── normal mode: matching lines with optional context ──
+        let mut matches: Vec<String> = vec![];
+        let mut total_matches = 0usize;
+
+        'files: for entry in walker.filter_map(|e| e.ok()) {
+            if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                continue;
+            }
+            let path = entry.path();
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let rel = path.strip_prefix(workspace).unwrap_or(path);
+
+            if context == 0 {
+                // Fast path: no context needed
+                let reader = BufReader::new(file);
+                for (i, line_result) in reader.lines().enumerate() {
+                    let line = match line_result {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                    if re.is_match(&line) {
+                        matches.push(format!("{}:{}: {}", rel.display(), i + 1, line.trim()));
+                        total_matches += 1;
+                        if total_matches >= GREP_MAX_MATCHES {
+                            break 'files;
+                        }
+                    }
+                }
+            } else {
+                // Context mode: read all lines, emit context windows
+                let reader = BufReader::new(file);
+                let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                let n = lines.len();
+                let mut last_printed_end = 0usize; // track to avoid duplicate context
+
+                for (i, line) in lines.iter().enumerate() {
+                    if re.is_match(line) {
+                        let ctx_start = i.saturating_sub(context);
+                        let ctx_end = (i + context + 1).min(n);
+                        // Separator if there's a gap from previous context block
+                        if last_printed_end > 0 && ctx_start > last_printed_end {
+                            matches.push("--".to_string());
+                        }
+                        let print_start = ctx_start.max(last_printed_end);
+                        for j in print_start..ctx_end {
+                            let marker = if j == i { ">" } else { " " };
+                            matches.push(format!(
+                                "{}{}:{}: {}",
+                                marker, rel.display(), j + 1, lines[j].trim()
+                            ));
+                        }
+                        last_printed_end = ctx_end;
+                        total_matches += 1;
+                        if total_matches >= GREP_MAX_MATCHES {
+                            break 'files;
+                        }
+                    }
+                }
+            }
+        }
+
+        if matches.is_empty() {
+            format!(
+                "🔍 No matches for '{}' in {}",
+                pattern,
+                search_root.display()
+            )
+        } else {
+            if total_matches >= GREP_MAX_MATCHES {
+                matches.push(format!("... (capped at {} matches)", GREP_MAX_MATCHES));
+            }
+            format!(
+                "🔍 {} match(es) for '{}':\n{}",
+                total_matches,
+                pattern,
+                matches.join("\n")
+            )
+        }
     }
 }
 

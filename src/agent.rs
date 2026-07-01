@@ -861,14 +861,28 @@ History:
         // Wiki flag: when wiki=true is set on read/write/patch/list, route to the
         // session's private wiki directory instead of the workspace.
         // Wiki writes are always allowed (no approval needed) — it's the agent's own scratchpad.
-        let is_wiki = args.get("wiki").and_then(|v| v.as_bool()).unwrap_or(false);
+        let is_wiki = args.get("wiki").map_or(false, |v| {
+            if let Some(b) = v.as_bool() {
+                b
+            } else if let Some(s) = v.as_str() {
+                matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+            } else if let Some(n) = v.as_i64() {
+                n != 0
+            } else {
+                false
+            }
+        });
         if is_wiki && matches!(name, "read" | "write" | "patch" | "list") {
             if let Some(s) = &self.session {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 match name {
                     "read" => {
                         let lines = args.get("lines").and_then(|v| v.as_str());
-                        let full = args.get("full").and_then(|v| v.as_bool()).unwrap_or(false);
+                        let full = args.get("full").map_or(false, |v| {
+                            if let Some(b) = v.as_bool() { b } else if let Some(s) = v.as_str() {
+                                matches!(s.trim().to_lowercase().as_str(), "true"|"1"|"yes")
+                            } else if let Some(n) = v.as_i64() { n != 0 } else { false }
+                        });
                         let limit = self.config.context_budget.read_line_limit;
                         return Some(s.read_wiki_file(path, lines, full, limit));
                     }
