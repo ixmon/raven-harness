@@ -22,6 +22,7 @@ url = "2.5"
 html-escape = "0.2"
 chrono = { version = "0.4", features = ["serde"] }
 ratatui = "0.29"
+ratatui-core = "0.1"
 crossterm = "0.28"
 # Markdown rendering for llm-wiki viewer (pulldown-cmark under the hood).
 # tui-markdown provides a convenient widget that turns md into ratatui Text.

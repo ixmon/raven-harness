@@ -2249,6 +2249,7 @@ dependencies = [
  "image 0.24.9",
  "rand 0.8.6",
  "ratatui",
+ "ratatui-core",
  "ratatui-image",
  "regex",
  "reqwest",

@@ -50,6 +50,13 @@ pub enum PickerFocus {
     Summary,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SummaryAction {
+    #[default]
+    ViewWiki,
+    Launch,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct WikiLink {
     pub text: String,
@@ -75,6 +82,7 @@ pub struct PickerState {
     pub wiki_content_start: usize, // line index in summary where wiki content (after --- header) starts
     pub last_summary_height: u16, // for better visible window in active link calc
     pub show_wiki_in_summary: bool, // hide wiki preview behind "Wiki" link initially
+    pub summary_action: SummaryAction,
     // For "Add workspace" flow
     pub adding_workspace: bool,
     pub confirm_trust_path: Option<std::path::PathBuf>,
@@ -274,6 +282,7 @@ impl App {
                 p.wiki_content_start = 0;
                 p.last_summary_height = 20;
                 p.show_wiki_in_summary = false;
+                p.summary_action = SummaryAction::ViewWiki;
                 p
             },
         }
@@ -894,8 +903,8 @@ impl App {
             let recent_turns_summary = meta.recent_turns_summary.clone();
             let repo_short = meta.repo_cache.short_summary.clone();
 
-            let wiki_section = if self.picker.show_wiki_in_summary {
-                // Load specific wiki file for multi-doc support (links between pages)
+            let summary_text = if self.picker.show_wiki_in_summary {
+                // When Wiki button active, show ONLY the wiki markdown, no session meta
                 let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
                 let path = std::path::PathBuf::from(&home)
                     .join(".raven-hotel").join("sessions").join(&session_id)
@@ -904,14 +913,15 @@ impl App {
                     Ok(c) => {
                         self.picker.current_wiki_content = c.clone();
                         self.picker.wiki_links = Self::parse_wiki_links(&c);
+                        self.picker.wiki_content_start = 0;
+                        self.recompute_active_link();
 
-                        // full when focused on Summary for browsing
                         let head = if self.picker.focus == PickerFocus::Summary {
                             c.clone()
                         } else {
                             c.lines().take(100).collect::<Vec<_>>().join("\n")
                         };
-                        format!("\n\n--- {} ---\n{}", wiki_file, head)
+                        head  // pure content for clean wiki display (no meta, no header line)
                     }
                     Err(_) => {
                         self.picker.current_wiki_content.clear();
@@ -919,34 +929,42 @@ impl App {
                         self.picker.active_link_idx = 0;
                         self.picker.wiki_content_start = 0;
                         self.recompute_active_link();
-                        "\n\n(no wiki content)".to_string()
+                        "(no wiki content)".to_string()
                     },
                 }
             } else {
-                format!("\n\nWiki (press 'w' to view {})", wiki_file)
+                // Normal session meta text
+                let tests = if meta.achievement_tests.is_empty() {
+                    "  (none)".to_string()
+                } else {
+                    meta.achievement_tests.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
+                };
+                let pitfalls = if meta.pitfalls.is_empty() {
+                    "  (none)".to_string()
+                } else {
+                    meta.pitfalls.iter().map(|p| format!("  - {}", p)).collect::<Vec<_>>().join("\n")
+                };
+                let discoveries = if meta.discoveries.is_empty() {
+                    "  (none)".to_string()
+                } else {
+                    meta.discoveries.iter().map(|d| format!("  - {}", d)).collect::<Vec<_>>().join("\n")
+                };
+                format!(
+                    "Session: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}",
+                    session_id,
+                    workspace.display(),
+                    agent_mode,
+                    updated_at,
+                    current_goal,
+                    tests,
+                    pitfalls,
+                    discoveries,
+                    recent_turns_summary,
+                    repo_short
+                )
             };
 
-            self.picker.summary = format!(
-                "Session: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}{}\n\nLaunch (Enter to open session in main view)",
-                session_id,
-                workspace.display(),
-                agent_mode,
-                updated_at,
-                current_goal,
-                tests,
-                pitfalls,
-                discoveries,
-                recent_turns_summary,
-                repo_short,
-                wiki_section
-            );
-            // Compute where the wiki content starts in the summary lines (after the --- header)
-            let summary_lines: Vec<&str> = self.picker.summary.lines().collect();
-            self.picker.wiki_content_start = summary_lines
-                .iter()
-                .position(|l| l.starts_with("--- "))
-                .map_or(0, |pos| pos + 1);
-            self.recompute_active_link();
+            self.picker.summary = summary_text;
         } else if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
             self.picker.summary = format!(
                 "Workspace: {}\n\nNo session selected.\n\nUse 'n' to create a new session,\n'a' to add new workspace,\n'd' to delete current."
@@ -1128,6 +1146,7 @@ impl App {
                             self.picker.summary_scroll = 0;
                             self.picker.current_wiki_file = "index.md".to_string();
                             self.picker.show_wiki_in_summary = false;
+                            self.picker.summary_action = SummaryAction::ViewWiki;
                             self.refresh_picker_summary();
                         }
                     }
@@ -1155,6 +1174,7 @@ impl App {
                             self.picker.summary_scroll = 0;
                             self.picker.current_wiki_file = "index.md".to_string();
                             self.picker.show_wiki_in_summary = false;
+                            self.picker.summary_action = SummaryAction::ViewWiki;
                             self.refresh_picker_summary();
                         }
                     }
@@ -1168,6 +1188,11 @@ impl App {
                 true
             }
             KeyCode::Left | KeyCode::Char('h') => {
+                if self.picker.focus == PickerFocus::Summary {
+                    self.picker.summary_action = SummaryAction::ViewWiki;
+                    self.needs_redraw = true;
+                    return true;
+                }
                 match self.picker.focus {
                     PickerFocus::Sessions => {
                         self.picker.focus = PickerFocus::Workspaces;
@@ -1183,6 +1208,11 @@ impl App {
                 true
             }
             KeyCode::Right | KeyCode::Char('l') => {
+                if self.picker.focus == PickerFocus::Summary {
+                    self.picker.summary_action = SummaryAction::Launch;
+                    self.needs_redraw = true;
+                    return true;
+                }
                 match self.picker.focus {
                     PickerFocus::Workspaces => {
                         self.picker.focus = PickerFocus::Sessions;
@@ -1208,12 +1238,23 @@ impl App {
                         self.activate_selected_session(agent);
                     }
                     PickerFocus::Summary => {
-                        if self.picker.show_wiki_in_summary {
-                            // follow link inside the wiki
-                            self.follow_wiki_link_in_summary();
-                        } else {
-                            // Launch / activate the session -> main workspace view (conversation + thinking panes)
-                            self.activate_selected_session(agent);
+                        match self.picker.summary_action {
+                            SummaryAction::ViewWiki => {
+                                if self.picker.show_wiki_in_summary && !self.picker.wiki_links.is_empty() {
+                                    // Wiki is showing and has links — follow the active one
+                                    self.follow_wiki_link_in_summary();
+                                } else {
+                                    // Toggle wiki view on/off
+                                    self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
+                                    if self.picker.show_wiki_in_summary {
+                                        self.refresh_picker_summary();
+                                        self.recompute_active_link();
+                                    }
+                                }
+                            }
+                            SummaryAction::Launch => {
+                                self.activate_selected_session(agent);
+                            }
                         }
                     }
                     _ => {
@@ -1221,6 +1262,41 @@ impl App {
                     }
                 }
                 self.needs_redraw = true;
+                true
+            }
+            KeyCode::Tab => {
+                // Cycle active link in wiki mode
+                if self.picker.focus == PickerFocus::Summary
+                    && self.picker.show_wiki_in_summary
+                    && !self.picker.wiki_links.is_empty()
+                {
+                    self.picker.active_link_idx =
+                        (self.picker.active_link_idx + 1) % self.picker.wiki_links.len();
+                    // Scroll to make the active link visible
+                    if let Some(link) = self.picker.wiki_links.get(self.picker.active_link_idx) {
+                        let visible_h = self.picker.last_summary_height.max(5) as usize;
+                        if link.line < self.picker.summary_scroll
+                            || link.line >= self.picker.summary_scroll + visible_h
+                        {
+                            self.picker.summary_scroll = link.line.saturating_sub(2);
+                        }
+                    }
+                    self.needs_redraw = true;
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                // Navigate back to index.md in wiki mode
+                if self.picker.focus == PickerFocus::Summary
+                    && self.picker.show_wiki_in_summary
+                    && self.picker.current_wiki_file != "index.md"
+                {
+                    self.picker.current_wiki_file = "index.md".to_string();
+                    self.picker.summary_scroll = 0;
+                    self.refresh_picker_summary();
+                    self.recompute_active_link();
+                    self.needs_redraw = true;
+                }
                 true
             }
             KeyCode::Char('a') | KeyCode::Char('A') => {
@@ -1268,8 +1344,12 @@ impl App {
             }
             KeyCode::Char('w') | KeyCode::Char('W') => {
                 if self.picker.focus == PickerFocus::Summary {
+                    self.picker.summary_action = SummaryAction::ViewWiki;
                     self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
-                    self.refresh_picker_summary();
+                    if self.picker.show_wiki_in_summary {
+                        self.refresh_picker_summary();
+                        self.recompute_active_link();
+                    }
                     self.needs_redraw = true;
                     return true;
                 } else if self.picker.focus == PickerFocus::Sessions {

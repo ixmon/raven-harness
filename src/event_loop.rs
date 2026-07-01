@@ -580,6 +580,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         summary_scroll: app.picker.summary_scroll,
                         wiki_links: &app.picker.wiki_links,
                         active_link_idx: app.picker.active_link_idx,
+                        summary_action: app.picker.summary_action,
                     },
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,
