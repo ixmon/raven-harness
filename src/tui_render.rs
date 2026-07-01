@@ -1431,12 +1431,11 @@ fn draw_session_summary(
                 }
             }
 
-            let t_spans: Vec<Span> = raw_line
-                .spans
-                .into_iter()
-                .map(|s| Span::styled(truncate_str(&s.content, content_area.width as usize - 2), s.style))
-                .collect();
-            text.lines.push(Line::from(t_spans));
+            text.lines.push(Line::from(
+                raw_line.spans.into_iter()
+                    .map(|s| Span::styled(s.content.to_string(), s.style))
+                    .collect::<Vec<Span>>()
+            ));
         }
     } else {
         // Session meta text (when Wiki button not active)
