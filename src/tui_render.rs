@@ -1591,17 +1591,13 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     }
 
     for line in md_text.lines.into_iter().skip(start).take(max) {
-        let tline = Line::from(
-            line.spans.into_iter().map(|s| {
-                Span::styled(truncate_str(&s.content, content_area.width as usize - 4), s.style)
-            }).collect::<Vec<_>>()
-        );
-        content_text.lines.push(tline);
+        content_text.lines.push(line);
     }
 
+    // No Wrap — our renderer controls line layout (tables rely on exact alignment).
+    // ratatui clips lines at the widget edge when wrap is disabled.
     let content_para = Paragraph::new(content_text)
-        .block(Block::default().title(" Wiki ").borders(Borders::ALL).border_style(content_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))))
-        .wrap(Wrap { trim: false });
+        .block(Block::default().title(" Wiki ").borders(Borders::ALL).border_style(content_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))));
     f.render_widget(content_para, content_area);
 }
 
@@ -1944,8 +1940,7 @@ fn draw_session_summary(
                 .border_type(BorderType::Rounded)
                 .border_style(border_style)
                 .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
-        )
-        .wrap(Wrap { trim: false });
+        );
     f.render_widget(para, content_area);
 
     // Render buttons at the bottom
