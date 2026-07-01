@@ -1073,6 +1073,20 @@ impl App {
         }
     }
 
+    /// Light scroll: if the currently selected nav item is in the current file
+    /// (a heading or same-file link), scroll content to its position.
+    /// Does NOT load files or rebuild nav — safe for Up/Down browsing.
+    fn scroll_to_nav_if_current_file(&mut self) {
+        if let Some(item) = self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav) {
+            let clean_target = Self::normalize_wiki_path(&item.target_file);
+            let clean_cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+            if clean_target == clean_cur {
+                self.wiki_viewer.scroll = item.scroll_to;
+            }
+            // If it's a different file, don't scroll — user must Enter to load it
+        }
+    }
+
     fn align_picker_to_wiki_session(&mut self) {
         let want = self.wiki_viewer.session_id.clone();
         // find in current sessions list
@@ -1125,8 +1139,11 @@ impl App {
                 if self.wiki_viewer.focus == WikiFocus::Nav {
                     if !self.wiki_viewer.nav_items.is_empty() {
                         let n = self.wiki_viewer.nav_items.len();
-                        let idx = if self.wiki_viewer.selected_nav == 0 { n - 1 } else { self.wiki_viewer.selected_nav - 1 };
-                        self.apply_wiki_nav_selection(idx);
+                        self.wiki_viewer.selected_nav =
+                            if self.wiki_viewer.selected_nav == 0 { n - 1 }
+                            else { self.wiki_viewer.selected_nav - 1 };
+                        // Scroll content if the item is in the current file (heading/link)
+                        self.scroll_to_nav_if_current_file();
                         self.needs_redraw = true;
                     }
                 } else {
@@ -1139,8 +1156,9 @@ impl App {
                 if self.wiki_viewer.focus == WikiFocus::Nav {
                     if !self.wiki_viewer.nav_items.is_empty() {
                         let n = self.wiki_viewer.nav_items.len();
-                        let idx = (self.wiki_viewer.selected_nav + 1) % n;
-                        self.apply_wiki_nav_selection(idx);
+                        self.wiki_viewer.selected_nav = (self.wiki_viewer.selected_nav + 1) % n;
+                        // Scroll content if the item is in the current file (heading/link)
+                        self.scroll_to_nav_if_current_file();
                         self.needs_redraw = true;
                     }
                 } else {
@@ -1158,7 +1176,7 @@ impl App {
                         self.wiki_viewer.focus = WikiFocus::Content;
                     } else {
                         self.wiki_viewer.selected_nav = next;
-                        self.apply_wiki_nav_selection(next);
+                        self.scroll_to_nav_if_current_file();
                     }
                     self.needs_redraw = true;
                 } else {
