@@ -391,7 +391,7 @@ pub fn grep_files(
             } else {
                 // Context mode: read all lines, emit context windows
                 let reader = BufReader::new(file);
-                let lines: Vec<String> = reader.lines().filter_map(|l| l.ok()).collect();
+                let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
                 let n = lines.len();
                 let mut last_printed_end = 0usize; // track to avoid duplicate context
 
@@ -404,11 +404,11 @@ pub fn grep_files(
                             matches.push("--".to_string());
                         }
                         let print_start = ctx_start.max(last_printed_end);
-                        for j in print_start..ctx_end {
+                        for (j, line) in lines.iter().enumerate().take(ctx_end).skip(print_start) {
                             let marker = if j == i { ">" } else { " " };
                             matches.push(format!(
                                 "{}{}:{}: {}",
-                                marker, rel.display(), j + 1, lines[j].trim()
+                                marker, rel.display(), j + 1, line.trim()
                             ));
                         }
                         last_printed_end = ctx_end;

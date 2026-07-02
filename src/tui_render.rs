@@ -118,8 +118,8 @@ fn wiki_render_markdown(md: &str) -> Text<'static> {
         }
 
         // ── Blockquotes ──
-        if trimmed.starts_with('>') {
-            let content = trimmed[1..].trim_start();
+        if let Some(stripped) = trimmed.strip_prefix('>') {
+            let content = stripped.trim_start();
             let mut spans = vec![Span::styled("▎ ", md_style::blockquote())];
             spans.extend(parse_inline(content, md_style::blockquote()));
             lines.push(Line::from(spans));
@@ -1146,7 +1146,7 @@ fn render_scrollable_pane(
             visual_lines += 1; // empty line still takes 1 row
         } else {
             // Ceiling division: how many rows does this line occupy?
-            visual_lines += ((line_width + inner_width - 1) / inner_width) as u16;
+            visual_lines += line_width.div_ceil(inner_width) as u16;
         }
     }
     let line_count = visual_lines;
@@ -2325,7 +2325,7 @@ fn render_scrollable_pane_buf(
         if line_width == 0 {
             visual_lines += 1;
         } else {
-            visual_lines += ((line_width + inner_width - 1) / inner_width) as u16;
+            visual_lines += line_width.div_ceil(inner_width) as u16;
         }
     }
     let line_count = visual_lines;

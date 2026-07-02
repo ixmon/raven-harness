@@ -536,7 +536,7 @@ async fn handle_input_key(
                                                 raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
                                                     let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
                                                         name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: NEEDS_WORK — nudging agent"),
+                                                        summary: "🔍 Super Judge: NEEDS_WORK — nudging agent".to_string(),
                                                     }).await;
                                                     // Inject feedback and re-run
                                                     let nudge = format!(

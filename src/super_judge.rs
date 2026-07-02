@@ -110,7 +110,7 @@ pub fn build_review_prompt(
         for indicator in &spiral_indicators {
             prompt.push_str(&format!("- {}\n", indicator));
         }
-        prompt.push_str("\n");
+        prompt.push('\n');
     }
 
     prompt.push_str("## Your task\n");
@@ -307,6 +307,12 @@ pub struct SuperJudgeObserver;
 impl SuperJudgeObserver {
     pub fn new() -> Self {
         Self
+    }
+}
+
+impl Default for SuperJudgeObserver {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

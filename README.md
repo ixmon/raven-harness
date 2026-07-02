@@ -105,6 +105,15 @@ RAVEN_VAULT_PASSWORD=mypassword cargo run -q --
 
 **Always use `cargo run -q`** for interactive sessions. Plain `cargo run` dumps compiler output before the TUI can take over the alternate screen.
 
+## For AI Coding Agents
+
+See [AGENTS.md](AGENTS.md) for specific instructions, including the required build hygiene checks that must pass before any PR:
+
+- `cargo check --no-default-features` → no errors
+- `cargo clippy --no-default-features -- -D warnings` → no warnings or errors
+
+These checks should be run from inside the `tui/` directory.
+
 ## Features
 
 ### Multi-Endpoint Management (`/settings`)

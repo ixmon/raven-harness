@@ -730,7 +730,7 @@ impl Session {
         let target = if r.is_empty() {
             root.clone()
         } else {
-            root.join(r.trim_start_matches(|c| matches!(c, '/' | '\\')))
+            root.join(r.trim_start_matches(['/', '\\']))
         };
         match fs::read_dir(&target) {
             Ok(rd) => {
@@ -775,7 +775,7 @@ impl Session {
             }
             if s == before { break; }
         }
-        s.trim_start_matches(|c: char| matches!(c, '/' | '\\' | '.')).to_string()
+        s.trim_start_matches(['/', '\\', '.']).to_string()
     }
 }
 

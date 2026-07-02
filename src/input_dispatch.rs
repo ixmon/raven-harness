@@ -403,6 +403,7 @@ While agent is running:
 Tip: type / then use ↑↓ to browse, Tab to complete.";
 
 /// Apply settings-side-effect actions to the App UI fields.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_settings_actions(
     actions: Vec<crate::settings_modal::SettingsAction>,
     left_committed: &mut Vec<String>,

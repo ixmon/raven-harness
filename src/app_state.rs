@@ -313,17 +313,16 @@ impl App {
             cached_agent_mode: "talk".into(),
             desktop: DesktopState::new(),
             raven_art: crate::desktop::load_raven_art(),
-            picker: {
-                let mut p = PickerState::default();
-                p.current_wiki_file = "index.md".to_string();
-                p.current_wiki_content = String::new();
-                p.wiki_links = vec![];
-                p.active_link_idx = 0;
-                p.wiki_content_start = 0;
-                p.last_summary_height = 20;
-                p.show_wiki_in_summary = false;
-                p.summary_action = SummaryAction::ViewWiki;
-                p
+            picker: PickerState {
+                current_wiki_file: "index.md".to_string(),
+                current_wiki_content: String::new(),
+                wiki_links: vec![],
+                active_link_idx: 0,
+                wiki_content_start: 0,
+                last_summary_height: 20,
+                show_wiki_in_summary: false,
+                summary_action: SummaryAction::ViewWiki,
+                ..Default::default()
             },
             wiki_viewer: WikiViewerState::default(),
         }
@@ -969,14 +968,12 @@ impl App {
         while s.starts_with("./") {
             s = s[2..].to_string();
         }
-        s = s.trim_start_matches(|c: char| c == '/' || c == '\\').to_string();
+        s = s.trim_start_matches(['/', '\\']).to_string();
         if s.is_empty() {
             return "index.md".to_string();
         }
-        if !s.ends_with(".md") {
-            if !s.contains('.') || s.ends_with('/') {
-                s.push_str(".md");
-            }
+        if !s.ends_with(".md") && (!s.contains('.') || s.ends_with('/')) {
+            s.push_str(".md");
         }
         s
     }
@@ -1005,15 +1002,10 @@ impl App {
 
         for (i, line) in content.lines().enumerate() {
             // Check for heading
-            let heading = if let Some(h) = line.strip_prefix("# ") {
-                Some((h.trim().to_string(), 0))
-            } else if let Some(h) = line.strip_prefix("## ") {
-                Some((format!("  {}", h.trim()), 2))
-            } else if let Some(h) = line.strip_prefix("### ") {
-                Some((format!("    {}", h.trim()), 4))
-            } else {
-                None
-            };
+            let heading = line.strip_prefix("# ")
+                .map(|h| (h.trim().to_string(), 0))
+                .or_else(|| line.strip_prefix("## ").map(|h| (format!("  {}", h.trim()), 2)))
+                .or_else(|| line.strip_prefix("### ").map(|h| (format!("    {}", h.trim()), 4)));
 
             if let Some((label, indent)) = heading {
                 current_heading_indent = indent;
@@ -1150,12 +1142,12 @@ impl App {
                 if self.wiki_viewer.focus == WikiFocus::Nav {
                     self.desktop.exit_wiki_viewer_to_picker();
                     self.needs_redraw = true;
-                    return true;
+                    true
                 } else {
                     // move to nav
                     self.wiki_viewer.focus = WikiFocus::Nav;
                     self.needs_redraw = true;
-                    return true;
+                    true
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => {
@@ -1163,11 +1155,11 @@ impl App {
                     // Rightmost pane — move to workspace screen
                     self.desktop.exit_wiki_viewer_to_workspace();
                     self.needs_redraw = true;
-                    return true;
+                    true
                 } else {
                     self.wiki_viewer.focus = WikiFocus::Content;
                     self.needs_redraw = true;
-                    return true;
+                    true
                 }
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1433,7 +1425,7 @@ impl App {
             self.picker.active_link_idx = 0;
             return;
         }
-        let total_scroll = self.picker.summary_scroll as usize;
+        let total_scroll = self.picker.summary_scroll;
         let wiki_scroll = total_scroll.saturating_sub(self.picker.wiki_content_start);
         let visible_h = self.picker.last_summary_height.max(5) as usize;
         self.picker.active_link_idx = 0;
@@ -1774,12 +1766,7 @@ impl App {
                 true
             }
             KeyCode::PageUp => {
-                if self.picker.focus == PickerFocus::Sessions {
-                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(12);
-                    self.recompute_active_link();
-                    self.needs_redraw = true;
-                    return true;
-                } else if self.picker.focus == PickerFocus::Summary {
+                if self.picker.focus == PickerFocus::Sessions || self.picker.focus == PickerFocus::Summary {
                     self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(12);
                     self.recompute_active_link();
                     self.needs_redraw = true;
@@ -1788,12 +1775,7 @@ impl App {
                 false
             }
             KeyCode::PageDown => {
-                if self.picker.focus == PickerFocus::Sessions {
-                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(12);
-                    self.recompute_active_link();
-                    self.needs_redraw = true;
-                    return true;
-                } else if self.picker.focus == PickerFocus::Summary {
+                if self.picker.focus == PickerFocus::Sessions || self.picker.focus == PickerFocus::Summary {
                     self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(12);
                     self.recompute_active_link();
                     self.needs_redraw = true;
