@@ -54,7 +54,16 @@ pub async fn handle_key_event(
             .await?;
         }
         Event::Paste(data) => {
-            handle_paste(app, &data);
+            if app.settings.active && matches!(
+                app.settings.mode,
+                crate::settings_modal::SettingsMode::Adding
+                | crate::settings_modal::SettingsMode::Editing
+                | crate::settings_modal::SettingsMode::BraveKey
+            ) {
+                handle_settings_paste(&mut app.settings, &data);
+            } else {
+                handle_paste(app, &data);
+            }
             handled = true;
         }
         Event::Resize(_width, _height) => {
@@ -650,6 +659,17 @@ pub fn handle_paste(app: &mut App, data: &str) {
     app.history_index = None;
     clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
     app.needs_redraw = true;
+}
+
+/// Handle paste into settings modal edit buffer.
+fn handle_settings_paste(settings: &mut crate::settings_modal::SettingsModal, data: &str) {
+    let sanitized: String = data
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if !sanitized.is_empty() {
+        settings.apply_edit_action(EditAction::InsertStr(sanitized));
+    }
 }
 
 /// Schedule a balance refresh.
