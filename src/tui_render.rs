@@ -1131,9 +1131,26 @@ fn render_scrollable_pane(
     title_color: Color,
     subtitle: Option<String>,
 ) {
-    let line_count = text.lines.len() as u16;
-    *last_line_count = line_count;
+    // Compute *visual* line count (accounting for wrapping).
+    // The Paragraph widget uses Wrap { trim: false }, so lines longer
+    // than the content width wrap to multiple visual lines. We must count
+    // wrapped lines for correct scroll limits; otherwise the max scroll
+    // is too small and you can never reach the bottom.
     let content_height = area.height.saturating_sub(2);
+    // Inner width = area width minus borders (2) minus horizontal padding (2)
+    let inner_width = area.width.saturating_sub(4).max(1) as usize;
+    let mut visual_lines: u16 = 0;
+    for line in text.lines.iter() {
+        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if line_width == 0 {
+            visual_lines += 1; // empty line still takes 1 row
+        } else {
+            // Ceiling division: how many rows does this line occupy?
+            visual_lines += ((line_width + inner_width - 1) / inner_width) as u16;
+        }
+    }
+    let line_count = visual_lines;
+    *last_line_count = line_count;
     let max_scroll = line_count.saturating_sub(content_height);
     if follow_output {
         *scroll = max_scroll;
@@ -2300,7 +2317,18 @@ fn render_scrollable_pane_buf(
     title_color: Color,
     subtitle: Option<String>,
 ) {
-    let line_count = text.lines.len() as u16;
+    // Compute visual (wrapped) line count — same as render_scrollable_pane
+    let inner_width = area.width.saturating_sub(4).max(1) as usize;
+    let mut visual_lines: u16 = 0;
+    for line in text.lines.iter() {
+        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if line_width == 0 {
+            visual_lines += 1;
+        } else {
+            visual_lines += ((line_width + inner_width - 1) / inner_width) as u16;
+        }
+    }
+    let line_count = visual_lines;
     *last_line_count = line_count;
     *scroll = (*scroll).min(line_count.saturating_sub(1));
 

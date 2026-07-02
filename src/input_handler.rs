@@ -315,18 +315,9 @@ async fn handle_input_key(
                 return Ok(true);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let pane = app.focused_pane;
-                if matches!(pane, crate::app_state::Pane::Left | crate::app_state::Pane::Right) {
-                    let curr = if pane == crate::app_state::Pane::Left { app.left_scroll } else { app.right_scroll };
-                    let maxs = app.pane_max_scroll(pane);
-                    if curr >= maxs {
-                        app.focused_pane = crate::app_state::Pane::Input;
-                    } else {
-                        app.scroll_focused_line(1);
-                    }
-                    app.needs_redraw = true;
-                    return Ok(true);
-                }
+                app.scroll_focused_line(1);
+                app.needs_redraw = true;
+                return Ok(true);
             }
             _ => {}
         }
