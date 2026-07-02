@@ -206,6 +206,22 @@ pub async fn run(
     chat_backend: ChatBackend,
     keystore: Keystore,
 ) -> Result<()> {
+    // Install a panic hook that restores the terminal before the default
+    // panic handler runs. This prevents raw panic messages (and any other
+    // stderr from worker threads) from corrupting the TUI display.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Best-effort terminal restore (may be called from any thread).
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
+        // Then let the original handler (which does the eprintln + backtrace) run.
+        original_hook(panic_info);
+    }));
+
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     crossterm::execute!(
