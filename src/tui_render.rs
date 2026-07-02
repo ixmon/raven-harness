@@ -128,7 +128,7 @@ fn wiki_render_markdown(md: &str) -> Text<'static> {
         }
 
         // ── Unordered lists ──
-        if (trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ")) {
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
             let indent = raw.len() - raw.trim_start().len();
             let content = &trimmed[2..];
             let prefix = " ".repeat(indent) + "• ";

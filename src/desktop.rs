@@ -99,6 +99,7 @@ impl DesktopState {
         self.active == ActiveDesktop::WikiViewer && !self.is_animating()
     }
 
+    #[allow(dead_code)]
     pub fn can_enter_wiki_viewer(&self) -> bool {
         !self.is_animating() && (self.active == ActiveDesktop::Picker || self.active == ActiveDesktop::Workspace)
     }
