@@ -999,11 +999,11 @@ impl App {
         // Headings from current document (h1-h3, indented by level)
         for (i, line) in content.lines().enumerate() {
             let entry = if let Some(h) = line.strip_prefix("# ") {
-                Some((format!("# {}", h.trim()), 0))
+                Some((h.trim().to_string(), 0))
             } else if let Some(h) = line.strip_prefix("## ") {
-                Some((format!("  ## {}", h.trim()), 0))
+                Some((format!("  {}", h.trim()), 0))
             } else if let Some(h) = line.strip_prefix("### ") {
-                Some((format!("    ### {}", h.trim()), 0))
+                Some((format!("    {}", h.trim()), 0))
             } else {
                 None
             };

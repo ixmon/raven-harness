@@ -1516,7 +1516,7 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     for (i, item) in viewer.nav_items.iter().enumerate().skip(nav_off).take(nav_vis) {
         let is_sel = i == sel;
         let style = if is_sel {
-            Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
         } else {
             match item.kind {
                 crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
