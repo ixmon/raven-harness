@@ -996,18 +996,26 @@ impl App {
 
         let content = &self.wiki_viewer.content;
 
-        // Headings from current document (h1-h3, indented by level)
+        // Build nav in document order — headings with links interleaved underneath.
+        // Track the current heading's indent depth so links get one level deeper.
+        let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)").ok();
+        let wikilink_re = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]").ok();
+        let mut current_heading_indent = 0usize; // indent of most recent heading (0/2/4)
+
         for (i, line) in content.lines().enumerate() {
-            let entry = if let Some(h) = line.strip_prefix("# ") {
+            // Check for heading
+            let heading = if let Some(h) = line.strip_prefix("# ") {
                 Some((h.trim().to_string(), 0))
             } else if let Some(h) = line.strip_prefix("## ") {
-                Some((format!("  {}", h.trim()), 0))
+                Some((format!("  {}", h.trim()), 2))
             } else if let Some(h) = line.strip_prefix("### ") {
-                Some((format!("    {}", h.trim()), 0))
+                Some((format!("    {}", h.trim()), 4))
             } else {
                 None
             };
-            if let Some((label, _)) = entry {
+
+            if let Some((label, indent)) = heading {
+                current_heading_indent = indent;
                 items.push(WikiNavItem {
                     label,
                     target_file: cur.clone(),
@@ -1015,33 +1023,29 @@ impl App {
                     kind: NavItemKind::Header,
                 });
             }
-        }
 
-        // Outgoing markdown links [text](*.md)
-        if let Ok(re) = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)") {
-            for (i, line) in content.lines().enumerate() {
+            // Collect links from this line, indented one level deeper than parent heading
+            let link_indent = " ".repeat(current_heading_indent + 4);
+            if let Some(ref re) = link_re {
                 for cap in re.captures_iter(line) {
                     let text = cap.get(1).map_or("", |m| m.as_str()).to_string();
                     let mut tgt = cap.get(2).map_or("", |m| m.as_str()).to_string();
                     if let Some(hpos) = tgt.find('#') { tgt = tgt[..hpos].to_string(); }
                     let clean_tgt = Self::normalize_wiki_path(&tgt);
                     items.push(WikiNavItem {
-                        label: format!("→ {}", text),
+                        label: format!("{}→ {}", link_indent, text),
                         target_file: clean_tgt,
                         scroll_to: i,
                         kind: NavItemKind::Link,
                     });
                 }
             }
-        }
-        // Wiki-style links [[target]]
-        if let Ok(re) = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]") {
-            for (i, line) in content.lines().enumerate() {
+            if let Some(ref re) = wikilink_re {
                 for cap in re.captures_iter(line) {
                     let tgt = cap.get(1).map_or("", |m| m.as_str()).to_string();
                     let clean_tgt = Self::normalize_wiki_path(&tgt);
                     items.push(WikiNavItem {
-                        label: format!("→ {}", clean_tgt.trim_end_matches(".md")),
+                        label: format!("{}→ {}", link_indent, clean_tgt.trim_end_matches(".md")),
                         target_file: clean_tgt,
                         scroll_to: i,
                         kind: NavItemKind::Link,
