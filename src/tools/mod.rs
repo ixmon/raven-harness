@@ -12,7 +12,7 @@ use serde_json::json;
 
 pub use self::exec::exec;
 pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
-pub use self::web::{browse, web_search};
+pub use self::web::{browse, browse_urls, web_search};
 
 pub mod backend;
 
@@ -180,6 +180,21 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
         ToolDef {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
+                name: "browse_urls".into(),
+                description: "Fetch and extract content from multiple URLs in parallel. Use after web_search to read the most promising results at once.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "urls": { "type": "array", "items": { "type": "string" }, "description": "List of full http(s) URLs to fetch" },
+                        "extract": { "type": "string", "description": "text (default), links, or html" }
+                    },
+                    "required": ["urls"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
                 name: "update_goal".into(),
                 description: "Update the tracked goal for this session, plus optional achievement tests and pitfalls. Call this when the user's intent clearly shifts or is refined.".into(),
                 parameters: json!({
@@ -271,9 +286,10 @@ pub async fn execute(
     arguments: &str,
     workspace: &std::path::Path,
     max_read_lines: usize,
+    brave_key: Option<String>,
 ) -> Result<String> {
     backend
-        .execute(name, arguments, workspace, max_read_lines)
+        .execute(name, arguments, workspace, max_read_lines, brave_key)
         .await
 }
 

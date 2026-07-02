@@ -239,6 +239,11 @@ async fn run_app<B: ratatui::backend::Backend>(
     mut keystore: Keystore,
 ) -> Result<()> {
     let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(config.clone(), chat_backend)));
+    // Set Brave Search API key from keystore (or BRAVE_API_KEY env var)
+    {
+        let brave_key = keystore.get_brave_key();
+        agent.lock().await.brave_key = brave_key;
+    }
     let mut app = App::new(&config);
 
     if let Some(pfile) = &config.harness.initial_prompt_file {

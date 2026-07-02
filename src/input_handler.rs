@@ -128,6 +128,8 @@ pub async fn handle_key(
             &mut app.display_model,
             &mut app.display_budget,
             &mut app.settings,
+            agent,
+            keystore,
         );
         if endpoint_switched {
             if let Ok(ag) = agent.try_lock() {

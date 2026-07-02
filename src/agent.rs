@@ -166,6 +166,8 @@ pub struct Agent {
     logged_message_count: usize,
     /// Judge for inference-based task completion decisions
     judge: Option<crate::judge::Judge>,
+    /// Brave Search API key (decrypted, set by TUI from keystore).
+    pub brave_key: Option<String>,
 }
 
 impl Agent {
@@ -202,6 +204,7 @@ impl Agent {
             session,
             logged_message_count,
             judge: Some(Judge::new(client_arc)),
+            brave_key: None,
         }
     }
 
@@ -311,6 +314,7 @@ impl Agent {
                 &raw_args,
                 &self.config.workspace,
                 self.config.context_budget.read_line_limit,
+                self.brave_key.clone(),
             )
             .await
             .unwrap_or_else(|e| format!("❌ Tool error: {}", e));

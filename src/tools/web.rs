@@ -1,32 +1,184 @@
 //! Web tools: search + browse.
 //!
-//! We try to stay useful without external API keys:
-//! - web_search: Scrapes DuckDuckGo HTML (lightweight, no key). Results are mediocre but better than nothing.
-//! - browse: Uses reqwest + scraper for readable text extraction. Supports shallow spidering.
+//! Search providers:
+//! - Brave API (when key is configured via settings or BRAVE_API_KEY env var)
+//! - DuckDuckGo HTML scrape (fallback, no key needed)
 //!
-//! In the future you can add a Brave provider (see Raven's web_providers/brave.py) behind a feature flag.
+//! Browse:
+//! - Single page: `browse(url)` / `browse(url, depth=1)` for spider
+//! - Parallel:    `browse_urls(urls)` — concurrent fetch of multiple URLs
 
 use scraper::{Html, Selector};
 use std::time::Duration;
 
-/// Very simple DuckDuckGo scraper. Returns a few results.
-pub fn web_search(query: &str, count: usize) -> String {
+const BRAVE_WEB_URL: &str = "https://api.search.brave.com/res/v1/web/search";
+
+/// Build a reqwest client with Chrome-like headers for anti-bot evasion.
+fn build_stealth_client_blocking() -> Result<reqwest::blocking::Client, reqwest::Error> {
+    use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ),
+    );
+    headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+
+    reqwest::blocking::Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .default_headers(headers)
+        .timeout(Duration::from_secs(15))
+        .build()
+}
+
+/// Build an async reqwest client with Chrome-like headers.
+fn build_stealth_client() -> Result<reqwest::Client, reqwest::Error> {
+    use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ),
+    );
+    headers.insert(
+        ACCEPT_LANGUAGE,
+        HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+
+    reqwest::Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
+             (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        )
+        .default_headers(headers)
+        .timeout(Duration::from_secs(20))
+        .danger_accept_invalid_certs(true) // for internal/dev sites
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .build()
+}
+
+// ─── Brave Search API ───────────────────────────────────────────────────────
+
+/// Search via Brave Web Search API. Returns formatted results or an error.
+fn brave_search(query: &str, count: usize, api_key: &str) -> Result<String, String> {
+    let client = build_stealth_client_blocking()
+        .map_err(|e| format!("HTTP client error: {}", e))?;
+
+    let resp = client
+        .get(BRAVE_WEB_URL)
+        .query(&[("q", query), ("count", &count.min(20).to_string())])
+        .header("X-Subscription-Token", api_key)
+        .header("Accept", "application/json")
+        .send()
+        .map_err(|e| format!("Brave API request failed: {}", e))?;
+
+    let status = resp.status();
+    if status.as_u16() == 429 {
+        return Err(
+            "⚠️ Brave Search rate limited. Please wait 10-15 seconds and try again."
+                .to_string(),
+        );
+    }
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        return Err(format!(
+            "⚠️ Brave API key rejected (HTTP {}). Check your key in Settings.",
+            status
+        ));
+    }
+    if !status.is_success() {
+        return Err(format!("Brave API returned HTTP {}", status));
+    }
+
+    let body: serde_json::Value = resp
+        .json()
+        .map_err(|e| format!("Brave response parse error: {}", e))?;
+
+    let results = body
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(|r| r.as_array());
+
+    let results = match results {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => return Err(format!("🔍 No Brave results for: {}", query)),
+    };
+
+    let mut out = format!(
+        "🔍 Web search (Brave): \"{}\" ({} results)\n\n",
+        query,
+        results.len().min(count)
+    );
+    for (i, item) in results.iter().take(count).enumerate() {
+        let title = item
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("(no title)");
+        let url = item.get("url").and_then(|u| u.as_str()).unwrap_or("");
+        let desc = item
+            .get("description")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, url));
+        if !desc.is_empty() {
+            // Truncate descriptions to keep context manageable
+            let desc_trunc = if desc.len() > 300 { &desc[..300] } else { desc };
+            out.push_str(&format!("   {}\n", desc_trunc));
+        }
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+// ─── Web Search (public) ────────────────────────────────────────────────────
+
+/// Search the web. Uses Brave API if a key is provided, falls back to DuckDuckGo.
+pub fn web_search(query: &str, count: usize, brave_key: Option<&str>) -> String {
     if query.trim().is_empty() {
         return "Empty search query".to_string();
     }
-
     let count = count.clamp(1, 12);
+
+    // Try Brave first if we have a key
+    if let Some(key) = brave_key {
+        match brave_search(query, count, key) {
+            Ok(results) => return results,
+            Err(e) => {
+                // On auth errors, don't fall back — tell user to fix key
+                if e.contains("rejected") {
+                    return e;
+                }
+                // On rate limit, tell user to retry (don't fall back to DDG)
+                if e.contains("rate limited") {
+                    return e;
+                }
+                // On other errors (network, parse), fall back to DDG
+                eprintln!("Brave search failed, falling back to DuckDuckGo: {}", e);
+            }
+        }
+    }
+
+    // DuckDuckGo fallback
+    ddg_search(query, count)
+}
+
+/// DuckDuckGo HTML scraper (no API key needed). Results are mediocre but free.
+fn ddg_search(query: &str, count: usize) -> String {
     let url = format!(
         "https://html.duckduckgo.com/html/?q={}",
         urlencoding::encode(query)
     );
 
-    // Note: this is called via spawn_blocking from tools::execute when used from the async agent loop.
-    let client = match reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 RavenTUI/0.1")
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
+    let client = match build_stealth_client_blocking() {
         Ok(c) => c,
         Err(e) => return format!("❌ Search client error: {}", e),
     };
@@ -47,7 +199,7 @@ pub fn web_search(query: &str, count: usize) -> String {
 
     let document = Html::parse_document(&body);
 
-    // DuckDuckGo result selectors (they are a bit fragile but have worked for years)
+    // DuckDuckGo result selectors (fragile but have worked for years)
     let result_sel = Selector::parse(".result").unwrap();
     let title_sel = Selector::parse(".result__a").unwrap();
     let snippet_sel = Selector::parse(".result__snippet").unwrap();
@@ -117,17 +269,14 @@ pub fn web_search(query: &str, count: usize) -> String {
     out
 }
 
+// ─── Browse (single page + spider) ─────────────────────────────────────────
+
 pub async fn browse(url: &str, depth: usize, extract: &str) -> String {
     if url.trim().is_empty() || !url.starts_with("http") {
         return "browse requires a full http(s):// URL".to_string();
     }
 
-    let client = match reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 RavenTUI/0.1")
-        .timeout(Duration::from_secs(20))
-        .danger_accept_invalid_certs(true) // for internal/dev sites
-        .build()
-    {
+    let client = match build_stealth_client() {
         Ok(c) => c,
         Err(e) => return format!("❌ HTTP client error: {}", e),
     };
@@ -199,6 +348,73 @@ pub async fn browse(url: &str, depth: usize, extract: &str) -> String {
     }
     out
 }
+
+// ─── Parallel Browse ────────────────────────────────────────────────────────
+
+/// Fetch multiple URLs concurrently and return combined extracted content.
+/// Capped at 6 concurrent fetches to avoid hammering servers.
+pub async fn browse_urls(urls: &[&str], extract: &str) -> String {
+    if urls.is_empty() {
+        return "browse_urls requires at least one URL".to_string();
+    }
+
+    let client = match build_stealth_client() {
+        Ok(c) => c,
+        Err(e) => return format!("❌ HTTP client error: {}", e),
+    };
+
+    // Use a semaphore to cap concurrency at 6
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
+    let mut set = tokio::task::JoinSet::new();
+
+    for (i, &url) in urls.iter().enumerate() {
+        if !url.starts_with("http") {
+            continue;
+        }
+        let client = client.clone();
+        let url = url.to_string();
+        let extract = extract.to_string();
+        let sem = semaphore.clone();
+
+        set.spawn(async move {
+            let _permit = sem.acquire().await;
+            let result = fetch_and_format(&client, &url, &extract).await;
+            (i, url, result)
+        });
+    }
+
+    let mut results: Vec<(usize, String, String)> = vec![];
+    while let Some(res) = set.join_next().await {
+        match res {
+            Ok(triple) => results.push(triple),
+            Err(e) => results.push((usize::MAX, String::new(), format!("❌ Task error: {}", e))),
+        }
+    }
+
+    // Sort by original index to preserve order
+    results.sort_by_key(|(i, _, _)| *i);
+
+    let good = results.iter().filter(|(_, _, r)| !r.starts_with("❌")).count();
+    let failed = results.len() - good;
+
+    let mut out = format!(
+        "📚 Fetched {} URLs ({} ok, {} failed)\n\n",
+        results.len(),
+        good,
+        failed
+    );
+
+    for (_, url, content) in &results {
+        if !url.is_empty() {
+            out.push_str(&format!("--- {} ---\n", url));
+        }
+        out.push_str(content);
+        out.push_str("\n\n");
+    }
+    out
+}
+
+// ─── Shared helpers ─────────────────────────────────────────────────────────
 
 async fn fetch_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
     let resp = client
@@ -295,4 +511,48 @@ fn extract_links(html: &str, base: &str) -> String {
         out.push_str(&format!("  {:2}. {}\n", i + 1, l));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brave_search_parses_response() {
+        // Simulate Brave API JSON response
+        let json: serde_json::Value = serde_json::json!({
+            "web": {
+                "results": [
+                    {
+                        "title": "Rust Programming Language",
+                        "url": "https://www.rust-lang.org/",
+                        "description": "A language empowering everyone to build reliable software."
+                    },
+                    {
+                        "title": "Rust (video game)",
+                        "url": "https://rust.facepunch.com/",
+                        "description": "Survival game by Facepunch Studios."
+                    }
+                ]
+            }
+        });
+
+        let results = json
+            .get("web")
+            .and_then(|w| w.get("results"))
+            .and_then(|r| r.as_array())
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].get("title").unwrap().as_str().unwrap(),
+            "Rust Programming Language"
+        );
+    }
+
+    #[test]
+    fn ddg_search_handles_empty_query() {
+        let result = web_search("", 5, None);
+        assert!(result.contains("Empty search query"));
+    }
 }

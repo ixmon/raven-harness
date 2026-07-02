@@ -410,6 +410,8 @@ pub fn apply_settings_actions(
     display_model: &mut String,
     display_budget: &mut raven_tui::config::ContextBudget,
     settings: &mut SettingsModal,
+    agent: &Arc<Mutex<Agent>>,
+    keystore: &Keystore,
 ) {
     use crate::settings_modal::SettingsAction;
 
@@ -429,6 +431,13 @@ pub fn apply_settings_actions(
             }
             SettingsAction::ActiveIdx(idx) => {
                 settings.active_endpoint_idx = idx;
+            }
+            SettingsAction::BraveKeyUpdated => {
+                settings.brave_key_configured = keystore.has_brave_key();
+                let brave_key = keystore.get_brave_key();
+                if let Ok(mut ag) = agent.try_lock() {
+                    ag.brave_key = brave_key;
+                }
             }
         }
     }
