@@ -2,6 +2,7 @@
 //!
 //! We deliberately keep the surface small and high-signal for agentic coding:
 //! exec, read, write, patch, grep, list, web_search, browse.
+//! There is **no** `edit` tool — use `patch` for search/replace edits.
 //!
 //! Tool schemas are the standard OpenAI function format so they work with
 //! llama.cpp and other OpenAI-compatible servers (including the one used by Raven Hotel).
@@ -11,7 +12,7 @@ use serde_json::json;
 
 pub use self::exec::exec;
 pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
-pub use self::web::{browse, web_search};
+pub use self::web::{browse, browse_urls, web_search};
 
 pub mod backend;
 
@@ -63,13 +64,14 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "read".into(),
-                description: "Read a file's contents. Use lines=\"N-M\" or full=true to read more/entire file (useful for refactoring). Always read before editing.".into(),
+                description: "Read a file's contents. Set wiki=true to target the session wiki root (path relative e.g. \"index.md\"; NEVER prefix 'wiki/' or mkdir wiki/wiki). Use lines=... .".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Path to the file (relative to workspace or absolute)" },
+                        "path": { "type": "string", "description": "Relative path. If wiki=true then relative to the wiki ROOT ONLY (do not use 'wiki/xxx', 'wiki/wiki/xxx' or any prefix; just 'index.md' or 'notes/x.md')" },
                         "lines": { "type": "string", "description": "Optional range like \"10-40\" or \"1-\" for from start" },
-                        "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" }
+                        "full": { "type": "boolean", "description": "If true, read as much as possible (bypasses small default cap)" },
+                        "wiki": { "type": "boolean", "description": "If true, path is relative to the session's private research wiki (not the workspace)" }
                     },
                     "required": ["path"]
                 }),
@@ -79,12 +81,13 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "write".into(),
-                description: "Write (overwrite) a file. Prefer patch for modifications to existing code.".into(),
+                description: "Write a file. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Destination path" },
-                        "content": { "type": "string", "description": "Full file content to write" }
+                        "path": { "type": "string", "description": "Path relative to workspace or (if wiki=true) to wiki ROOT. NEVER start with 'wiki/' or 'wiki/wiki/'." },
+                        "content": { "type": "string", "description": "Full file content to write" },
+                        "wiki": { "type": "boolean", "description": "Target the session wiki (relative paths, no 'wiki/' prefix)" }
                     },
                     "required": ["path", "content"]
                 }),
@@ -94,14 +97,15 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Safe search-and-replace edit. Strongly preferred over write for modifications. Use near_line when the search text appears multiple times.".into(),
+                description: "Search/replace edit. Set wiki=true for wiki files (path e.g. 'index.md').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "File to edit" },
+                        "path": { "type": "string", "description": "File path (relative to wiki ROOT if wiki=true; NEVER start with 'wiki/' or 'wiki/wiki/')" },
                         "search": { "type": "string", "description": "Exact text to find and replace (must match precisely)" },
                         "replace": { "type": "string", "description": "Replacement text" },
-                        "near_line": { "type": "integer", "description": "Optional hint: the approximate line number of the occurrence you want (1-based)" }
+                        "near_line": { "type": "integer", "description": "Optional hint: the approximate line number of the occurrence you want (1-based)" },
+                        "wiki": { "type": "boolean", "description": "If true, patches a file in the session's private research wiki" }
                     },
                     "required": ["path", "search", "replace"]
                 }),
@@ -111,12 +115,16 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "grep".into(),
-                description: "Search for a pattern across files in the workspace. Returns matching lines with context.".into(),
+                description: "Search for a pattern across files in the workspace. Returns matching lines with context. Use include to filter by file type (e.g. '*.rs', '*.py').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Regex or literal pattern (case-insensitive)" },
-                        "path": { "type": "string", "description": "Optional subdirectory or file to limit the search" }
+                        "pattern": { "type": "string", "description": "Regex or literal pattern (case-insensitive). Use fixed=true for literal strings containing special chars." },
+                        "path": { "type": "string", "description": "Optional subdirectory or file to limit the search" },
+                        "include": { "type": "string", "description": "Glob filter e.g. '*.rs', '*.py', '*.toml'. Only search files matching this pattern." },
+                        "context": { "type": "integer", "description": "Lines of context around each match (default 0, max 5)" },
+                        "files_only": { "type": "boolean", "description": "If true, only list filenames containing matches (not the matching lines)" },
+                        "fixed": { "type": "boolean", "description": "If true, treat pattern as a literal string (no regex). Useful for searching code with special chars like foo.bar() or arr[0]." }
                     },
                     "required": ["pattern"]
                 }),
@@ -126,11 +134,12 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "list".into(),
-                description: "List files and directories in a path (relative to workspace). Great for exploration.".into(),
+                description: "List dir. wiki=true lists session wiki ROOT (path relative to it, e.g. '' or 'subdir'; do not use path='wiki/..').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory to list (default: workspace root)" }
+                        "path": { "type": "string", "description": "Subdir relative (or to wiki ROOT if wiki=true). NEVER prefix 'wiki/' or 'wiki/wiki/'." },
+                        "wiki": { "type": "boolean", "description": "List the wiki directory instead" }
                     },
                     "required": []
                 }),
@@ -168,6 +177,21 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             },
         },
         // Session / context management tools (model can call these to keep long-running work on track)
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "browse_urls".into(),
+                description: "Fetch and extract content from multiple URLs in parallel. Use after web_search to read the most promising results at once.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "urls": { "type": "array", "items": { "type": "string" }, "description": "List of full http(s) URLs to fetch" },
+                        "extract": { "type": "string", "description": "text (default), links, or html" }
+                    },
+                    "required": ["urls"]
+                }),
+            },
+        },
         ToolDef {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
@@ -212,6 +236,8 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
                 }),
             },
         },
+        // Wiki tools have been folded into read/write/patch/list via the wiki=true flag.
+        // The wiki is a private per-session markdown store for research/think/dream modes.
         // File summary cache tools — use these to avoid repeatedly reading large or unchanged source files.
         // The cache lives in ~/.raven-hotel/{session}/context.db and is keyed by (relative_path, mtime).
         ToolDef {
@@ -260,9 +286,10 @@ pub async fn execute(
     arguments: &str,
     workspace: &std::path::Path,
     max_read_lines: usize,
+    brave_key: Option<String>,
 ) -> Result<String> {
     backend
-        .execute(name, arguments, workspace, max_read_lines)
+        .execute(name, arguments, workspace, max_read_lines, brave_key)
         .await
 }
 

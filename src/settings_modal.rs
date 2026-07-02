@@ -24,6 +24,7 @@ pub enum SettingsMode {
     List,
     Adding,
     Editing,
+    BraveKey,
 }
 
 /// Mutable state for the inference-endpoints settings overlay.
@@ -47,6 +48,8 @@ pub struct SettingsModal {
     pub edit_step: usize,
     /// When editing API key, empty submit means "keep existing".
     pub edit_keep_key: bool,
+    /// Whether a Brave Search API key is configured (for display in List mode).
+    pub brave_key_configured: bool,
 }
 
 impl SettingsModal {
@@ -67,6 +70,7 @@ impl SettingsModal {
             editing_idx: None,
             edit_step: 0,
             edit_keep_key: false,
+            brave_key_configured: false,
         }
     }
 
@@ -86,6 +90,7 @@ impl SettingsModal {
         self.mode = SettingsMode::List;
         self.editing_idx = None;
         self.clear_wizard();
+        self.brave_key_configured = keystore.has_brave_key();
         self.active = true;
     }
 
@@ -289,6 +294,8 @@ pub enum SettingsAction {
         budget: ContextBudget,
     },
     ActiveIdx(usize),
+    /// Brave API key was updated — TUI should refresh agent.brave_key
+    BraveKeyUpdated,
 }
 
 pub struct SettingsHandleResult {
@@ -435,6 +442,19 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
             }
 
             modal_lines.lines.push(Line::from(""));
+
+            // Brave Search status
+            let brave_status = if settings.brave_key_configured {
+                ("🔑 Brave Search: configured", Color::Green)
+            } else {
+                ("🔍 Brave Search: not set", Color::DarkGray)
+            };
+            modal_lines.lines.push(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(brave_status.0, Style::default().fg(brave_status.1)),
+            ]));
+
+            modal_lines.lines.push(Line::from(""));
             modal_lines.lines.push(Line::from(vec![
                 Span::styled("  ↑↓ ", Style::default().fg(Color::DarkGray)),
                 Span::styled("navigate", Style::default().fg(Color::Gray)),
@@ -461,9 +481,64 @@ pub fn draw_settings_modal(f: &mut Frame, area: Rect, settings: &SettingsModal) 
                     Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled("delete", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "  B ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("brave key", Style::default().fg(Color::Gray)),
                 Span::styled("  Esc ", Style::default().fg(Color::DarkGray)),
                 Span::styled("close", Style::default().fg(Color::Gray)),
             ]));
+        }
+        SettingsMode::BraveKey => {
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Brave Search API Key",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            modal_lines.lines.push(Line::from(""));
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Get a free key at https://brave.com/search/api/",
+                Style::default().fg(Color::DarkGray),
+            )));
+            modal_lines.lines.push(Line::from(""));
+
+            // Show the edit field
+            let cursor = settings.edit_cursor.min(settings.edit_buf.len());
+            let before = settings.edit_buf[..cursor].to_string();
+            let after = settings.edit_buf[cursor..].to_string();
+            modal_lines.lines.push(Line::from(vec![
+                Span::styled(
+                    "  ▶ API Key: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(before, Style::default().fg(Color::White)),
+                Span::styled(
+                    "_",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::SLOW_BLINK),
+                ),
+                Span::styled(after, Style::default().fg(Color::White)),
+            ]));
+
+            modal_lines.lines.push(Line::from(""));
+            if settings.brave_key_configured {
+                modal_lines.lines.push(Line::from(Span::styled(
+                    "  (currently set — submit empty to remove)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            modal_lines.lines.push(Line::from(""));
+            modal_lines.lines.push(Line::from(Span::styled(
+                "  Enter save  •  Esc cancel",
+                Style::default().fg(Color::DarkGray),
+            )));
         }
     }
 
@@ -685,12 +760,70 @@ pub async fn handle_settings_key(
                     actions.push(SettingsAction::Notify("Endpoint deleted.".into()));
                 }
             }
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                settings.mode = SettingsMode::BraveKey;
+                settings.edit_buf.clear();
+                settings.edit_cursor = 0;
+            }
             KeyCode::Esc => {
                 settings.active = false;
                 actions.push(SettingsAction::Close);
             }
             _ => {}
         },
+        SettingsMode::BraveKey => {
+            if let Some(action) = map_key_to_edit(&key) {
+                settings.apply_edit_action(action);
+            } else {
+                match key.code {
+                    KeyCode::Enter => {
+                        let key_text = settings.edit_buf.trim().to_string();
+                        if key_text.is_empty() {
+                            // Remove existing key
+                            if let Err(e) = keystore.clear_brave_key() {
+                                actions.push(SettingsAction::Notify(format!(
+                                    "Failed to clear Brave key: {}",
+                                    e
+                                )));
+                            } else {
+                                actions.push(SettingsAction::Notify(
+                                    "Brave Search key removed.".into(),
+                                ));
+                                actions.push(SettingsAction::BraveKeyUpdated);
+                            }
+                        } else {
+                            if !keystore.is_unlocked() {
+                                actions.push(SettingsAction::Notify(
+                                    "Setting vault password (first key). Using 'raven' as default.".into(),
+                                ));
+                                let _ = keystore.init_password("raven");
+                            }
+                            match keystore.set_brave_key(&key_text) {
+                                Ok(()) => {
+                                    actions.push(SettingsAction::Notify(
+                                        "✅ Brave Search API key saved.".into(),
+                                    ));
+                                    actions.push(SettingsAction::BraveKeyUpdated);
+                                }
+                                Err(e) => {
+                                    actions.push(SettingsAction::Notify(format!(
+                                        "Failed to save Brave key: {}",
+                                        e
+                                    )));
+                                }
+                            }
+                        }
+                        settings.mode = SettingsMode::List;
+                        settings.clear_wizard();
+                    }
+                    KeyCode::Esc => {
+                        settings.mode = SettingsMode::List;
+                        settings.clear_wizard();
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     SettingsHandleResult { actions }

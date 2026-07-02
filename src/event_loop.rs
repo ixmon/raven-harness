@@ -151,6 +151,12 @@ impl TurnObserver for TuiObserver {
 
 impl TuiObserver {
     fn needs_approval(&self, name: &str, args: &str) -> bool {
+        // Wiki writes are always safe — private session scratchpad, never touches workspace
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
+            if v.get("wiki").and_then(|w| w.as_bool()).unwrap_or(false) {
+                return false;
+            }
+        }
         let is_mutating = matches!(name, "write" | "patch" | "exec");
         let is_outside = if name == "exec" {
             let cmd = serde_json::from_str::<serde_json::Value>(args).ok()
@@ -200,6 +206,22 @@ pub async fn run(
     chat_backend: ChatBackend,
     keystore: Keystore,
 ) -> Result<()> {
+    // Install a panic hook that restores the terminal before the default
+    // panic handler runs. This prevents raw panic messages (and any other
+    // stderr from worker threads) from corrupting the TUI display.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        // Best-effort terminal restore (may be called from any thread).
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stderr(),
+            crossterm::terminal::LeaveAlternateScreen,
+            crossterm::cursor::Show,
+        );
+        // Then let the original handler (which does the eprintln + backtrace) run.
+        original_hook(panic_info);
+    }));
+
     crossterm::terminal::enable_raw_mode()?;
     let mut stdout = io::stdout();
     crossterm::execute!(
@@ -222,7 +244,10 @@ pub async fn run(
         crossterm::event::DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    if let Err(err) = res { eprintln!("TUI error: {:?}", err); }
+    if let Err(err) = res {
+        // TUI loop exited with error. Avoid polluting if possible, but this is shutdown path.
+        eprintln!("TUI error: {:?}", err);
+    }
     Ok(())
 }
 
@@ -233,6 +258,11 @@ async fn run_app<B: ratatui::backend::Backend>(
     mut keystore: Keystore,
 ) -> Result<()> {
     let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(config.clone(), chat_backend)));
+    // Set Brave Search API key from keystore (or BRAVE_API_KEY env var)
+    {
+        let brave_key = keystore.get_brave_key();
+        agent.lock().await.brave_key = brave_key;
+    }
     let mut app = App::new(&config);
 
     if let Some(pfile) = &config.harness.initial_prompt_file {
@@ -366,16 +396,29 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.left_committed.push(to_commit);
                     }
                     if !app.current_thinking.is_empty() {
-                        for line in app.current_thinking.lines() {
-                            // Never prepend brain icon to tool call / debug lines.
-                            // Only real thinking gets 🧠 ; tool output uses 🔧 on first line + indented ↳ .
-                            let l = line.trim_start();
-                            let settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
-                                line.to_string()
+                        // Settle the thinking: 1 brain icon per thought block (not per line),
+                        // 1 tool icon at start of tool blocks. Subsequent lines of a thought
+                        // are indented without repeating the icon.
+                        let lines: Vec<&str> = app.current_thinking.lines().collect();
+                        if !lines.is_empty() {
+                            let first = lines[0];
+                            let l = first.trim_start();
+                            let first_settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
+                                first.to_string()
                             } else {
-                                format!("🧠 {}", line)
+                                format!("🧠 {}", first)
                             };
-                            app.trace_lines.push(settled);
+                            app.trace_lines.push(first_settled);
+
+                            for line in &lines[1..] {
+                                let l = line.trim_start();
+                                let settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
+                                    line.to_string()
+                                } else {
+                                    format!("   {}", line)
+                                };
+                                app.trace_lines.push(settled);
+                            }
                         }
                         app.current_thinking.clear();
                     }
@@ -401,6 +444,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.api_total_tokens = total_tokens;
                     app.needs_redraw = true;
                 }
+                UiUpdate::SuperJudgeBegin => {
+                    app.is_processing = true;
+                    app.trace_lines.push("🔍 Super Judge review starting…".to_string());
+                    app.right_follow_output = true;
+                    app.right_scroll = 10_000;
+                    app.needs_redraw = true;
+                }
                 _ => {}
             }
         }
@@ -422,7 +472,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Defensive cleanup: never allow brain icon prepended to tool call/debug lines
-        // (🔧 start or indented ↳ result). Ensures single tool icon on first line of tool output.
+        // (🔧 start or indented ↳ result). Ensures single tool icon at start of each tool block.
         for line in &mut app.trace_lines {
             if line.starts_with("🧠") {
                 let rest = line.trim_start_matches("🧠").trim_start();
@@ -462,7 +512,8 @@ async fn run_app<B: ratatui::backend::Backend>(
         let show_gauge = app.is_processing;
         let gauge_h = if show_gauge { 1 } else { 0 };
         let show_status = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Workspace);
-        let show_input = show_status;
+        let show_input = show_status
+            || (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && app.picker.adding_workspace);
         let status_h = if show_status { 1 } else { 0 };
         let input_line_count = if show_input { app.input.lines().count().max(1) as u16 } else { 0 };
         let input_h = if show_input {
@@ -470,6 +521,11 @@ async fn run_app<B: ratatui::backend::Backend>(
         } else {
             0
         };
+
+        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
+            // rough estimate; updated inside draw if possible
+            app.picker.last_summary_height = 25;
+        }
 
         // Draw
         if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 || app.desktop.is_animating() {
@@ -492,6 +548,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let content_area = vertical[1];
                 let gauge_area = vertical[2];
                 let input_area = vertical[3];
+
+                if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
+                    app.picker.last_summary_height = content_area.height.saturating_sub(4).max(10);
+                }
 
                 let left_focused = app.focused_pane == Pane::Left;
                 let right_focused = app.focused_pane == Pane::Right;
@@ -517,7 +577,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                     });
                 }
 
-                tui_render::draw_content_desktop(
+                if app.desktop.showing_wiki_viewer() {
+                    tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                } else {
+                    tui_render::draw_content_desktop(
                     f, content_area, &app.desktop,
                     &tui_render::WorkspaceDrawData {
                         left_committed: &app.left_committed,
@@ -540,40 +603,51 @@ async fn run_app<B: ratatui::backend::Backend>(
                         sessions: &app.picker.sessions,
                         selected_session: app.picker.selected_session,
                         focus: app.picker.focus,
+                        summary: &app.picker.summary,
+                        summary_scroll: app.picker.summary_scroll,
+                        wiki_links: &app.picker.wiki_links,
+                        active_link_idx: app.picker.active_link_idx,
+                        summary_action: app.picker.summary_action,
                     },
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,
                     &mut app.left_scroll, &mut app.right_scroll,
                     app.left_follow_output, app.right_follow_output,
                 );
+                }
 
-                if show_gauge {
+                if show_gauge && !app.desktop.showing_wiki_viewer() {
                     tui_render::draw_context_gauge(f, gauge_area, &tui_render::ContextGaugeData {
                         turn_rounds: app.turn_rounds, max_rounds: config.max_rounds,
                         tool_calls_this_turn: app.tool_calls_this_turn,
                     });
                 }
 
-                if show_input {
+                if show_input && !app.desktop.showing_wiki_viewer() {
+                    let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, input_area, &tui_render::InputBarData {
                         input: &app.input, is_processing: app.is_processing,
                         spinner_tick: app.spinner_tick, search_mode: app.search_mode,
-                        focused: app.focused_pane == Pane::Input,
+                        focused: input_focused,
                     });
 
-                    tui_render::draw_overlays(
-                        f, size, input_area, &app.settings, app.pending_approval.as_deref(),
-                        &app.slash_commands, &app.input, app.slash_selected,
-                        app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
-                        app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
-                    );
+                    if !app.desktop.showing_wiki_viewer() {
+                        tui_render::draw_overlays(
+                            f, size, input_area, &app.settings, app.pending_approval.as_deref(),
+                            &app.slash_commands, &app.input, app.slash_selected,
+                            app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
+                            app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
+                        );
+                    }
 
-                    app.clamp_cursor();
-                    let text_before = &app.input[..app.cursor_pos];
-                    let cursor_line = text_before.matches('\n').count() as u16;
-                    let last_nl = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
-                    let cursor_col = app.input[last_nl..app.cursor_pos].chars().count() as u16;
-                    f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
+                    if input_focused && !app.desktop.showing_wiki_viewer() {
+                        app.clamp_cursor();
+                        let text_before = &app.input[..app.cursor_pos];
+                        let cursor_line = text_before.matches('\n').count() as u16;
+                        let last_nl = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let cursor_col = app.input[last_nl..app.cursor_pos].chars().count() as u16;
+                        f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
+                    }
                 }
 
                 if app.scroll_flash_timer > 0 { app.scroll_flash_timer -= 1; }

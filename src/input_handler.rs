@@ -1,7 +1,7 @@
 //! Input handling logic for key events and editing actions.
 
 use crate::app_state::App;
-use crate::key_edit::{is_paste_key, map_key_to_edit};
+use crate::key_edit::{is_paste_key, map_key_to_edit, EditAction};
 use crate::settings_modal::handle_settings_key;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyModifiers};
@@ -54,11 +54,51 @@ pub async fn handle_key_event(
             .await?;
         }
         Event::Paste(data) => {
-            handle_paste(app, &data);
+            if app.settings.active && matches!(
+                app.settings.mode,
+                crate::settings_modal::SettingsMode::Adding
+                | crate::settings_modal::SettingsMode::Editing
+                | crate::settings_modal::SettingsMode::BraveKey
+            ) {
+                handle_settings_paste(&mut app.settings, &data);
+            } else {
+                handle_paste(app, &data);
+            }
             handled = true;
         }
         Event::Resize(_width, _height) => {
             app.needs_redraw = true;
+        }
+        Event::Mouse(me) => {
+            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = me.kind {
+                let col = me.column;
+                let row = me.row;
+                if app.desktop.showing_picker() {
+                    app.picker.focus = crate::app_state::PickerFocus::Sessions;
+                    app.needs_redraw = true;
+                    handled = true;
+                } else if matches!(app.desktop.active, ActiveDesktop::Workspace) {
+                    // Use last rendered areas to decide which pane was clicked
+                    let in_left = app.last_left_area.x <= col && col < app.last_left_area.x + app.last_left_area.width
+                        && app.last_left_area.y <= row && row < app.last_left_area.y + app.last_left_area.height;
+                    let in_right = app.last_right_area.x <= col && col < app.last_right_area.x + app.last_right_area.width
+                        && app.last_right_area.y <= row && row < app.last_right_area.y + app.last_right_area.height;
+                    if in_left {
+                        app.focused_pane = crate::app_state::Pane::Left;
+                        app.needs_redraw = true;
+                        handled = true;
+                    } else if in_right {
+                        app.focused_pane = crate::app_state::Pane::Right;
+                        app.needs_redraw = true;
+                        handled = true;
+                    } else {
+                        app.focused_pane = crate::app_state::Pane::Input;
+                        app.needs_redraw = true;
+                        handled = true;
+                    }
+                }
+            }
+            // other mouse events (wheel, up, drag) ignored for now
         }
         _ => {}
     }
@@ -97,6 +137,8 @@ pub async fn handle_key(
             &mut app.display_model,
             &mut app.display_budget,
             &mut app.settings,
+            agent,
+            keystore,
         );
         if endpoint_switched {
             if let Ok(ag) = agent.try_lock() {
@@ -209,8 +251,14 @@ async fn handle_input_key(
         return Ok(true);
     }
 
+    // Full wiki viewer screen
+    if app.desktop.showing_wiki_viewer() && app.handle_wiki_viewer_key(key.code, agent) {
+        return Ok(true);
+    }
+
     // When focused on content panes (Left/Right), use arrows for focus or desktop slide
-    if app.focused_pane != crate::app_state::Pane::Input {
+    // (skip when wiki viewer owns the screen — its handler already processed or rejected the key)
+    if app.focused_pane != crate::app_state::Pane::Input && !app.desktop.showing_wiki_viewer() {
         match key.code {
             KeyCode::Left => {
                 if app.desktop.showing_picker() {
@@ -224,11 +272,15 @@ async fn handle_input_key(
                         app.needs_redraw = true;
                         return Ok(true);
                     } else if app.focused_pane == crate::app_state::Pane::Left {
-                        // on Conversation, left goes to 2nd screen (picker) focused on session pane
-                        app.desktop.set_picker();
-                        app.picker.focus = crate::app_state::PickerFocus::Sessions;
-                        if !app.picker.loaded {
-                            app.refresh_picker();
+                        // on Conversation, left goes to wiki viewer if possible, else picker
+                        if !app.wiki_viewer.session_id.is_empty() {
+                            app.desktop.set_wiki_viewer();
+                        } else {
+                            app.desktop.set_picker();
+                            app.picker.focus = crate::app_state::PickerFocus::Sessions;
+                            if !app.picker.loaded {
+                                app.refresh_picker();
+                            }
                         }
                         app.needs_redraw = true;
                         return Ok(true);
@@ -254,6 +306,16 @@ async fn handle_input_key(
                 if !app.try_slide_to_workspace() {
                     app.focused_pane = crate::app_state::Pane::Right;
                 }
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.scroll_focused_line(-1);
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.scroll_focused_line(1);
                 app.needs_redraw = true;
                 return Ok(true);
             }
@@ -287,17 +349,29 @@ async fn handle_input_key(
     }
 
     // Suppress text input editing on splash and picker screens (input bar is hidden there)
+    // except when in adding workspace mode
     if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker)
+        && !app.picker.adding_workspace
         && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
     {
         return Ok(true);
     }
 
-    // Map key to edit action (updated API) — only when focused on input
-    if app.focused_pane == crate::app_state::Pane::Input {
-        if let Some(action) = map_key_to_edit(&key) {
+    // Map key to edit action (updated API).
+    // Editing the input (backspace, delete, etc.) is allowed whenever the input
+    // is visible (on workspace). Cursor movement in input only when explicitly
+    // focused on the input pane (otherwise arrows navigate panes).
+    if let Some(action) = map_key_to_edit(&key) {
+        let is_cursor_move = matches!(
+            action,
+            EditAction::Left | EditAction::Right | EditAction::Home | EditAction::End
+        );
+        if !is_cursor_move || app.focused_pane == crate::app_state::Pane::Input {
             app.apply_edit_action(action);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
+                app.focused_pane = crate::app_state::Pane::Input;
+            }
             return Ok(true);
         }
     }
@@ -307,6 +381,9 @@ async fn handle_input_key(
         KeyCode::Char(c) => {
             app.insert_char(c);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
+                app.focused_pane = crate::app_state::Pane::Input;
+            }
             Ok(true)
         }
         KeyCode::Enter => {
@@ -323,6 +400,24 @@ async fn handle_input_key(
                     app.submit_queued_interject(app.input.clone(), queued_interject);
                 }
             } else {
+                // Picker add workspace: Enter accepts the path and starts trust confirm
+                if app.desktop.showing_picker() && app.picker.adding_workspace {
+                    let path = app.input.trim().to_string();
+                    app.clear_input();
+                    app.picker.adding_workspace = false;
+                    app.needs_redraw = true;
+                    if !path.is_empty() {
+                        if let Ok(p) = std::fs::canonicalize(&path) {
+                            if p.is_dir() {
+                                app.picker.confirm_trust_path = Some(p.clone());
+                                app.input = format!("Trust {} ? [y/n]", p.display());
+                                app.cursor_pos = app.input.len();
+                            }
+                        }
+                    }
+                    app.needs_redraw = true;
+                    return Ok(true);
+                }
                 // Submit the input. If it is a slash command, dispatch it (may activate
                 // submenus for /approval-mode or /run-mode, or handle instantly).
                 // Only plain prompts go through to the agent driver.
@@ -385,6 +480,7 @@ async fn handle_input_key(
                         tokio::spawn(async move {
                             let mut ag = agent_c.lock().await;
                             let mode = ag.current_exec_mode();
+                            let agent_mode = ag.current_agent_mode();
                             let mut obs = crate::event_loop::TuiObserver {
                                 tx: tx_c.clone(),
                                 approval_req_tx: appr_c,
@@ -398,9 +494,99 @@ async fn handle_input_key(
                             let res = raven_tui::agent_driver::drive_turn(&mut ag, &prompt_c, &mut obs).await;
                             match res {
                                 Ok(r) => {
-                                    let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
-                                        final_text: r.final_text,
-                                    }).await;
+                                    // In "work" mode, run the Super Judge before declaring Done
+                                    if agent_mode == "work" {
+                                        const MAX_SUPER_JUDGE_CYCLES: u32 = 3;
+                                        let mut last_text = r.final_text.clone();
+                                        let mut all_actions = r.actions.clone();
+                                        let mut cycle = 0u32;
+
+                                        loop {
+                                            if cycle >= MAX_SUPER_JUDGE_CYCLES {
+                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                    name: "system".into(),
+                                                    summary: "🔍 Super Judge: max review cycles reached, accepting".into(),
+                                                }).await;
+                                                break;
+                                            }
+                                            cycle += 1;
+
+                                            // Brief pause for UX (shows Processing off briefly)
+                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                            let _ = tx_c.send(crate::event_loop::UiUpdate::SuperJudgeBegin).await;
+                                            let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                name: "system".into(),
+                                                summary: format!("🔍 Super Judge reviewing work (cycle {}/{})", cycle, MAX_SUPER_JUDGE_CYCLES),
+                                            }).await;
+
+                                            // Use the headless Super Judge observer
+                                            let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
+                                            let verdict = raven_tui::super_judge::run_super_judge_with_observer(
+                                                &mut ag, &last_text, &all_actions, &mut sj_obs,
+                                            ).await;
+
+                                            match verdict {
+                                                raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: WORK_COMPLETE — {}", note),
+                                                    }).await;
+                                                    break;
+                                                }
+                                                raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: "🔍 Super Judge: NEEDS_WORK — nudging agent".to_string(),
+                                                    }).await;
+                                                    // Inject feedback and re-run
+                                                    let nudge = format!(
+                                                        "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
+                                                        feedback
+                                                    );
+                                                    match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs).await {
+                                                        Ok(r2) => {
+                                                            last_text = r2.final_text.clone();
+                                                            all_actions.extend(r2.actions);
+                                                        }
+                                                        Err(e) => {
+                                                            let _ = tx_c.send(crate::event_loop::UiUpdate::Error(
+                                                                format!("Super Judge re-run error: {}", e)
+                                                            )).await;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                                raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: DEATH_SPIRAL detected — {}", feedback),
+                                                    }).await;
+                                                    // Inject anti-spiral guidance as final message
+                                                    ag.push_message("user", &format!(
+                                                        "[🔍 SUPER JUDGE — DEATH SPIRAL DETECTED]: {}\n\n\
+                                                         Stop repeating the same approach. Try something completely different.",
+                                                        feedback
+                                                    ));
+                                                    break;
+                                                }
+                                                raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
+                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                        name: "system".into(),
+                                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
+                                                    }).await;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
+                                            final_text: last_text,
+                                        }).await;
+                                    } else {
+                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
+                                            final_text: r.final_text,
+                                        }).await;
+                                    }
                                     let _ = tx_c.send(crate::event_loop::UiUpdate::Usage {
                                         prompt_tokens: Some(r.metrics.prompt_tokens as u32),
                                         completion_tokens: Some(r.metrics.completion_tokens as u32),
@@ -439,6 +625,9 @@ async fn handle_input_key(
                 app.mode_menu_active = false;
             } else if app.agent_mode_menu_active {
                 app.agent_mode_menu_active = false;
+            } else if app.desktop.showing_picker() && app.picker.adding_workspace {
+                app.picker.adding_workspace = false;
+                app.clear_input();
             } else if !app.input.is_empty() {
                 app.clear_input();
             }
@@ -461,6 +650,17 @@ pub fn handle_paste(app: &mut App, data: &str) {
     app.history_index = None;
     clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
     app.needs_redraw = true;
+}
+
+/// Handle paste into settings modal edit buffer.
+fn handle_settings_paste(settings: &mut crate::settings_modal::SettingsModal, data: &str) {
+    let sanitized: String = data
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    if !sanitized.is_empty() {
+        settings.apply_edit_action(EditAction::InsertStr(sanitized));
+    }
 }
 
 /// Schedule a balance refresh.

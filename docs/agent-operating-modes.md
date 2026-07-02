@@ -93,6 +93,12 @@ The goal of raven-hotel / raven-eval is to improve the *environment* so any mode
 
 See also: existing goal injection, judge_turn, last_user_request safety checks, full_log usage for recovery, and ExecApprovalMode.
 
+### LLM-Wiki for think/research/dream
+
+In reflective modes the agent is expected to maintain a structured `wiki/` directory inside the session (`~/.raven-hotel/sessions/<id>/wiki/`). This is the durable place for links, papers, hypotheses, experiment results and citations. See `docs/llm-wiki.md` for layout, starter template, new `read_wiki`/`write_wiki` tools, and how the TUI surfaces it in the picker summary + viewer.
+
+The wiki is the main mechanism that lets both you and the model "think together" across turns and restarts when the task involves research or exploration.
+
 ---
 
 Next steps (as of this note):

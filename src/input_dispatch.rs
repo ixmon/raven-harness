@@ -403,6 +403,7 @@ While agent is running:
 Tip: type / then use ↑↓ to browse, Tab to complete.";
 
 /// Apply settings-side-effect actions to the App UI fields.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_settings_actions(
     actions: Vec<crate::settings_modal::SettingsAction>,
     left_committed: &mut Vec<String>,
@@ -410,6 +411,8 @@ pub fn apply_settings_actions(
     display_model: &mut String,
     display_budget: &mut raven_tui::config::ContextBudget,
     settings: &mut SettingsModal,
+    agent: &Arc<Mutex<Agent>>,
+    keystore: &Keystore,
 ) {
     use crate::settings_modal::SettingsAction;
 
@@ -429,6 +432,13 @@ pub fn apply_settings_actions(
             }
             SettingsAction::ActiveIdx(idx) => {
                 settings.active_endpoint_idx = idx;
+            }
+            SettingsAction::BraveKeyUpdated => {
+                settings.brave_key_configured = keystore.has_brave_key();
+                let brave_key = keystore.get_brave_key();
+                if let Ok(mut ag) = agent.try_lock() {
+                    ag.brave_key = brave_key;
+                }
             }
         }
     }

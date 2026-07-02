@@ -584,7 +584,7 @@ pub fn detect_plan_narration(text: &str) -> bool {
 
 /// Detect malformed/partial tool call XML syntax that didn't parse as a real tool call.
 pub fn detect_malformed_tool_syntax(text: &str) -> bool {
-    crate::llm::contains_tool_xml_syntax(text)
+    crate::tool_xml::contains_tool_xml_syntax(text)
 }
 
 /// Check if a user request text implies that execution/output is expected.

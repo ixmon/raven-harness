@@ -33,6 +33,7 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
         .arg(&cmd)
         .current_dir(&ws)
         .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -47,6 +48,7 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
         .arg("/C")
         .arg(&cmd)
         .current_dir(&ws)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
@@ -77,8 +79,9 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
                 trimmed = "(no output)".to_string();
             }
             if trimmed.len() > EXEC_OUTPUT_TRUNCATE {
-                trimmed.truncate(EXEC_OUTPUT_TRUNCATE);
-                trimmed.push_str("\n... (truncated)");
+                // Use safe truncate to avoid panicking on non-char-boundary (multi-byte UTF-8 in command output)
+                let safe = super::safe_truncate(&trimmed, EXEC_OUTPUT_TRUNCATE);
+                trimmed = safe.to_string() + "\n... (truncated)";
             }
             trimmed
         }

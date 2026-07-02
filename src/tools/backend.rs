@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::{
-    browse, exec, grep_files, list_dir, patch_file, read_file, safe_truncate, web_search,
+    browse, browse_urls, exec, grep_files, list_dir, patch_file, read_file, safe_truncate, web_search,
     write_file,
 };
 
@@ -136,6 +136,7 @@ impl MockToolBackend {
                     safe_truncate(text, 80)
                 ));
             }
+
             "read_summary" => {
                 let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
                 return Ok(format!("✅ read_summary requested for {}", path));
@@ -163,12 +164,13 @@ impl ToolBackend {
         arguments: &str,
         workspace: &Path,
         max_read_lines: usize,
+        brave_key: Option<String>,
     ) -> Result<String> {
         let args = parse_tool_args(arguments);
 
         match self {
             Self::Mock(m) => m.execute_sync(name, &args, workspace, max_read_lines),
-            Self::Real => real_execute(name, &args, workspace, max_read_lines).await,
+            Self::Real => real_execute(name, &args, workspace, max_read_lines, brave_key).await,
         }
     }
 }
@@ -188,6 +190,7 @@ async fn real_execute(
     args: &Value,
     workspace: &Path,
     max_read_lines: usize,
+    brave_key: Option<String>,
 ) -> Result<String> {
     match name {
         "exec" => {
@@ -215,7 +218,11 @@ async fn real_execute(
         "grep" => {
             let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             let path = args.get("path").and_then(|v| v.as_str());
-            Ok(grep_files(pattern, path, workspace))
+            let include = args.get("include").and_then(|v| v.as_str());
+            let context = args.get("context").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+            let files_only = args.get("files_only").and_then(|v| v.as_bool()).unwrap_or(false);
+            let fixed = args.get("fixed").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(grep_files(pattern, path, include, context.min(5), files_only, fixed, workspace))
         }
         "list" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
@@ -228,7 +235,8 @@ async fn real_execute(
                 .unwrap_or("")
                 .to_string();
             let count = args.get("count").and_then(|v| v.as_u64()).unwrap_or(6) as usize;
-            let res = tokio::task::spawn_blocking(move || web_search(&query, count))
+            let bk = brave_key.clone();
+            let res = tokio::task::spawn_blocking(move || web_search(&query, count, bk.as_deref()))
                 .await
                 .unwrap_or_else(|e| format!("web_search join error: {}", e));
             Ok(res)
@@ -241,6 +249,23 @@ async fn real_execute(
                 .and_then(|v| v.as_str())
                 .unwrap_or("text");
             Ok(browse(url, depth, extract).await)
+        }
+        "browse_urls" => {
+            let urls: Vec<String> = args
+                .get("urls")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let extract = args
+                .get("extract")
+                .and_then(|v| v.as_str())
+                .unwrap_or("text");
+            let url_refs: Vec<&str> = urls.iter().map(|s| s.as_str()).collect();
+            Ok(browse_urls(&url_refs, extract).await)
         }
         "update_goal" => {
             let goal = args.get("goal").and_then(|v| v.as_str()).unwrap_or("");
@@ -256,6 +281,7 @@ async fn real_execute(
                 safe_truncate(text, 80)
             ))
         }
+
         "read_summary" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             Ok(format!("✅ read_summary requested for {}", path))
@@ -264,7 +290,10 @@ async fn real_execute(
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             Ok(format!("✅ store_summary requested for {}", path))
         }
-        other => Ok(format!("❌ Unknown tool: {}", other)),
+        "edit" | "str_replace" | "search_replace" | "modify" => {
+            Ok("❌ There is no 'edit' tool (or str_replace, etc.). Use the `patch` tool for search/replace edits (args: path, search, replace, optional near_line and wiki). Or use `write` for full file replacement. Always call `read` first for context.".to_string())
+        }
+        other => Ok(format!("❌ Unknown tool: {}. Valid tools: exec, read, write, patch, grep, list, web_search, browse, browse_urls, update_goal, define_done, record_discovery, read_summary, store_summary. (For file edits use patch or write; there is no 'edit' tool.)", other)),
     }
 }
 

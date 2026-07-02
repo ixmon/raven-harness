@@ -404,6 +404,21 @@ impl Session {
         block.push_str("If fresh it returns the summary; if stale/missing it gives you the mtime + capped raw content and tells you to call store_summary after analysis. ");
         block.push_str("This keeps token usage low even on long tasks.\n\n");
 
+        // Wiki (private research memory) — always mentioned so the agent knows the path.
+        block.push_str("### Private Research Wiki (use for think/research/dream modes)\n");
+        block.push_str("The session has a private wiki directory that is ALREADY the target when you use wiki=true.\n");
+        block.push_str("CRITICAL:\n");
+        block.push_str("- ALWAYS pass wiki=true (as boolean) on read / write / patch / list to target the session wiki.\n");
+        block.push_str("- 'path' MUST be relative only: \"index.md\", \"notes/experiments.md\", \"foo/bar.md\" etc.\n");
+        block.push_str("- NEVER include the string \"wiki\" (or \"wiki/\") in the path value. NEVER mkdir wiki or wiki/wiki.\n");
+        block.push_str("Correct tool use examples (do not escape args):\n");
+        block.push_str("  read  path=index.md                 wiki=true\n");
+        block.push_str("  write path=research/findings.md     wiki=true   content=...\n");
+        block.push_str("  list  wiki=true   (or path=some/subdir + wiki=true)\n");
+        block.push_str("  patch path=index.md wiki=true search=\"...\" replace=\"...\"\n");
+        block.push_str("list with wiki=true lists the wiki root. Use it to keep research notes, links, results, hypotheses. Wiki writes bypass approval.\n");
+        block.push_str("Re-read before editing. Record sources/URLs in the md.\n\n");
+
         if flags.goal_tracking && !flags.disable_goal_tool {
             block.push_str("---\nUse the structure and goal above to stay on track. Call update_goal(...) if the user's intent clearly shifts.\n");
         }
@@ -540,6 +555,242 @@ impl Session {
         )?;
         Ok(())
     }
+
+    // ── Private research wiki (session-local markdown for think/research/dream) ──
+    // Lives in ~/.raven-hotel/sessions/<id>/wiki/
+    // Accessed via read_wiki / write_wiki / list_wiki tools (intercepted like record_discovery).
+    // Never goes through the workspace containment checks.
+
+    pub fn wiki_root(&self) -> PathBuf {
+        self.dir.join("wiki")
+    }
+
+    pub fn ensure_wiki_dir(&self) -> Result<PathBuf> {
+        let d = self.wiki_root();
+        fs::create_dir_all(&d)?;
+        Ok(d)
+    }
+
+    /// Read a wiki file. Returns a formatted result string (similar to read tool output).
+    pub fn read_wiki_file(&self, rel: &str, line_range: Option<&str>, full: bool, max_lines: usize) -> String {
+        let root = self.wiki_root();
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = if r.is_empty() || r == "." || r == "/" {
+            "index.md".to_string()
+        } else {
+            r
+        };
+        let target = root.join(&clean_rel);
+
+        match fs::read_to_string(&target) {
+            Ok(content) => {
+                let all: Vec<&str> = content.lines().collect();
+                let (start, end) = if let Some(r) = line_range.and_then(parse_line_range_for_wiki) {
+                    (r.0.saturating_sub(1), if r.1 == usize::MAX { all.len() } else { r.1 })
+                } else if full {
+                    (0, all.len())
+                } else {
+                    (0, all.len().min(max_lines))
+                };
+                let shown = &all[start.min(all.len())..end.min(all.len())];
+                let mut out = format!("📄 wiki/{} ({} lines total)\n", clean_rel, all.len());
+                for (i, ln) in shown.iter().enumerate() {
+                    out.push_str(&format!("{:4} | {}\n", start + i + 1, ln));
+                }
+                if !full && all.len() > shown.len() {
+                    out.push_str(&format!("... ({} more lines; use lines=\"{}-\" or full=true)\n", all.len() - shown.len(), start + shown.len() + 1));
+                }
+                out
+            }
+            Err(e) => format!("❌ Could not read wiki/{}: {}", clean_rel, e),
+        }
+    }
+
+    /// Write a file under wiki/. Creates parent dirs. Returns ack string.
+    pub fn write_wiki_file(&self, rel: &str, content: &str) -> String {
+        let root = self.wiki_root();
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = r;
+        if clean_rel.is_empty() {
+            return "❌ write_wiki requires a non-empty path (e.g. 'index.md')".into();
+        }
+        let target = root.join(&clean_rel);
+        if let Some(parent) = target.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return format!("❌ Failed to create wiki dirs for {}: {}", clean_rel, e);
+            }
+        }
+        match fs::write(&target, content) {
+            Ok(_) => format!("✅ Wrote {} bytes to wiki/{}", content.len(), clean_rel),
+            Err(e) => format!("❌ Write error for wiki/{}: {}", clean_rel, e),
+        }
+    }
+
+    /// Patch (search/replace) a file under the wiki directory.
+    /// Mirrors the workspace patch tool but operates on the private session wiki.
+    /// Use this (instead of the normal `patch` tool) for edits to wiki pages.
+    pub fn patch_wiki_file(
+        &self,
+        rel: &str,
+        search: &str,
+        replace: &str,
+        near_line: Option<i64>,
+    ) -> String {
+        let root = self.wiki_root();
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = r;
+        if clean_rel.is_empty() {
+            return "❌ patch_wiki requires a non-empty relative path (e.g. 'index.md')".into();
+        }
+        let target = root.join(&clean_rel);
+
+        if let Some(parent) = target.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                return format!("❌ Failed to create dirs for wiki/{}: {}", clean_rel, e);
+            }
+        }
+
+        if !target.exists() {
+            return format!("❌ File not found in wiki: {}", clean_rel);
+        }
+
+        let content = match fs::read_to_string(&target) {
+            Ok(c) => c,
+            Err(e) => return format!("❌ Could not read wiki/{}: {}", clean_rel, e),
+        };
+
+        let count = content.matches(search).count();
+
+        if count == 0 {
+            return format!("⚠️ Search text not found in wiki/{}", clean_rel);
+        }
+
+        let original = content.clone();
+
+        let new_content = if count == 1 {
+            content.replacen(search, replace, 1)
+        } else if let Some(hint) = near_line {
+            // Find the occurrence closest to the hinted line number (1-based)
+            let mut best_pos = None;
+            let mut best_dist = i64::MAX;
+            let mut start = 0usize;
+
+            while let Some(pos) = content[start..].find(search) {
+                let abs_pos = start + pos;
+                let line_num = content[..abs_pos].matches('\n').count() as i64 + 1;
+                let dist = (line_num - hint).abs();
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_pos = Some(abs_pos);
+                }
+                start = abs_pos + 1;
+                if start >= content.len() {
+                    break;
+                }
+            }
+
+            if let Some(pos) = best_pos {
+                let mut out = content;
+                out.replace_range(pos..pos + search.len(), replace);
+                out
+            } else {
+                return format!(
+                    "⚠️ Ambiguous match ({} occurrences) and could not locate near line {} in wiki/{}",
+                    count, hint, clean_rel
+                );
+            }
+        } else {
+            return format!(
+                "⚠️ Search text appears {} times in wiki/{}. Provide near_line (approx 1-based line) to disambiguate, or make search more unique.",
+                count, clean_rel
+            );
+        };
+
+        let changed = new_content != original;
+
+        match fs::write(&target, &new_content) {
+            Ok(_) => {
+                if changed {
+                    format!("✅ Patched wiki/{}", clean_rel)
+                } else {
+                    format!(
+                        "✅ Patched wiki/{} (no net change — the content after the edit was identical to before)",
+                        clean_rel
+                    )
+                }
+            }
+            Err(e) => format!("❌ Patch write error for wiki/{}: {}", clean_rel, e),
+        }
+    }
+
+    /// List wiki dir (relative subpath optional).
+    pub fn list_wiki(&self, sub: Option<&str>) -> String {
+        let root = self.wiki_root();
+        let r = Self::strip_wiki_prefix(sub.unwrap_or(""));
+        let target = if r.is_empty() {
+            root.clone()
+        } else {
+            root.join(r.trim_start_matches(['/', '\\']))
+        };
+        match fs::read_dir(&target) {
+            Ok(rd) => {
+                let mut entries: Vec<String> = rd.filter_map(|e| e.ok()).map(|e| {
+                    let ft = e.file_type().ok();
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if ft.map(|t| t.is_dir()).unwrap_or(false) { format!("{}/", name) } else { name }
+                }).collect();
+                entries.sort();
+                let header = if r.is_empty() { "wiki/" } else { &format!("wiki/{}", r) };
+                if entries.is_empty() {
+                    format!("📁 {} (0 entries)\n(empty)", header)
+                } else {
+                    format!("📁 {} ({} entries)\n{}", header, entries.len(), entries.join("\n"))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Non-existent subdir under wiki: report as empty (agent may list before write)
+                let header = if r.is_empty() { "wiki/" } else { &format!("wiki/{}", r) };
+                format!("📁 {} (0 entries)\n(empty)", header)
+            }
+            Err(e) => format!("❌ list_wiki error: {}", e),
+        }
+    }
+
+    fn strip_wiki_prefix(rel: &str) -> String {
+        let mut s = rel.trim().to_string();
+        // Aggressively strip any "wiki/" the model might paste (from seeing ROOT or absolute paths)
+        for _ in 0..4 {
+            let before = s.clone();
+            if s.starts_with("wiki/") {
+                s = s[5..].to_string();
+            } else if s.starts_with("./wiki/") {
+                s = s[7..].to_string();
+            } else if let Some(pos) = s.find("/wiki/") {
+                s = s[pos + 6..].to_string();
+            } else if let Some(pos) = s.find("/sessions/") {
+                // e.g. .../sessions/<id>/wiki/xxx -> take after /wiki/
+                if let Some(w) = s[pos..].find("/wiki/") {
+                    s = s[pos + w + 6..].to_string();
+                }
+            }
+            if s == before { break; }
+        }
+        s.trim_start_matches(['/', '\\', '.']).to_string()
+    }
+}
+
+fn parse_line_range_for_wiki(s: &str) -> Option<(usize, usize)> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    if let Some((a, b)) = s.split_once('-') {
+        let start = if a.is_empty() { 1 } else { a.parse().ok()? };
+        let end = if b.is_empty() { usize::MAX } else { b.parse().ok()? };
+        return Some((start, end));
+    }
+    if let Ok(n) = s.parse::<usize>() {
+        return Some((n, n));
+    }
+    None
 }
 
 pub fn current_file_mtime(path: &Path) -> Result<i64> {
@@ -974,4 +1225,22 @@ pub fn list_sessions_for(workspace: &Path) -> Result<Vec<SessionMeta>> {
     }
     out.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(out)
+}
+
+/// Small preview of the session's wiki/index.md (first few lines) for the picker summary pane.
+/// Returns None if the file does not exist or cannot be read.
+pub fn wiki_preview_for_session(session_id: &str, max_lines: usize) -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let base = PathBuf::from(home)
+        .join(RAVEN_HOME)
+        .join(SESSIONS_SUBDIR)
+        .join(session_id)
+        .join("wiki")
+        .join("index.md");
+    let content = fs::read_to_string(&base).ok()?;
+    let lines: Vec<&str> = content.lines().take(max_lines).collect();
+    if lines.is_empty() {
+        return None;
+    }
+    Some(lines.join("\n"))
 }

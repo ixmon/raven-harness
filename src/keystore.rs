@@ -60,6 +60,9 @@ pub struct KeystoreFile {
     /// Overrides CLI/env defaults on next launch when present.
     #[serde(default)]
     pub launch: Option<LaunchDefaults>,
+    /// Encrypted Brave Search API key (same nonce||ciphertext format as endpoint keys).
+    #[serde(default)]
+    pub brave_api_key: Option<String>,
 }
 
 /// Runtime key vault — holds the derived AES key in memory after unlock.
@@ -84,6 +87,7 @@ impl Keystore {
                 salt: base64::engine::general_purpose::STANDARD.encode(salt),
                 endpoints: vec![],
                 launch: None,
+                brave_api_key: None,
             }
         };
 
@@ -380,6 +384,42 @@ impl Keystore {
             .with_context(|| format!("writing {}", self.path.display()))?;
         Ok(())
     }
+
+    /// Store an encrypted Brave Search API key.
+    pub fn set_brave_key(&mut self, key: &str) -> Result<()> {
+        if key.is_empty() {
+            return self.clear_brave_key();
+        }
+        let encrypted = self.encrypt_key(key)?;
+        self.file.brave_api_key = Some(encrypted);
+        self.save()
+    }
+
+    /// Retrieve the decrypted Brave API key, or fall back to BRAVE_API_KEY env var.
+    pub fn get_brave_key(&self) -> Option<String> {
+        // Keystore takes precedence
+        if let Some(ref enc) = self.file.brave_api_key {
+            if self.derived_key.is_some() {
+                if let Ok(key) = self.decrypt_key(enc) {
+                    return Some(key);
+                }
+            }
+        }
+        // Fall back to environment variable
+        std::env::var("BRAVE_API_KEY").ok().filter(|s| !s.is_empty())
+    }
+
+    /// Remove the stored Brave API key.
+    pub fn clear_brave_key(&mut self) -> Result<()> {
+        self.file.brave_api_key = None;
+        self.save()
+    }
+
+    /// Check if a Brave API key is available (stored or env).
+    pub fn has_brave_key(&self) -> bool {
+        self.file.brave_api_key.is_some()
+            || std::env::var("BRAVE_API_KEY").ok().filter(|s| !s.is_empty()).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -503,6 +543,37 @@ mod tests {
 
         ks.remove_endpoint(0).unwrap();
         assert_eq!(ks.len(), 0);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn keystore_brave_key_roundtrip() {
+        let path = unique_test_path();
+        cleanup(&path);
+
+        let mut ks = Keystore::load_or_create(&path).unwrap();
+        ks.init_password("pw").unwrap();
+
+        // No key yet
+        assert!(!ks.has_brave_key());
+        assert!(ks.get_brave_key().is_none());
+
+        // Set key
+        ks.set_brave_key("BSAtest123456").unwrap();
+        assert!(ks.has_brave_key());
+        assert_eq!(ks.get_brave_key().as_deref(), Some("BSAtest123456"));
+
+        // Reload from disk
+        let mut ks2 = Keystore::load_or_create(&path).unwrap();
+        ks2.unlock("pw").unwrap();
+        assert_eq!(ks2.get_brave_key().as_deref(), Some("BSAtest123456"));
+
+        // Clear key
+        ks2.clear_brave_key().unwrap();
+        assert!(ks2.get_brave_key().is_none());
+        // After clear, file field is None
+        assert!(ks2.file.brave_api_key.is_none());
 
         cleanup(&path);
     }

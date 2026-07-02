@@ -166,6 +166,8 @@ pub struct Agent {
     logged_message_count: usize,
     /// Judge for inference-based task completion decisions
     judge: Option<crate::judge::Judge>,
+    /// Brave Search API key (decrypted, set by TUI from keystore).
+    pub brave_key: Option<String>,
 }
 
 impl Agent {
@@ -202,6 +204,7 @@ impl Agent {
             session,
             logged_message_count,
             judge: Some(Judge::new(client_arc)),
+            brave_key: None,
         }
     }
 
@@ -311,6 +314,7 @@ impl Agent {
                 &raw_args,
                 &self.config.workspace,
                 self.config.context_budget.read_line_limit,
+                self.brave_key.clone(),
             )
             .await
             .unwrap_or_else(|e| format!("❌ Tool error: {}", e));
@@ -858,6 +862,73 @@ History:
             }
         }
 
+        // Catch common hallucinated tool names early with a helpful message
+        // (before falling through to normal tool execution).
+        if matches!(name, "edit" | "str_replace" | "search_replace" | "modify_file") {
+            return Some("❌ There is no 'edit' tool. The correct tool for search/replace edits is `patch` (parameters: path, search, replace, optional near_line; add wiki=true for the session wiki). Use `read` first to get exact text to search for.".to_string());
+        }
+
+        // Wiki flag: when wiki=true is set on read/write/patch/list, route to the
+        // session's private wiki directory instead of the workspace.
+        // Wiki writes are always allowed (no approval needed) — it's the agent's own scratchpad.
+        let mut is_wiki = args.get("wiki").is_some_and(|v| {
+            if let Some(b) = v.as_bool() {
+                b
+            } else if let Some(s) = v.as_str() {
+                matches!(s.trim().to_lowercase().as_str(), "true" | "1" | "yes" | "on")
+            } else if let Some(n) = v.as_i64() {
+                n != 0
+            } else {
+                false
+            }
+        });
+        // Auto-detect: if path starts with "wiki/" but wiki=true wasn't set,
+        // the model forgot the flag. Route to wiki anyway (strip_wiki_prefix handles cleanup).
+        if !is_wiki && matches!(name, "read" | "write" | "patch" | "list") {
+            if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                let trimmed = p.trim().trim_start_matches("./");
+                if trimmed.starts_with("wiki/") || trimmed.starts_with("wiki\\") || trimmed == "wiki" {
+                    is_wiki = true;
+                }
+            }
+        }
+        if is_wiki && matches!(name, "read" | "write" | "patch" | "list") {
+            if let Some(s) = &self.session {
+                let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                match name {
+                    "read" => {
+                        let lines = args.get("lines").and_then(|v| v.as_str());
+                        let full = args.get("full").is_some_and(|v| {
+                            if let Some(b) = v.as_bool() { b } else if let Some(s) = v.as_str() {
+                                matches!(s.trim().to_lowercase().as_str(), "true"|"1"|"yes")
+                            } else if let Some(n) = v.as_i64() { n != 0 } else { false }
+                        });
+                        let limit = self.config.context_budget.read_line_limit;
+                        return Some(s.read_wiki_file(path, lines, full, limit));
+                    }
+                    "write" => {
+                        let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                        let _ = s.ensure_wiki_dir();
+                        return Some(s.write_wiki_file(path, content));
+                    }
+                    "patch" => {
+                        let search = args.get("search").and_then(|v| v.as_str()).unwrap_or("");
+                        let replace = args.get("replace").and_then(|v| v.as_str()).unwrap_or("");
+                        let near_line = args.get("near_line").and_then(|v| v.as_i64());
+                        let _ = s.ensure_wiki_dir();
+                        return Some(s.patch_wiki_file(path, search, replace, near_line));
+                    }
+                    "list" => {
+                        let sub = if path.is_empty() { None } else { Some(path) };
+                        let _ = s.ensure_wiki_dir();
+                        return Some(s.list_wiki(sub));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            return Some(format!("❌ {}(wiki=true): no active session", name));
+        }
+
         if name == "read_summary" {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let rel = make_rel_path(path, &self.config.workspace);
@@ -1237,16 +1308,17 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 
 ## Tool Discipline (critical)
 - NEVER claim a file was read/written/edited unless a tool call just confirmed it.
-- For any edit to existing code, prefer the `patch` tool over `write`. `patch` is safer and supports disambiguation via `near_line`.
-- Before patching, call `read` (or `read` with a line range) so you have the exact text.
-- Use `list` and `grep` heavily to explore the project.
-- Use `exec` for building, testing, git, cargo, etc. Keep commands focused.
-- `web_search` finds candidate pages. `browse` reads them. Use search → browse for research.
-- If a tool fails, report the exact error and adapt. Do not pretend it succeeded.
+- Prefer `patch` over `write` for edits. `patch` supports `near_line` for disambiguation.
+- Always `read` the target file (or line range) immediately before `patch`. The `search` value must be verbatim text that exists right now. If the change is already present, skip the patch.
+- If a tool fails, `read` the relevant section and either retry with corrected text or skip.
+- Use `list` and `grep` to explore. Use `exec` for builds/tests/git.
+- `web_search` → `browse` for research.
+- Wiki: use wiki=true with read/write/patch/list. Path is bare relative (e.g. "index.md", "research/ideas.md"). Wiki ops need no approval.
 {}{}
 
 ## Available Tools
 exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
+(read/write/patch/list accept wiki=true for session wiki. Path is always relative.)
 
 ## Output Style
 - Be concise but complete.
