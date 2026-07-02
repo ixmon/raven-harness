@@ -1646,7 +1646,7 @@ fn draw_workspace_column(
             let is_sel = i == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
             } else if focused {
                 Style::default().fg(Color::White)
             } else {
@@ -1705,7 +1705,7 @@ fn draw_sessions_column(
             let is_sel = i == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::Black).bg(Color::Rgb(0x80, 0xd0, 0xff)).add_modifier(Modifier::BOLD)
+                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
             } else if focused {
                 Style::default().fg(Color::White)
             } else {
@@ -1735,6 +1735,7 @@ fn draw_sessions_column(
     f.render_widget(para, area);
 }
 
+#[allow(dead_code)] // kept for future reuse
 fn draw_button(f: &mut Frame, area: Rect, label: &str, focused: bool) {
     let (fg, border_fg) = if focused {
         (Color::Cyan, Color::Cyan)
@@ -1763,166 +1764,32 @@ fn draw_session_summary(
     summary: &str,
     scroll: usize,
     focused: bool,
-    wiki_links: &[crate::app_state::WikiLink],
-    active_link_idx: usize,
-    summary_action: crate::app_state::SummaryAction,
+    _wiki_links: &[crate::app_state::WikiLink],
+    _active_link_idx: usize,
+    _summary_action: crate::app_state::SummaryAction,
 ) {
-    // Reserve bottom 3 rows for buttons
-    let button_height = 3u16;
-    let content_height = area.height.saturating_sub(button_height);
-    let content_area = Rect {
-        x: area.x,
-        y: area.y,
-        width: area.width,
-        height: content_height,
-    };
-    let buttons_area = Rect {
-        x: area.x,
-        y: area.y + content_height,
-        width: area.width,
-        height: button_height,
-    };
-
-    let is_wiki_mode = summary.trim_start().starts_with("--- ") || (focused && summary_action == crate::app_state::SummaryAction::ViewWiki);
+    // Summary-only pane (full wiki is on the dedicated wiki viewer screen)
+    let content_area = area;
 
     let mut text = Text::default();
+    text.lines.push(Line::from(Span::styled(
+        "  Session Summary",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    text.lines.push(Line::from(""));
 
     let start = scroll;
-    let max_lines = (content_area.height as usize).saturating_sub(1);
+    let max_lines = (content_area.height as usize).saturating_sub(4);
 
-    if is_wiki_mode {
-        // Pure wiki markdown content (no session meta text)
-        let md_text = wiki_render_markdown(summary);
-        // Determine which link text is the active one (for highlight)
-        let active_link_text = if active_link_idx < wiki_links.len() {
-            wiki_links.get(active_link_idx).map(|l| l.text.as_str()).unwrap_or("")
-        } else {
-            "" // button is focused, no link highlight
-        };
-
-        for (idx, mut raw_line) in md_text.lines.into_iter().skip(start).take(max_lines).enumerate() {
-            let _this_line = start + idx;
-
-            // Highlight links by matching span content against known link texts
-            for span in &mut raw_line.spans {
-                for link in wiki_links.iter() {
-                    if span.content.contains(&link.text) {
-                        if link.text == active_link_text && !active_link_text.is_empty() {
-                            span.style = Style::default()
-                                .fg(Color::Magenta)
-                                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED);
-                        } else {
-                            span.style = Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::UNDERLINED);
-                        }
-                        break;
-                    }
-                }
-            }
-
-            // Make bold more visible (combine with color)
-            for span in &mut raw_line.spans {
-                if span.style.add_modifier.contains(Modifier::BOLD) {
-                    if span.style.fg.is_none() || span.style.fg == Some(Color::Reset) {
-                        span.style = span.style.fg(Color::LightCyan);
-                    }
-                }
-            }
-
-            text.lines.push(Line::from(
-                raw_line.spans.into_iter()
-                    .map(|s| Span::styled(s.content.to_string(), s.style))
-                    .collect::<Vec<Span>>()
-            ));
-        }
+    let all_lines: Vec<String> = if summary.is_empty() {
+        vec!["  (no session)".to_string()]
     } else {
-        // Session meta text (when Wiki button not active)
-        text.lines.push(Line::from(Span::styled(
-            "  Session Summary",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        )));
-        text.lines.push(Line::from(""));
+        summary.lines().map(|l| l.to_string()).collect()
+    };
 
-        let all_lines: Vec<String> = if summary.is_empty() {
-            vec!["  (no session)".to_string()]
-        } else {
-            summary.lines().map(|l| l.to_string()).collect()
-        };
-        let visible: Vec<_> = all_lines.iter().skip(start).take(max_lines).collect();
-
-        let active_line = wiki_links.get(active_link_idx).map(|l| l.line).unwrap_or(usize::MAX);
-        let wiki_section_start = all_lines.iter().position(|l| l.starts_with("--- ")).unwrap_or(0);
-
-        for (vis_idx, line) in visible.iter().enumerate() {
-            let global_line_in_all = start + vis_idx;
-            let is_wiki_line = global_line_in_all >= wiki_section_start;
-            let wiki_line_num = if is_wiki_line {
-                global_line_in_all.saturating_sub(wiki_section_start + 1)
-            } else {
-                usize::MAX
-            };
-
-            let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
-
-            let mut spans = vec![];
-            let mut remaining = line.as_str();
-
-            let line_links: Vec<_> = wiki_links.iter().filter(|l| l.line == wiki_line_num).collect();
-
-            for link in &line_links {
-                if let Some(text_pos) = remaining.find(&link.text) {
-                    let mut link_start = text_pos;
-                    while link_start > 0 && remaining.as_bytes().get(link_start - 1) != Some(&b'[') {
-                        link_start -= 1;
-                    }
-                    if link_start > 0 && remaining.as_bytes().get(link_start - 1) == Some(&b'[') {
-                        link_start -= 1;
-                    }
-
-                    let mut link_end = text_pos + link.text.len();
-                    while link_end < remaining.len() && remaining.as_bytes().get(link_end) != Some(&b')') {
-                        link_end += 1;
-                    }
-                    if link_end < remaining.len() && remaining.as_bytes().get(link_end) == Some(&b')') {
-                        link_end += 1;
-                    }
-
-                    if link_start < text_pos + link.text.len() && link_end > link_start {
-                        if link_start > 0 {
-                            spans.push(Span::styled(remaining[..link_start].to_string(), base_style));
-                        }
-                        let full_link = &remaining[link_start..link_end];
-                        let is_active = wiki_line_num == active_line;
-                        let link_style = if is_active {
-                            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED)
-                        } else {
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED)
-                        };
-                        spans.push(Span::styled(full_link.to_string(), link_style));
-                        remaining = &remaining[link_end..];
-                    }
-                }
-            }
-            if !remaining.is_empty() {
-                spans.push(Span::styled(remaining.to_string(), base_style));
-            }
-
-            if spans.is_empty() {
-                let mut style = base_style;
-                if is_wiki_line && wiki_line_num == active_line {
-                    style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-                } else if is_wiki_line && !line_links.is_empty() {
-                    style = Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED);
-                }
-                text.lines.push(Line::from(Span::styled(
-                    truncate_str(line, content_area.width as usize - 2),
-                    style
-                )));
-            } else {
-                text.lines.push(Line::from(spans));
-            }
-        }
+    let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
+    for line in all_lines.iter().skip(start).take(max_lines) {
+        text.lines.push(Line::from(Span::styled(line.to_string(), base_style)));
     }
 
     let border_style = if focused {
@@ -1930,42 +1797,16 @@ fn draw_session_summary(
     } else {
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
-    let title = if is_wiki_mode { " Wiki " } else { " Summary " };
     let para = Paragraph::new(text)
         .block(
             Block::default()
-                .title(title)
+                .title(" Summary ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style)
                 .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
         );
     f.render_widget(para, content_area);
-
-    // Render buttons at the bottom
-    let button_width = buttons_area.width / 2;
-    let wiki_area = Rect {
-        x: buttons_area.x,
-        y: buttons_area.y,
-        width: button_width,
-        height: buttons_area.height,
-    };
-    let launch_area = Rect {
-        x: buttons_area.x + button_width,
-        y: buttons_area.y,
-        width: buttons_area.width - button_width,
-        height: buttons_area.height,
-    };
-
-    // Button focus is driven by active_link_idx:
-    // idx == wiki_links.len()     => Wiki button focused
-    // idx == wiki_links.len() + 1 => Launch button focused
-    let n_links = wiki_links.len();
-    let wiki_btn_focused = focused && active_link_idx == n_links;
-    let launch_btn_focused = focused && active_link_idx == n_links + 1;
-
-    draw_button(f, wiki_area, "Wiki", wiki_btn_focused);
-    draw_button(f, launch_area, "Launch", launch_btn_focused);
 }
 
 pub fn draw_splash(f: &mut Frame, area: Rect, data: &SplashData<'_>) {
