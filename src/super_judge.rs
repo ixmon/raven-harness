@@ -316,19 +316,14 @@ impl TurnObserver for SuperJudgeObserver {
         // Silent in headless mode (TUI variant uses custom observer)
     }
 
-    fn on_thinking(&mut self, t: &str) {
-        if !t.is_empty() {
-            eprint!("🔍 {}", t);
-        }
+    fn on_thinking(&mut self, _t: &str) {
+        // Prints removed to avoid corrupting TUI display during tool calls / reviews.
+        // UI updates are sent separately in the TUI super-judge path.
     }
 
-    fn on_tool_start(&mut self, name: &str, _args: &str) {
-        eprint!("  🔍 {} → ", name);
-    }
+    fn on_tool_start(&mut self, _name: &str, _args: &str) {}
 
-    fn on_tool_result(&mut self, record: &ActionRecord) {
-        eprintln!("🔍 {}", record.summary.lines().next().unwrap_or(""));
-    }
+    fn on_tool_result(&mut self, _record: &ActionRecord) {}
 
     async fn approve_tool(&mut self, tc: &ToolCall) -> bool {
         let name = &tc.function.name;
@@ -343,20 +338,15 @@ impl TurnObserver for SuperJudgeObserver {
         match name.as_str() {
             "read" | "read_summary" | "list" | "grep" | "exec" => true,
             "write" | "patch" => {
-                eprintln!("  🔍 DENIED: Super Judge cannot write/patch workspace files");
+                // Note: denial is communicated via the verdict / UI path, not raw stderr.
                 false
             }
             _ => true,
         }
     }
 
-    fn on_nudge(&mut self, count: u32, max: u32) {
-        eprintln!("  🔍 [nudge {}/{}]", count, max);
-    }
-
-    fn on_stuck(&mut self, reason: &str, _suggested: &str) {
-        eprintln!("  🔍 [stuck: {}]", reason);
-    }
+    fn on_nudge(&mut self, _count: u32, _max: u32) {}
+    fn on_stuck(&mut self, _reason: &str, _suggested: &str) {}
 }
 
 fn truncate(s: &str, max: usize) -> String {

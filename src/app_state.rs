@@ -78,6 +78,7 @@ pub struct WikiViewerState {
 }
 
 #[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
 pub struct WikiLink {
     pub text: String,
     pub target: String,
@@ -1287,17 +1288,17 @@ impl App {
 
     pub fn refresh_picker_summary(&mut self) {
         if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
-            let tests = if meta.achievement_tests.is_empty() {
+            let _tests = if meta.achievement_tests.is_empty() {
                 "  (none)".to_string()
             } else {
                 meta.achievement_tests.iter().map(|t| format!("  - {}", t)).collect::<Vec<_>>().join("\n")
             };
-            let pitfalls = if meta.pitfalls.is_empty() {
+            let _pitfalls = if meta.pitfalls.is_empty() {
                 "  (none)".to_string()
             } else {
                 meta.pitfalls.iter().map(|p| format!("  - {}", p)).collect::<Vec<_>>().join("\n")
             };
-            let discoveries = if meta.discoveries.is_empty() {
+            let _discoveries = if meta.discoveries.is_empty() {
                 "  (none)".to_string()
             } else {
                 meta.discoveries.iter().map(|d| format!("  - {}", d)).collect::<Vec<_>>().join("\n")
@@ -1460,7 +1461,7 @@ impl App {
 
         // Load the *actual full content* of the current wiki file for reliable link scanning
         // (the embedded preview in .summary is truncated)
-        let mut content = String::new();
+        let _content = String::new();
         if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             let path = std::path::PathBuf::from(&home)
@@ -1469,13 +1470,7 @@ impl App {
                 .join(&meta.session_id)
                 .join("wiki")
                 .join(&wiki_file);
-            if let Ok(c) = std::fs::read_to_string(&path) {
-                content = c;
-            }
-        }
-
-        if content.is_empty() {
-            content = self.picker.summary.clone();
+            let _ = std::fs::read_to_string(&path);
         }
 
         // Use the active link (first visible one) instead of rescanning

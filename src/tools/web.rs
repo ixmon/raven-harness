@@ -162,7 +162,8 @@ pub fn web_search(query: &str, count: usize, brave_key: Option<&str>) -> String 
                     return e;
                 }
                 // On other errors (network, parse), fall back to DDG
-                eprintln!("Brave search failed, falling back to DuckDuckGo: {}", e);
+                // Brave failed (network/key/rate/etc); fallback silently to DDG.
+                // (Direct prints would corrupt the TUI display.)
             }
         }
     }

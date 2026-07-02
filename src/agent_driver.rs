@@ -195,7 +195,7 @@ pub async fn drive_turn(
             if steering.past_deadline() {
                 let secs = max_duration_secs.unwrap_or(0);
                 let msg = format!("[system: wall-clock timeout after {}s — stopping]", secs);
-                eprintln!("raven: {}", msg);
+                // Note: in TUI mode this message is also logged via agent events; avoid raw eprint to protect display.
                 agent.log_harness_event("timeout", &msg);
                 last_assistant_text = format!("(timed out after {}s)", secs);
                 break 'auto_continue;
@@ -537,7 +537,7 @@ async fn execute_decision(
 
         SteeringDecision::Timeout { seconds } => {
             let msg = format!("[system: wall-clock timeout after {}s — stopping]", seconds);
-            eprintln!("raven: {}", msg);
+            // Note: in TUI mode this message is also logged via agent events; avoid raw eprint to protect display.
             agent.log_harness_event("timeout", &msg);
             Flow::BreakOuter
         }
@@ -606,7 +606,7 @@ async fn execute_verdict_decision(
 
         // JudgeNeeded should never come from apply_judge_verdict
         SteeringDecision::JudgeNeeded { .. } => {
-            eprintln!("raven: BUG — judge verdict produced another JudgeNeeded");
+            // raven: BUG — judge verdict produced another JudgeNeeded (logged via harness)
             Flow::Break
         }
 

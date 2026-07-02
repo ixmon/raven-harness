@@ -228,7 +228,10 @@ pub async fn run(
         crossterm::event::DisableMouseCapture
     )?;
     terminal.show_cursor()?;
-    if let Err(err) = res { eprintln!("TUI error: {:?}", err); }
+    if let Err(err) = res {
+        // TUI loop exited with error. Avoid polluting if possible, but this is shutdown path.
+        eprintln!("TUI error: {:?}", err);
+    }
     Ok(())
 }
 
