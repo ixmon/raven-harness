@@ -65,6 +65,22 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// The exact filtering we apply to a final_text (which may come from a tool
+/// response / model content that contains raw XML tool call syntax) before
+/// committing it to the conversation pane (`left_committed`).
+///
+/// This is the "circumstance" we must always hit: even if the strip function
+/// itself is correct, we have to *use* it here (and not fall back to raw when
+/// the result is empty).
+fn clean_final_text_for_pane(final_text: &str) -> Option<String> {
+    let cleaned = raven_tui::llm::strip_xml_tool_call_blocks(final_text);
+    if cleaned.trim().is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
 // ── TuiObserver ──────────────────────────────────────────────────────────────
 
 pub struct TuiObserver {
@@ -265,6 +281,31 @@ async fn run_app<B: ratatui::backend::Backend>(
     }
     let mut app = App::new(&config);
 
+    // On (re)start, prepopulate the conversation pane from the prebuilt/default
+    // session's log so previous work is visible immediately in the UI panes.
+    {
+        if let Ok(ag) = agent.try_lock() {
+            if let Some(s) = ag.session() {
+                if !s.id.is_empty() {
+                    let recent = s.load_recent_conversation(25);
+                    if !recent.is_empty() {
+                        app.left_committed.clear();
+                        for (role, content) in recent {
+                            let disp = if role == "user" {
+                                format!("> {}", content)
+                            } else {
+                                raven_tui::llm::strip_xml_tool_call_blocks(&content)
+                            };
+                            if !disp.trim().is_empty() {
+                                app.left_committed.push(disp);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Some(pfile) = &config.harness.initial_prompt_file {
         if let Ok(text) = std::fs::read_to_string(pfile) {
             let text = text.trim().to_string();
@@ -390,9 +431,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.needs_redraw = true;
                 }
                 UiUpdate::Done { final_text } => {
-                    let cleaned = raven_tui::llm::strip_xml_tool_call_blocks(&final_text);
-                    let to_commit = if !cleaned.trim().is_empty() { cleaned } else { final_text };
-                    if !to_commit.trim().is_empty() {
+                    // Use the component's filter (which applies strip and never falls back
+                    // to raw XML). This is the key circumstance we test.
+                    if let Some(to_commit) = clean_final_text_for_pane(&final_text) {
                         app.left_committed.push(to_commit);
                     }
                     if !app.current_thinking.is_empty() {
@@ -424,11 +465,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                     app.current_response.clear();
                     app.is_processing = false;
+                    // If stop was set (e.g. by Esc to abort a turn), reset it so the main
+                    // loop doesn't exit the app. The stop flag is used both for aborting
+                    // the current agent turn and for quitting the whole TUI.
+                    if stop_signal.load(Ordering::SeqCst) {
+                        stop_signal.store(false, Ordering::SeqCst);
+                    }
                     app.needs_redraw = true;
                 }
                 UiUpdate::Error(e) => {
                     app.left_committed.push(format!("Error: {}", e));
                     app.is_processing = false;
+                    if stop_signal.load(Ordering::SeqCst) {
+                        stop_signal.store(false, Ordering::SeqCst);
+                    }
                     app.needs_redraw = true;
                 }
                 UiUpdate::ContextUsage { used_tokens } => {
@@ -482,7 +532,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        if app.is_processing {
+        if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
 
@@ -509,7 +559,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         app.cached_agent_mode = agent_mode.clone();
 
         let workspace_display = config.workspace.display().to_string();
-        let show_gauge = app.is_processing;
+        let show_gauge = app.is_processing && !stop_signal.load(Ordering::SeqCst);
         let gauge_h = if show_gauge { 1 } else { 0 };
         let show_status = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Workspace);
         let show_input = show_status
@@ -539,6 +589,13 @@ async fn run_app<B: ratatui::backend::Backend>(
 
             terminal.draw(|f| {
                 let size = f.area();
+                // Ensure a consistent black background on all screens (picker, workspace,
+                // wiki viewer, splash, etc.). Individual panes reinforce with their blocks.
+                f.render_widget(
+                    ratatui::widgets::Block::default()
+                        .style(ratatui::style::Style::default().bg(ratatui::style::Color::Black)),
+                    size,
+                );
                 let vertical = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([Constraint::Length(status_h), Constraint::Min(6), Constraint::Length(gauge_h), Constraint::Length(input_h)])
@@ -598,10 +655,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                         model: &app.display_model, workspace: &workspace_display,
                     },
                     &tui_render::PickerDrawData {
-                        workspaces: &app.picker.workspaces,
-                        selected_workspace: app.picker.selected_workspace,
-                        sessions: &app.picker.sessions,
-                        selected_session: app.picker.selected_session,
+                        picker_items: &app.picker.picker_items,
+                        selected_item: app.picker.selected_item,
                         focus: app.picker.focus,
                         summary: &app.picker.summary,
                         summary_scroll: app.picker.summary_scroll,
@@ -676,7 +731,9 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.needs_redraw = true;
         }
 
-        if stop_signal.load(Ordering::SeqCst) { break; }
+        if stop_signal.load(Ordering::SeqCst) && !app.is_processing {
+            break;
+        }
     }
 
     Ok(())
@@ -698,4 +755,42 @@ fn schedule_balance_refresh(agent: &Arc<tokio::sync::Mutex<Agent>>, tx: &mpsc::S
     let agent2 = agent.clone();
     let btx = tx.clone();
     tokio::spawn(async move { refresh_balance_label(&agent2, &btx).await; });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clean_final_text_for_pane_drops_pure_tool_xml_from_tool_response() {
+        // Simulate a "final_text" that came from a tool-using turn where the
+        // model (or XML fallback path) put the raw tool call into the content.
+        // No live inference — we just feed the string that would reach the
+        // Done handler.
+        let xml_from_tool_response = r#"<tool_call>
+<function=browse>
+<parameter=url>https://arxiv.org/abs/2607.01224</parameter>
+</function>
+</tool_call>"#;
+
+        // This exercises the exact filter used by the conversation-pane commit
+        // component. If we ever stop calling the strip (or reintroduce the old
+        // "else use raw" fallback), this test will fail.
+        assert!(
+            clean_final_text_for_pane(xml_from_tool_response).is_none(),
+            "pure XML from a tool response must be filtered out before touching left_committed"
+        );
+    }
+
+    #[test]
+    fn clean_final_text_for_pane_keeps_narrative_but_drops_xml() {
+        let mixed = "I should search arXiv for related papers.\n<tool_call>\n<function=browse>\n<parameter=url>https://arxiv.org/abs/2607.01224</parameter>\n</function>\n</tool_call>";
+
+        let result = clean_final_text_for_pane(mixed)
+            .expect("should keep the narrative text");
+
+        assert!(result.contains("I should search arXiv"));
+        assert!(!result.contains("<tool_call"));
+        assert!(!result.contains("function=browse"));
+    }
 }

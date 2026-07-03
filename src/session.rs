@@ -90,6 +90,10 @@ fn default_agent_mode() -> String {
     "talk".to_string()
 }
 
+fn default_session_label() -> String {
+    "Undetermined".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SessionMeta {
     pub session_id: String,
@@ -120,6 +124,12 @@ pub struct SessionMeta {
     /// A compact rolling summary of recent work (last ~10 turns or equivalent).
     /// Kept small on purpose so it always fits in the injected block.
     pub recent_turns_summary: String,
+
+    /// Short (≤60 char) human-readable label for this session, shown in the
+    /// picker "Session Summary" pane. Generated when we write summaries.
+    /// Defaults to "Undetermined".
+    #[serde(default = "default_session_label")]
+    pub session_label: String,
 
     /// Controls approval requirements for side-effecting actions (exec, writes, etc.)
     #[serde(default)]
@@ -167,6 +177,42 @@ impl Session {
     /// (for repo cache / summaries / trusted flag etc.).
     pub fn init_named(workspace: &Path, name: &str) -> Result<Self> {
         Self::init_internal(workspace, Some(name))
+    }
+
+    /// Open an existing session by its opaque id (the subdir name under
+    /// ~/.raven-hotel/sessions/<id>/). Used by the TUI picker to resume a
+    /// specific session (including named ones) rather than the workspace's
+    /// default id.
+    pub fn open(session_id: &str) -> Result<Self> {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
+        let dir = base.join(session_id);
+        if !dir.is_dir() {
+            anyhow::bail!("session not found: {}", session_id);
+        }
+        let meta_path = dir.join("meta.json");
+        let log_path = dir.join("full_log.jsonl");
+
+        let mut meta: SessionMeta = if meta_path.exists() {
+            let data = fs::read_to_string(&meta_path)?;
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            SessionMeta::default()
+        };
+        if meta.session_id.is_empty() {
+            meta.session_id = session_id.to_string();
+        }
+        // workspace may be empty in old metas; caller should have it from list
+        let workspace = meta.workspace.clone();
+
+        Ok(Self {
+            id: session_id.to_string(),
+            dir,
+            meta_path,
+            log_path,
+            workspace,
+            meta,
+        })
     }
 
     fn init_internal(workspace: &Path, explicit_name: Option<&str>) -> Result<Self> {
@@ -467,6 +513,19 @@ impl Session {
     /// Update the rolling recent-turns summary (kept deliberately small).
     pub fn set_recent_turns_summary(&mut self, summary: &str) -> Result<()> {
         self.meta.recent_turns_summary = summary.trim().to_string();
+        self.meta.updated_at = now_iso();
+        self.save_meta()
+    }
+
+    /// Set a short human label for the session (≤60 chars). Shown in the TUI picker.
+    pub fn set_session_label(&mut self, label: &str) -> Result<()> {
+        let mut l = label.trim().to_string();
+        if l.is_empty() {
+            l = "Undetermined".to_string();
+        } else if l.len() > 60 {
+            l = crate::tools::safe_truncate(&l, 57).to_string() + "...";
+        }
+        self.meta.session_label = l;
         self.meta.updated_at = now_iso();
         self.save_meta()
     }

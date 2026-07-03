@@ -74,7 +74,7 @@ pub async fn handle_key_event(
                 let col = me.column;
                 let row = me.row;
                 if app.desktop.showing_picker() {
-                    app.picker.focus = crate::app_state::PickerFocus::Sessions;
+                    app.picker.focus = crate::app_state::PickerFocus::Tree;
                     app.needs_redraw = true;
                     handled = true;
                 } else if matches!(app.desktop.active, ActiveDesktop::Workspace) {
@@ -246,7 +246,7 @@ async fn handle_input_key(
         return Ok(true);
     }
 
-    // Session picker screen navigation (two drop-down lists)
+    // Session/workspace picker screen navigation (combined tree of workspaces + sessions)
     if app.desktop.showing_picker() && app.handle_picker_key(key.code, agent) {
         return Ok(true);
     }
@@ -277,7 +277,7 @@ async fn handle_input_key(
                             app.desktop.set_wiki_viewer();
                         } else {
                             app.desktop.set_picker();
-                            app.picker.focus = crate::app_state::PickerFocus::Sessions;
+                            app.picker.focus = crate::app_state::PickerFocus::Tree;
                             if !app.picker.loaded {
                                 app.refresh_picker();
                             }
@@ -466,6 +466,9 @@ async fn handle_input_key(
 
                 match crate::input_dispatch::dispatch_slash_command(&prompt, &mut ctx) {
                     crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {
+                        // Starting a fresh turn: ensure any prior stop (from Esc abort) is cleared
+                        // so the new drive_turn isn't immediately aborted by a stale flag.
+                        stop.store(false, std::sync::atomic::Ordering::SeqCst);
                         app.is_processing = true;
                         app.needs_redraw = true;
 
@@ -484,7 +487,7 @@ async fn handle_input_key(
                             let mut obs = crate::event_loop::TuiObserver {
                                 tx: tx_c.clone(),
                                 approval_req_tx: appr_c,
-                                stop: stop_c,
+                                stop: stop_c.clone(),
                                 queued: q_c,
                                 instant: i_c,
                                 denials_this_turn: 0,
@@ -502,6 +505,13 @@ async fn handle_input_key(
                                         let mut cycle = 0u32;
 
                                         loop {
+                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                    name: "system".into(),
+                                                    summary: "⏹ Stopped (Esc)".into(),
+                                                }).await;
+                                                break;
+                                            }
                                             if cycle >= MAX_SUPER_JUDGE_CYCLES {
                                                 let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
                                                     name: "system".into(),
@@ -513,17 +523,33 @@ async fn handle_input_key(
 
                                             // Brief pause for UX (shows Processing off briefly)
                                             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                    name: "system".into(),
+                                                    summary: "⏹ Stopped (Esc)".into(),
+                                                }).await;
+                                                break;
+                                            }
                                             let _ = tx_c.send(crate::event_loop::UiUpdate::SuperJudgeBegin).await;
                                             let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
                                                 name: "system".into(),
                                                 summary: format!("🔍 Super Judge reviewing work (cycle {}/{})", cycle, MAX_SUPER_JUDGE_CYCLES),
                                             }).await;
 
-                                            // Use the headless Super Judge observer
+                                            // Use the headless Super Judge observer (its review may run to completion;
+                                            // subsequent nudges and loops will abort on stop).
                                             let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
                                             let verdict = raven_tui::super_judge::run_super_judge_with_observer(
                                                 &mut ag, &last_text, &all_actions, &mut sj_obs,
                                             ).await;
+
+                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                    name: "system".into(),
+                                                    summary: "⏹ Stopped (Esc)".into(),
+                                                }).await;
+                                                break;
+                                            }
 
                                             match verdict {
                                                 raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
@@ -538,6 +564,13 @@ async fn handle_input_key(
                                                         name: "system".into(),
                                                         summary: "🔍 Super Judge: NEEDS_WORK — nudging agent".to_string(),
                                                     }).await;
+                                                    if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                                        let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
+                                                            name: "system".into(),
+                                                            summary: "⏹ Stopped (Esc)".into(),
+                                                        }).await;
+                                                        break;
+                                                    }
                                                     // Inject feedback and re-run
                                                     let nudge = format!(
                                                         "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
@@ -618,6 +651,21 @@ async fn handle_input_key(
             Ok(true)
         }
         KeyCode::Esc => {
+            if app.is_processing {
+                // Signal the running drive_turn (via TuiObserver) to stop at the next
+                // safe point. We intentionally do NOT clear is_processing here: the
+                // post-input "stop && !is_processing => quit app" check would otherwise
+                // exit the TUI. The turn will send Done (which clears is_processing and
+                // resets the stop flag). Gauge drawing suppresses while stop is asserted.
+                // Stop takes effect at round boundaries (after current tool batch or
+                // sooner for remaining tools in the batch).
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                app.trace_lines.push("⏹ Stopped by user (Esc)".to_string());
+                app.right_follow_output = true;
+                app.right_scroll = 10_000;
+                app.needs_redraw = true;
+                return Ok(true);
+            }
             // Clear input or close menus
             if app.search_mode {
                 app.search_mode = false;

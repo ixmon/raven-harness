@@ -715,7 +715,7 @@ pub fn draw_slash_menu(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x55)))
-            .style(Style::default().bg(Color::Rgb(0x22, 0x22, 0x33))),
+            .style(Style::default().bg(Color::Black)),
     );
     f.render_widget(Clear, menu_area);
     f.render_widget(menu_block, menu_area);
@@ -769,7 +769,7 @@ pub fn draw_mode_menu(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x55)))
-            .style(Style::default().bg(Color::Rgb(0x22, 0x22, 0x33))),
+            .style(Style::default().bg(Color::Black)),
     );
     f.render_widget(Clear, menu_area);
     f.render_widget(menu_block, menu_area);
@@ -1054,7 +1054,7 @@ pub fn draw_overlays(
 }
 
 fn conversation_entry_styles(entry: &str) -> (Style, Style) {
-    if entry.starts_with("You: ") {
+    if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
         (
             Style::default()
                 .fg(Color::Cyan)
@@ -1081,6 +1081,15 @@ fn conversation_entry_styles(entry: &str) -> (Style, Style) {
         (
             Style::default().fg(Color::Yellow),
             Style::default().fg(Color::Yellow),
+        )
+    } else if entry.starts_with("Raven Hotel - Loaded session")
+        || entry.starts_with("Use ↑/↓")
+    {
+        // Subtle instructions and initial session banners — keep them visually
+        // separate from actual conversation turns.
+        (
+            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::DarkGray),
         )
     } else {
         (
@@ -1196,7 +1205,8 @@ fn render_scrollable_pane(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(focus_style)
-                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
+                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                .style(Style::default().bg(Color::Black)),
         )
         .wrap(Wrap { trim: false })
         .scroll((*scroll, 0));
@@ -1213,15 +1223,12 @@ fn render_scrollable_pane(
     }
 }
 
-fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+fn truncate_str(s: &str, max_chars: usize) -> String {
+    if char_count(s) <= max_chars {
         return s.to_string();
     }
-    let end = (0..=max)
-        .rev()
-        .find(|&i| s.is_char_boundary(i))
-        .unwrap_or(0);
-    format!("{}…", &s[..end])
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{}…", truncated)
 }
 
 fn char_count(s: &str) -> usize {
@@ -1350,10 +1357,9 @@ pub struct SplashData<'a> {
 }
 
 pub struct PickerDrawData<'a> {
-    pub workspaces: &'a [raven_tui::session::WorkspaceEntry],
-    pub selected_workspace: usize,
-    pub sessions: &'a [raven_tui::session::SessionMeta],
-    pub selected_session: usize,
+    // Tree combines workspaces + indented sessions under them (sessions pane removed)
+    pub picker_items: &'a [crate::app_state::PickerItem],
+    pub selected_item: usize,
     pub focus: crate::app_state::PickerFocus,
     pub summary: &'a str,
     pub summary_scroll: usize,
@@ -1377,7 +1383,7 @@ pub struct WorkspaceDrawData<'a> {
 }
 
 /// Draw splash or workspace, or animate a horizontal slide between them.
-/// When desktop is Picker, draws the two-column session/workspace chooser.
+/// When desktop is Picker, draws the combined workspaces+sessions tree + summary (no separate sessions pane).
 pub fn draw_content_desktop(
     f: &mut Frame,
     content_area: Rect,
@@ -1549,7 +1555,7 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
         nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
     }
     let nav_para = Paragraph::new(nav_text)
-        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))));
+        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
     f.render_widget(nav_para, nav_area);
 
     // Content pane - larger wiki display; highlight active nav target where possible
@@ -1599,8 +1605,13 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
         for span in &mut line.spans {
             let matches = !search.is_empty() && span.content.contains(&search);
             if matches || is_active_region {
+                // Subtle highlight for active nav target (heading or link) in wiki content,
+                // matching the style used for selected items in nav/tree panes.
                 let mut st = span.style;
-                st = st.fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED | Modifier::REVERSED);
+                st = st
+                    .fg(Color::White)
+                    .bg(Color::Rgb(0x20, 0x50, 0x80))
+                    .add_modifier(Modifier::BOLD);
                 span.style = st;
             }
         }
@@ -1613,23 +1624,24 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     // No Wrap — our renderer controls line layout (tables rely on exact alignment).
     // ratatui clips lines at the widget edge when wrap is disabled.
     let content_para = Paragraph::new(content_text)
-        .block(Block::default().title(" Wiki ").borders(Borders::ALL).border_style(content_border).style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))));
+        .block(Block::default().title(" Wiki ").borders(Borders::ALL).border_style(content_border).style(Style::default().bg(Color::Black)));
     f.render_widget(content_para, content_area);
 }
 
 pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
+    // Single tree column (workspaces + indented sessions) + summary.
+    // This removes the separate narrow Sessions pane.
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(28), Constraint::Percentage(28), Constraint::Percentage(44)])
+        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(area);
 
-    draw_workspace_column(f, cols[0], data.workspaces, data.selected_workspace, data.focus == crate::app_state::PickerFocus::Workspaces);
-    draw_sessions_column(f, cols[1], data.sessions, data.selected_session, data.focus == crate::app_state::PickerFocus::Sessions);
-    draw_session_summary(f, cols[2], data.summary, data.summary_scroll, data.focus == crate::app_state::PickerFocus::Summary, data.wiki_links, data.active_link_idx, data.summary_action);
+    draw_picker_tree(f, cols[0], data.picker_items, data.selected_item, data.focus == crate::app_state::PickerFocus::Tree);
+    draw_session_summary(f, cols[1], data.summary, data.summary_scroll, data.focus == crate::app_state::PickerFocus::Summary, data.wiki_links, data.active_link_idx, data.summary_action);
 
     // subtle hint line at bottom of area if space
     if area.height > 4 {
-        let hint = " ←/→ focus Summary  w: toggle Wiki  Enter: full Wiki viewer or Launch  a/n/d  (right on Summary -> wiki view)";
+        let hint = "↑↓ Tree  ←→ focus  w: wiki  Enter: launch  (right on summary -> full wiki)";
         let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
         f.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
@@ -1638,6 +1650,69 @@ pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
     }
 }
 
+fn draw_picker_tree(
+    f: &mut Frame,
+    area: Rect,
+    items: &[crate::app_state::PickerItem],
+    selected: usize,
+    focused: bool,
+) {
+    // Combined tree: workspaces at depth 0, their sessions indented (depth 1).
+    // Truncation uses the actual inner width of this pane (no hard-coded char limits).
+    let mut text = Text::default();
+
+    if items.is_empty() {
+        text.lines.push(Line::from(Span::styled("  (no workspaces)", Style::default().fg(Color::DarkGray))));
+    } else {
+        // Compute usable width from the rendered pane area (borders on each side).
+        // We subtract a small margin so text doesn't butt against the right border.
+        let inner_width = area.width.saturating_sub(2).max(4) as usize;
+        let maxw = inner_width.saturating_sub(2);
+
+        for (i, item) in items.iter().enumerate().take(18) {
+            let is_sel = i == selected;
+            // Distinguish workspace headers from session rows in the combined tree.
+            let prefix = if item.depth == 0 {
+                if is_sel { "▶ " } else { "▷ " }
+            } else if is_sel {
+                "▶ "
+            } else {
+                "  "
+            };
+            let indent = "  ".repeat(item.depth);
+            let style = if is_sel {
+                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
+            } else if focused {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+            };
+            let label = format!("{}{}{}", prefix, indent, item.label);
+            text.lines.push(Line::from(Span::styled(truncate_str(&label, maxw), style)));
+        }
+    }
+
+    let border_style = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let para = Paragraph::new(text)
+        .block(
+            Block::default()
+                .title(" Workspaces / Sessions ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(border_style)
+                .padding(ratatui::widgets::Padding::new(1, 1, 1, 0))
+                .style(Style::default().bg(Color::Black)),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(para, area);
+}
+
+// Old column fn kept for now (no longer used by draw_picker)
+#[allow(dead_code)]
 fn draw_workspace_column(
     f: &mut Frame,
     area: Rect,
@@ -1691,12 +1766,13 @@ fn draw_workspace_column(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style)
-                .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
+                .style(Style::default().bg(Color::Black)),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
+#[allow(dead_code)]
 fn draw_sessions_column(
     f: &mut Frame,
     area: Rect,
@@ -1746,7 +1822,7 @@ fn draw_sessions_column(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style)
-                .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
+                .style(Style::default().bg(Color::Black)),
         )
         .wrap(Wrap { trim: false });
     f.render_widget(para, area);
@@ -1789,11 +1865,6 @@ fn draw_session_summary(
     let content_area = area;
 
     let mut text = Text::default();
-    text.lines.push(Line::from(Span::styled(
-        "  Session Summary",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-    )));
-    text.lines.push(Line::from(""));
 
     let start = scroll;
     let max_lines = (content_area.height as usize).saturating_sub(4);
@@ -1817,11 +1888,11 @@ fn draw_session_summary(
     let para = Paragraph::new(text)
         .block(
             Block::default()
-                .title(" Summary ")
+                .title(" Session Summary ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style)
-                .style(Style::default().bg(Color::Rgb(0x1a, 0x1a, 0x22))),
+                .style(Style::default().bg(Color::Black)),
         );
     f.render_widget(para, content_area);
 }
@@ -1856,7 +1927,8 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
         ]))
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff)));
+        .border_style(Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff)))
+        .style(Style::default().bg(Color::Black));
 
     let inner = block.inner(area);
     block.render(area, buf);
@@ -2370,7 +2442,8 @@ fn render_scrollable_pane_buf(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(focus_style)
-                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
+                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                .style(Style::default().bg(Color::Black)),
         )
         .wrap(Wrap { trim: false })
         .scroll((*scroll, 0))
