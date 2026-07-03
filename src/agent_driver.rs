@@ -322,11 +322,14 @@ pub async fn drive_turn(
             }
 
             // ── 7. Execute tool calls ──
+            if observer.should_stop() {
+                break 'auto_continue;
+            }
             steering.tools_used += tool_calls.len();
 
             let mut to_execute: Vec<ToolCall> = vec![];
             for tc in &tool_calls {
-                if observer.stop_tool_processing() {
+                if observer.should_stop() || observer.stop_tool_processing() {
                     break;
                 }
                 if observer.approve_tool(tc).await {
@@ -341,22 +344,36 @@ pub async fn drive_turn(
                         tc.function.name
                     );
                     agent.record_tool_denial(tc, &deny);
-                    if observer.stop_tool_processing() {
+                    if observer.should_stop() || observer.stop_tool_processing() {
                         break;
                     }
                 }
             }
 
-            let records = agent.execute_and_record_tool_calls(&to_execute).await;
-            for r in &records {
-                observer.on_tool_result(r);
-                estimated_tool_tokens += r.estimated_tokens as u64;
-                if r.tool == "read_summary" && r.output_to_model.contains("(fresh summary)") {
-                    cache_summary_hits += 1;
-                    estimated_summary_tokens += r.estimated_tokens as u64;
-                }
+            if observer.should_stop() {
+                break 'auto_continue;
             }
-            all_actions.extend(records);
+
+            // Execute the approved tools for this round one-by-one so that a stop
+            // asserted mid-batch (e.g. Esc) can prevent the *remaining* tools in
+            // the current model response from running. The tool already in flight
+            // will complete (tools are not cancelled mid-exec), then we abort before
+            // the next one and before any subsequent LLM round.
+            for tc in to_execute {
+                if observer.should_stop() {
+                    break 'auto_continue;
+                }
+                let recs = agent.execute_and_record_tool_calls(&[tc]).await;
+                for r in &recs {
+                    observer.on_tool_result(r);
+                    estimated_tool_tokens += r.estimated_tokens as u64;
+                    if r.tool == "read_summary" && r.output_to_model.contains("(fresh summary)") {
+                        cache_summary_hits += 1;
+                        estimated_summary_tokens += r.estimated_tokens as u64;
+                    }
+                }
+                all_actions.extend(recs);
+            }
 
             observer.on_context_usage(agent.estimated_context_tokens());
         }
@@ -379,20 +396,15 @@ pub async fn drive_turn(
     observer.on_context_usage(agent.estimated_context_tokens());
 
     // Final authoritative pass: strip XML from session log tail.
-    let final_text = if let Some(tail) = agent
+    // Never fall back to unstripped last_assistant_text; if the log tail was pure
+    // tool XML it will become empty (correct — don't show naked calls in history).
+    let final_text = agent
         .session
         .as_ref()
         .and_then(|s| s.last_assistant_content())
-    {
-        let cleaned = crate::llm::strip_xml_tool_call_blocks(&tail);
-        if !cleaned.trim().is_empty() {
-            cleaned
-        } else {
-            last_assistant_text
-        }
-    } else {
-        last_assistant_text
-    };
+        .map(|tail| crate::llm::strip_xml_tool_call_blocks(&tail))
+        .filter(|c| !c.trim().is_empty())
+        .unwrap_or_else(|| crate::llm::strip_xml_tool_call_blocks(&last_assistant_text));
 
     let tool_call_count = all_actions.len() as u32;
 

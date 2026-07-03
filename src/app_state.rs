@@ -45,8 +45,7 @@ pub enum Pane {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PickerFocus {
     #[default]
-    Workspaces,
-    Sessions,
+    Tree,
     Summary,
 }
 
@@ -62,6 +61,18 @@ pub enum WikiFocus {
     #[default]
     Nav,
     Content,
+}
+
+#[derive(Clone, Debug)]
+pub struct PickerItem {
+    pub depth: usize,
+    pub label: String,
+    // Transient index into current self.workspaces / self.sessions at build time (for compat).
+    pub workspace_idx: usize,
+    pub session_idx: Option<usize>, // None = workspace row
+    // Stable keys for reliable re-selection after refresh (new 'n', deletes, etc.)
+    pub workspace_path: std::path::PathBuf,
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -105,12 +116,15 @@ pub struct WikiNavItem {
 pub struct PickerState {
     pub workspaces: Vec<WorkspaceEntry>,
     pub selected_workspace: usize,
-    pub sessions: Vec<SessionMeta>,
+    pub sessions: Vec<SessionMeta>, // for currently selected workspace
     pub selected_session: usize,
     pub focus: PickerFocus,
     pub loaded: bool,
     pub summary: String,
     pub summary_scroll: usize,
+    // Tree view: combined workspaces + indented sessions (replaces separate sessions pane)
+    pub picker_items: Vec<PickerItem>,
+    pub selected_item: usize,
     // Current file shown in the summary/wiki column (relative to wiki/ dir)
     pub current_wiki_file: String,
     pub current_wiki_content: String,
@@ -1132,7 +1146,7 @@ impl App {
 
     /// Handle keys when in the full wiki viewer screen.
     /// Returns true if handled.
-    pub fn handle_wiki_viewer_key(&mut self, key: KeyCode, _agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) -> bool {
+    pub fn handle_wiki_viewer_key(&mut self, key: KeyCode, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) -> bool {
         if !self.desktop.showing_wiki_viewer() {
             return false;
         }
@@ -1152,8 +1166,13 @@ impl App {
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 if self.wiki_viewer.focus == WikiFocus::Content {
-                    // Rightmost pane — move to workspace screen
+                    // Rightmost pane — move to workspace screen.
+                    // Make sure the selected session's history prepopulates the conv/trace panes.
+                    let sid = self.wiki_viewer.session_id.clone();
                     self.desktop.exit_wiki_viewer_to_workspace();
+                    if !sid.is_empty() {
+                        self.activate_session_by_id(&sid, agent);
+                    }
                     self.needs_redraw = true;
                     true
                 } else {
@@ -1256,7 +1275,47 @@ impl App {
                 self.picker.selected_workspace = 0;
             }
         }
-        self.refresh_picker_sessions();
+
+        // Build combined tree items (workspaces + their sessions indented) so we can
+        // eliminate the separate sessions column/pane.
+        let mut items: Vec<PickerItem> = vec![];
+        for (wi, ws) in self.picker.workspaces.iter().enumerate() {
+            // Store full path; truncation happens at render time based on pane width
+            let label = ws.path.display().to_string();
+            items.push(PickerItem {
+                depth: 0,
+                label,
+                workspace_idx: wi,
+                session_idx: None,
+                workspace_path: ws.path.clone(),
+                session_id: None,
+            });
+
+            // Load sessions for this workspace to populate the tree (small N)
+            if let Ok(ses) = raven_tui::session::list_sessions_for(&ws.path) {
+                for (si, s) in ses.iter().enumerate().take(5) {
+                    let short = &s.session_id[..s.session_id.len().min(18)];
+                    let date = &s.updated_at[..s.updated_at.len().min(10)];
+                    // Clean label; indent added in renderer based on depth.
+                    let label = format!("{}  {}", short, date);
+                    items.push(PickerItem {
+                        depth: 1,
+                        label,
+                        workspace_idx: wi,
+                        session_idx: Some(si),
+                        workspace_path: ws.path.clone(),
+                        session_id: Some(s.session_id.clone()),
+                    });
+                }
+            }
+        }
+        self.picker.picker_items = items;
+        if self.picker.selected_item >= self.picker.picker_items.len() {
+            self.picker.selected_item = 0;
+        }
+
+        self.sync_picker_selection();
+        self.refresh_picker_summary();
         self.picker.loaded = true;
     }
 
@@ -1276,6 +1335,43 @@ impl App {
             self.picker.selected_session = 0;
         }
         self.refresh_picker_summary();
+    }
+
+    fn sync_picker_selection(&mut self) {
+        if let Some(item) = self.picker.picker_items.get(self.picker.selected_item) {
+            // Resolve workspace index by stable path when possible (handles list reorder)
+            let wi = if let Some(pos) = self.picker.workspaces.iter().position(|w| w.path == item.workspace_path) {
+                pos
+            } else {
+                item.workspace_idx.min(self.picker.workspaces.len().saturating_sub(1))
+            };
+            self.picker.selected_workspace = wi;
+
+            // Always reload the sessions list for the resolved ws (newest first)
+            let ws_path = self.picker.workspaces.get(wi).map(|w| w.path.clone()).unwrap_or_else(|| item.workspace_path.clone());
+            if let Ok(ses) = raven_tui::session::list_sessions_for(&ws_path) {
+                self.picker.sessions = ses;
+            } else {
+                self.picker.sessions.clear();
+            }
+
+            // Resolve selected session by stable id or by index, else default to first (newest)
+            if let Some(ref sid) = item.session_id {
+                if let Some(pos) = self.picker.sessions.iter().position(|m| &m.session_id == sid) {
+                    self.picker.selected_session = pos;
+                    return;
+                }
+            }
+            if let Some(si) = item.session_idx {
+                if si < self.picker.sessions.len() {
+                    self.picker.selected_session = si;
+                    return;
+                }
+            }
+            if !self.picker.sessions.is_empty() {
+                self.picker.selected_session = 0;
+            }
+        }
     }
 
     pub fn refresh_picker_summary(&mut self) {
@@ -1301,6 +1397,11 @@ impl App {
             let agent_mode = meta.agent_mode.clone();
             let updated_at = meta.updated_at.clone();
             let current_goal = meta.current_goal.clone();
+            let session_label = if meta.session_label.trim().is_empty() {
+                "Undetermined".to_string()
+            } else {
+                meta.session_label.clone()
+            };
             let recent_turns_summary = meta.recent_turns_summary.clone();
             let repo_short = meta.repo_cache.short_summary.clone();
 
@@ -1351,7 +1452,8 @@ impl App {
                     meta.discoveries.iter().map(|d| format!("  - {}", d)).collect::<Vec<_>>().join("\n")
                 };
                 format!(
-                    "Session: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}",
+                    "{}\n\nSession: {}\nWorkspace: {}\n\nMode: {}\nUpdated: {}\n\nGoal:\n  {}\n\nAchievement tests:\n{}\n\nPitfalls:\n{}\n\nDiscoveries:\n{}\n\nRecent summary:\n  {}\n\nRepo summary:\n  {}",
+                    session_label,
                     session_id,
                     workspace.display(),
                     agent_mode,
@@ -1528,20 +1630,10 @@ impl App {
         match key {
             KeyCode::Up | KeyCode::Char('k') => {
                 match self.picker.focus {
-                    PickerFocus::Workspaces => {
-                        if self.picker.selected_workspace > 0 {
-                            self.picker.selected_workspace -= 1;
-                            self.refresh_picker_sessions();
-                            self.refresh_picker_summary();
-                        }
-                    }
-                    PickerFocus::Sessions => {
-                        if self.picker.selected_session > 0 {
-                            self.picker.selected_session -= 1;
-                            self.picker.summary_scroll = 0;
-                            self.picker.current_wiki_file = "index.md".to_string();
-                            self.picker.show_wiki_in_summary = false;
-                            self.picker.summary_action = SummaryAction::ViewWiki;
+                    PickerFocus::Tree => {
+                        if self.picker.selected_item > 0 {
+                            self.picker.selected_item -= 1;
+                            self.sync_picker_selection();
                             self.refresh_picker_summary();
                         }
                     }
@@ -1556,20 +1648,10 @@ impl App {
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 match self.picker.focus {
-                    PickerFocus::Workspaces => {
-                        if self.picker.selected_workspace + 1 < self.picker.workspaces.len() {
-                            self.picker.selected_workspace += 1;
-                            self.refresh_picker_sessions();
-                            self.refresh_picker_summary();
-                        }
-                    }
-                    PickerFocus::Sessions => {
-                        if self.picker.selected_session + 1 < self.picker.sessions.len() {
-                            self.picker.selected_session += 1;
-                            self.picker.summary_scroll = 0;
-                            self.picker.current_wiki_file = "index.md".to_string();
-                            self.picker.show_wiki_in_summary = false;
-                            self.picker.summary_action = SummaryAction::ViewWiki;
+                    PickerFocus::Tree => {
+                        if self.picker.selected_item + 1 < self.picker.picker_items.len() {
+                            self.picker.selected_item += 1;
+                            self.sync_picker_selection();
                             self.refresh_picker_summary();
                         }
                     }
@@ -1585,10 +1667,7 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') => {
                 match self.picker.focus {
                     PickerFocus::Summary => {
-                        self.picker.focus = PickerFocus::Sessions;
-                    }
-                    PickerFocus::Sessions => {
-                        self.picker.focus = PickerFocus::Workspaces;
+                        self.picker.focus = PickerFocus::Tree;
                     }
                     _ => {
                         self.exit_picker_to_main();
@@ -1599,11 +1678,7 @@ impl App {
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 match self.picker.focus {
-                    PickerFocus::Workspaces => {
-                        self.picker.focus = PickerFocus::Sessions;
-                        self.refresh_picker_summary();
-                    }
-                    PickerFocus::Sessions => {
+                    PickerFocus::Tree => {
                         self.picker.focus = PickerFocus::Summary;
                         self.picker.summary_scroll = 0;
                         self.refresh_picker_summary();
@@ -1619,8 +1694,18 @@ impl App {
             }
             KeyCode::Enter => {
                 match self.picker.focus {
-                    PickerFocus::Sessions => {
-                        self.activate_selected_session(agent);
+                    PickerFocus::Tree => {
+                        let item = self.picker.picker_items.get(self.picker.selected_item).cloned();
+                        self.sync_picker_selection();
+                        if let Some(item) = item {
+                            if item.session_id.is_some() || item.depth == 1 {
+                                self.activate_selected_session(agent);
+                            } else {
+                                // workspace header row -> focus its (first/newest) session summary
+                                self.picker.focus = PickerFocus::Summary;
+                                self.refresh_picker_summary();
+                            }
+                        }
                     }
                     PickerFocus::Summary => {
                         let n_links = self.picker.wiki_links.len();
@@ -1638,9 +1723,6 @@ impl App {
                             // No links, default to wiki viewer
                             self.enter_wiki_viewer();
                         }
-                    }
-                    _ => {
-                        self.picker.focus = PickerFocus::Sessions;
                     }
                 }
                 self.needs_redraw = true;
@@ -1698,14 +1780,26 @@ impl App {
                 true
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
-                // New session for current ws
+                // New session for current ws — the tree now owns selection (sessions live under ws rows)
                 if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
+                    let ws_path = ws.path.clone();
                     let name = format!("new-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                    if let Ok(_s) = raven_tui::session::Session::init_named(&ws.path, &name) {
+                    if let Ok(new_sess) = raven_tui::session::Session::init_named(&ws_path, &name) {
+                        let new_id = new_sess.id.clone();
                         self.refresh_picker();
-                        // select the new one? for simplicity refresh will have it at end or sort
-                        if !self.picker.sessions.is_empty() {
-                            self.picker.selected_session = self.picker.sessions.len() - 1;
+                        // Prefer stable session id to pick the correct tree row (newest first after sort)
+                        if let Some(pos) = self.picker.picker_items.iter().position(|it| {
+                            it.session_id.as_ref() == Some(&new_id)
+                        }) {
+                            self.picker.selected_item = pos;
+                            self.sync_picker_selection();
+                            self.refresh_picker_summary();
+                        } else if let Some(pos) = self.picker.picker_items.iter().position(|it| {
+                            it.workspace_path == ws_path && it.depth == 1
+                        }) {
+                            // Fallback: first session row under this ws (newest)
+                            self.picker.selected_item = pos;
+                            self.sync_picker_selection();
                             self.refresh_picker_summary();
                         }
                     }
@@ -1714,19 +1808,19 @@ impl App {
                 true
             }
             KeyCode::Char('d') | KeyCode::Char('D') => {
-                // Delete current focus item
-                if self.picker.focus == PickerFocus::Workspaces {
-                    if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
-                        if let Ok(ses) = raven_tui::session::list_sessions_for(&ws.path) {
-                            for s in ses {
-                                let _ = remove_session_dir(&s.session_id);
+                // Delete current focus item (tree now combines ws + sessions)
+                if self.picker.focus == PickerFocus::Tree {
+                    if let Some(item) = self.picker.picker_items.get(self.picker.selected_item) {
+                        if let Some(ref sid) = item.session_id {
+                            let _ = remove_session_dir(sid);
+                        } else {
+                            // ws header: delete all its sessions (use stable path)
+                            if let Ok(ses) = raven_tui::session::list_sessions_for(&item.workspace_path) {
+                                for s in ses {
+                                    let _ = remove_session_dir(&s.session_id);
+                                }
                             }
                         }
-                        self.refresh_picker();
-                    }
-                } else if self.picker.focus == PickerFocus::Sessions {
-                    if let Some(s) = self.picker.sessions.get(self.picker.selected_session) {
-                        let _ = remove_session_dir(&s.session_id);
                         self.refresh_picker();
                     }
                 }
@@ -1743,30 +1837,33 @@ impl App {
                     }
                     self.needs_redraw = true;
                     return true;
-                } else if self.picker.focus == PickerFocus::Sessions {
-                    if let Some(s) = self.picker.sessions.get(self.picker.selected_session) {
-                        let wiki_file = if self.picker.current_wiki_file.is_empty() {
-                            "index.md".to_string()
-                        } else {
-                            self.picker.current_wiki_file.clone()
-                        };
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                        let wiki_path = std::path::PathBuf::from(home)
-                            .join(".raven-hotel").join("sessions").join(&s.session_id)
-                            .join("wiki").join(&wiki_file);
-                        let content = std::fs::read_to_string(&wiki_path)
-                            .unwrap_or_else(|_| format!("(no {wiki_file} yet — agent can create one with write_wiki)"));
-                        self.left_committed.push(format!("=== Wiki: {} ===\n{}", wiki_file, content));
-                        self.left_follow_output = true;
-                        self.left_scroll = 10_000;
-                        self.needs_redraw = true;
-                        return true;
+                } else if self.picker.focus == PickerFocus::Tree {
+                    // From tree, if on a session row, dump its wiki to main left pane (like old behavior)
+                    if let Some(item) = self.picker.picker_items.get(self.picker.selected_item) {
+                        if let Some(ref sid) = item.session_id {
+                            let wiki_file = if self.picker.current_wiki_file.is_empty() {
+                                "index.md".to_string()
+                            } else {
+                                self.picker.current_wiki_file.clone()
+                            };
+                            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+                            let wiki_path = std::path::PathBuf::from(home)
+                                .join(".raven-hotel").join("sessions").join(sid)
+                                .join("wiki").join(&wiki_file);
+                            let content = std::fs::read_to_string(&wiki_path)
+                                .unwrap_or_else(|_| format!("(no {wiki_file} yet — agent can create one with write_wiki)"));
+                            self.left_committed.push(format!("=== Wiki: {} ===\n{}", wiki_file, content));
+                            self.left_follow_output = true;
+                            self.left_scroll = 10_000;
+                            self.needs_redraw = true;
+                            return true;
+                        }
                     }
                 }
                 true
             }
             KeyCode::PageUp => {
-                if self.picker.focus == PickerFocus::Sessions || self.picker.focus == PickerFocus::Summary {
+                if self.picker.focus == PickerFocus::Tree || self.picker.focus == PickerFocus::Summary {
                     self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(12);
                     self.recompute_active_link();
                     self.needs_redraw = true;
@@ -1775,7 +1872,7 @@ impl App {
                 false
             }
             KeyCode::PageDown => {
-                if self.picker.focus == PickerFocus::Sessions || self.picker.focus == PickerFocus::Summary {
+                if self.picker.focus == PickerFocus::Tree || self.picker.focus == PickerFocus::Summary {
                     self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(12);
                     self.recompute_active_link();
                     self.needs_redraw = true;
@@ -1788,38 +1885,46 @@ impl App {
     }
 
     fn activate_selected_session(&mut self, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) {
-        let ws_path = match self.picker.workspaces.get(self.picker.selected_workspace) {
-            Some(w) => w.path.clone(),
-            None => return,
+        let sess_id = if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
+            meta.session_id.clone()
+        } else {
+            return;
         };
-        let sess_meta = match self.picker.sessions.get(self.picker.selected_session) {
-            Some(s) => s.clone(),
-            None => return,
-        };
+        self.activate_session_by_id(&sess_id, agent);
+    }
 
-        // Load (or resume) the session for this workspace.
-        let loaded_sess = match raven_tui::session::Session::init(&ws_path) {
+    /// Load a specific session (by its persisted id) into the agent and prepopulate
+    /// the workspace UI panes (conversation + resets trace). Used both by picker
+    /// "launch" and when arrowing from wiki viewer into the programming screen.
+    fn activate_session_by_id(&mut self, session_id: &str, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) {
+        let loaded_sess = match raven_tui::session::Session::open(session_id) {
             Ok(s) => s,
             Err(e) => {
-                self.left_committed.push(format!("Error loading session: {}", e));
+                self.left_committed.push(format!("Error opening session {}: {}", session_id, e));
                 self.needs_redraw = true;
                 return;
             }
         };
 
-        // Load recent conv history from log for UI display (prevents blank on re-select)
+        // Load recent conv history from log for UI display (prevents blank on re-select/reopen)
         self.left_committed.clear();
         let recent = loaded_sess.load_recent_conversation(25);
         for (role, content) in recent {
-            let disp = if role == "user" { format!("> {}", content) } else { content.to_string() };
-            self.left_committed.push(disp);
+            let disp = if role == "user" {
+                format!("> {}", content)
+            } else {
+                raven_tui::llm::strip_xml_tool_call_blocks(&content)
+            };
+            if !disp.trim().is_empty() {
+                self.left_committed.push(disp);
+            }
         }
 
         if let Ok(mut ag) = agent.try_lock() {
             *ag.session_mut() = Some(loaded_sess);
         }
 
-        // Reset other visible UI state
+        // Reset other visible UI state (trace is runtime-only; conv is restored above)
         self.trace_lines.clear();
         self.current_response.clear();
         self.current_thinking.clear();
@@ -1831,9 +1936,8 @@ impl App {
         self.focused_pane = Pane::Left;
 
         let banner = format!(
-            "Raven Hotel - Loaded session\nWorkspace: {}\nSession: {}\n\nUse ↑/↓ in panes, arrows to navigate, /help for commands.",
-            ws_path.display(),
-            sess_meta.session_id
+            "Raven Hotel - Loaded session\nSession: {}\n\nUse ↑/↓ in panes, arrows to navigate, /help for commands.",
+            session_id
         );
         self.left_committed.push(banner);
 

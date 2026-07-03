@@ -81,7 +81,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "write".into(),
-                description: "Write a file. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed.".into(),
+                description: "Write (or overwrite) a *file*. Path must point to a file, not a directory. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -97,7 +97,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Search/replace edit. Set wiki=true for wiki files (path e.g. 'index.md').".into(),
+                description: "Search/replace edit on a *file*. Path must be a file (not dir). Set wiki=true for wiki files (path e.g. 'index.md').".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {

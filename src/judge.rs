@@ -184,6 +184,7 @@ mod tests {
             last_user_request: None,
             repo_cache: crate::session::RepoCache::default(),
             recent_turns_summary: String::new(),
+            session_label: "Undetermined".to_string(),
             exec_approval_mode: crate::session::ExecApprovalMode::default(),
             agent_mode: "talk".to_string(),
             initial_analysis: None,

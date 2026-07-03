@@ -185,12 +185,19 @@ impl Agent {
         if let Some(s) = &session {
             let recent = s.load_recent_conversation(20);
             for (role, content) in recent {
-                conversation.push(Message {
-                    role,
-                    content: Some(content),
-                    tool_calls: None,
-                    tool_call_id: None,
-                });
+                let clean = if role == "assistant" {
+                    crate::llm::strip_xml_tool_call_blocks(&content)
+                } else {
+                    content
+                };
+                if !clean.trim().is_empty() {
+                    conversation.push(Message {
+                        role,
+                        content: Some(clean),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    });
+                }
             }
         }
 
@@ -517,6 +524,7 @@ impl Agent {
             let summary = self.summarize_messages(&dropped).await;
             // Push the compression into the session's rolling "recent turns" summary
             // (the injection block will surface a version of it).
+            let label = self.generate_session_label().await;
             if let Some(s) = &mut self.session {
                 let combined = if s.meta.recent_turns_summary.is_empty() {
                     summary.clone()
@@ -530,6 +538,9 @@ impl Agent {
                     combined
                 };
                 let _ = s.set_recent_turns_summary(&trimmed);
+
+                // Also refresh the short label when we rewrite summary on prune
+                let _ = s.set_session_label(&label);
             }
         }
 
@@ -639,6 +650,57 @@ History:
         } else {
             raw
         }
+    }
+
+    /// Produce a short (≤60 char) label describing the current session.
+    /// This is cheap (heuristic) so it can be updated without the full summary cost.
+    /// Called when writing the detailed recent_turns_summary, and can be called
+    /// more frequently for the picker UI label.
+    async fn generate_session_label(&self) -> String {
+        let Some(sess) = &self.session else {
+            return "Undetermined".to_string();
+        };
+        let m = &sess.meta;
+
+        // Prefer last user request, cleaned
+        if let Some(req) = &m.last_user_request {
+            let mut s = req.trim().to_string();
+            if let Some(nl) = s.find('\n') {
+                s.truncate(nl);
+            }
+            s = s.trim().to_string();
+            if !s.is_empty() {
+                return tools::safe_truncate(&s, 60).to_string();
+            }
+        }
+
+        // Next, current goal
+        let goal = m.current_goal.trim();
+        if !goal.is_empty() {
+            return tools::safe_truncate(goal, 60).to_string();
+        }
+
+        // Fallback to first useful line of existing summary
+        for line in m.recent_turns_summary.lines() {
+            let l = line.trim();
+            if l.len() > 8 && !l.starts_with('(') && !l.starts_with('-') {
+                return tools::safe_truncate(l, 60).to_string();
+            }
+        }
+
+        // Last resort from recent conversation
+        let last: Vec<_> = self.conversation.iter().rev().take(3).collect();
+        for msg in &last {
+            if let Some(c) = &msg.content {
+                let t = c.trim();
+                if t.len() > 10 {
+                    let first = t.lines().next().unwrap_or(t);
+                    return tools::safe_truncate(first, 60).to_string();
+                }
+            }
+        }
+
+        "Undetermined".to_string()
     }
 
     // ─────────────────────────────────────────────────────────────────
@@ -999,6 +1061,26 @@ History:
                     .as_ref()
                     .map(|tcs| tcs.iter().map(|tc| tc.function.name.as_str()).collect())
                     .unwrap_or_default();
+
+                // Include full tool call input details (name + arguments) when the
+                // assistant message contains tool_calls. This makes tool *inputs*
+                // available in full_log.jsonl for debugging/replay without logging
+                // raw tool *outputs* (those are sanitized + truncated before being
+                // put into the "tool" role messages that go to the model and the log).
+                let tool_calls_detail = msg.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter().map(|tc| {
+                        let args_val: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                            .unwrap_or_else(|_| serde_json::json!(tc.function.arguments));
+                        serde_json::json!({
+                            "id": &tc.id,
+                            "function": {
+                                "name": &tc.function.name,
+                                "arguments": args_val
+                            }
+                        })
+                    }).collect::<Vec<_>>()
+                });
+
                 let entry = serde_json::json!({
                     "ts": chrono::Utc::now().to_rfc3339(),
                     "role": msg.role,
@@ -1006,6 +1088,7 @@ History:
                     "has_tool_calls": msg.tool_calls.is_some(),
                     "tool_call_id": msg.tool_call_id,
                     "tool_names": tool_names,
+                    "tool_calls": tool_calls_detail,
                 });
                 let _ = s.append_log(&entry.to_string());
                 self.logged_message_count += 1;
@@ -1021,6 +1104,7 @@ History:
                 let last_few: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
                 if !last_few.is_empty() {
                     let sm = self.summarize_messages(&last_few).await;
+                    let label = self.generate_session_label().await;
                     if let Some(s_mut) = &mut self.session {
                         let prev = &s_mut.meta.recent_turns_summary;
                         let merged = if prev.is_empty() {
@@ -1034,30 +1118,74 @@ History:
                             merged
                         };
                         let _ = s_mut.set_recent_turns_summary(&trimmed);
+
+                        // Keep label fresh whenever we touch the summary
+                        let _ = s_mut.set_session_label(&label);
                     }
                 }
             }
         }
     }
 
-    /// Force-update the recent turns summary and persist session state.
-    /// Called at the end of each turn (before sending Done to the UI) to
-    /// ensure the session context is fresh for the next restart.
+    /// Force-update the (cheap) session label for the picker and, occasionally,
+    /// the recent_turns_summary. Called at the end of each turn so that session
+    /// state on disk is reasonably fresh if the process is killed/restarted.
+    ///
+    /// We deliberately do *not* summarize on every turn (or even every 5th).
+    /// Summarization is expensive (an extra LLM call). The heavy lifting is in
+    /// prune_history (at 48 msgs) and the lighter periodic refresh in persist_turn
+    /// (every 12 msgs once >= 24). Here we only do a light refresh every 12 as well.
     pub async fn force_flush_session(&mut self) {
         if self.conversation.len() < 2 {
             return;
         }
-        // Summarize the last several messages
-        let recent: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
-        let sm = self.summarize_messages(&recent).await;
-        if let Some(s) = &mut self.session {
-            // Replace (not append) — keep it fresh and relevant
-            let trimmed = if sm.len() > SUMMARY_CHAR_LIMIT {
-                tools::safe_truncate(&sm, SUMMARY_CHAR_LIMIT).to_string() + "..."
+
+        // Label is cheap (heuristic, no LLM call) — always refresh it so the
+        // picker shows a good description even after restarts.
+        let label = self.generate_session_label().await;
+
+        let len = self.conversation.len();
+        let is_mock = matches!(*self.client.lock().await, ChatBackend::Mock(_));
+
+        let needs_full = {
+            let s_ref = self.session.as_ref();
+            s_ref.is_none_or(|s| s.meta.recent_turns_summary.is_empty())
+                || (len >= 24 && len.is_multiple_of(12) && !is_mock)
+        };
+
+        let summary_for_meta = if needs_full {
+            let recent: Vec<_> = self.conversation.iter().rev().take(6).cloned().collect();
+            if recent.is_empty() {
+                None
             } else {
-                sm
-            };
-            let _ = s.set_recent_turns_summary(&trimmed);
+                let sm = self.summarize_messages(&recent).await;
+                let prev = self.session.as_ref()
+                    .map(|s| s.meta.recent_turns_summary.clone())
+                    .unwrap_or_default();
+                let merged = if prev.is_empty() {
+                    sm
+                } else {
+                    format!("{}\n{}", prev, sm)
+                };
+                Some(merged)
+            }
+        } else {
+            None
+        };
+
+        if let Some(s) = &mut self.session {
+            let _ = s.set_session_label(&label);
+
+            if needs_full {
+                if let Some(sm) = summary_for_meta {
+                    let trimmed = if sm.len() > SUMMARY_CHAR_LIMIT {
+                        tools::safe_truncate(&sm, SUMMARY_CHAR_LIMIT).to_string() + "..."
+                    } else {
+                        sm
+                    };
+                    let _ = s.set_recent_turns_summary(&trimmed);
+                }
+            }
         }
     }
 

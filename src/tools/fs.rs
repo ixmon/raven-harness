@@ -117,7 +117,16 @@ pub fn read_file(
             }
             out
         }
-        Err(e) => format!("❌ Could not read {}: {}", path.display(), e),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::IsADirectory {
+                format!(
+                    "❌ {} is a directory. Use list_dir to list its contents, or provide a path to a specific file inside it.",
+                    path.display()
+                )
+            } else {
+                format!("❌ Could not read {}: {}", path.display(), e)
+            }
+        }
     }
 }
 
@@ -147,6 +156,13 @@ pub fn write_file(user_path: &str, content: &str, workspace: &Path) -> String {
         Ok(p) => p,
         Err(e) => return format!("❌ {}", e),
     };
+
+    if path.is_dir() {
+        return format!(
+            "❌ Cannot write to directory '{}'. Specify a *file* path (e.g. 'README.md', 'tui/glm.md', or 'src/main.rs'). Directories cannot be written with the write tool — use list_dir to explore.",
+            path.display()
+        );
+    }
 
     if let Some(parent) = path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
@@ -190,6 +206,13 @@ pub fn patch_file(
         Ok(p) => p,
         Err(e) => return format!("❌ {}", e),
     };
+
+    if path.is_dir() {
+        return format!(
+            "❌ Cannot patch directory '{}'. Specify a *file* path.",
+            path.display()
+        );
+    }
 
     if !path.exists() {
         return format!("❌ File not found: {}", path.display());
@@ -447,6 +470,17 @@ pub fn list_dir(user_path: &str, workspace: &Path) -> String {
         Err(e) => return format!("❌ {}", e),
     };
 
+    if path.is_file() {
+        return format!(
+            "❌ {} is a file, not a directory. Use read (or read with lines=) to view its contents.",
+            path.display()
+        );
+    }
+
+    if !path.is_dir() && path.exists() {
+        return format!("❌ {} exists but is not a directory.", path.display());
+    }
+
     // Safeguard against "halt recursion of a directory with too many files"
     const MAX_LIST: usize = 300;
 
@@ -615,5 +649,28 @@ mod tests {
         // workspace itself
         let res = resolve(&ws, ".");
         assert!(res.is_ok(), "'.' should resolve to workspace");
+    }
+
+    #[test]
+    fn test_write_file_rejects_directory() {
+        use std::fs;
+        let ws = std::env::temp_dir();
+        let dir_path = ws.join("raven_test_write_dir_guard");
+        let _ = fs::remove_dir_all(&dir_path);
+        fs::create_dir_all(&dir_path).unwrap();
+
+        let res = write_file("raven_test_write_dir_guard", "should not write", &ws);
+        assert!(
+            res.contains("Cannot write to directory"),
+            "write to dir should be rejected clearly: {}",
+            res
+        );
+        assert!(
+            res.contains("Specify a *file* path"),
+            "should suggest file path: {}",
+            res
+        );
+
+        let _ = fs::remove_dir_all(&dir_path);
     }
 }

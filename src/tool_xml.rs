@@ -370,4 +370,35 @@ README.md
         let frag2 = "parameter=path> src/marshmallow/schema.py\n</parameter>";
         assert_eq!(strip_xml_tool_call_blocks(frag2), "");
     }
+
+    #[test]
+    fn pure_tool_xml_from_response_is_filtered_before_committing_to_conversation_pane() {
+        // Mock a tool response / final_text that contains raw XML tool call syntax
+        // (as can happen with XML-native models like certain Qwen/llama.cpp setups
+        // when the model emits the call directly in its content stream, e.g. for
+        // browse on an arXiv paper).
+        let raw_from_tool_response = r#"<tool_call>
+<function=browse>
+<parameter=url>
+https://arxiv.org/abs/2607.01224
+</parameter>
+</function>
+</tool_call>"#;
+
+        // This is exactly the filtering used by the UiUpdate::Done handler
+        // (and similar commit paths in agent_driver) right before pushing
+        // anything to left_committed (the conversation pane).
+        let cleaned = strip_xml_tool_call_blocks(raw_from_tool_response);
+
+        let mut simulated_left_committed: Vec<String> = vec![];
+        if !cleaned.trim().is_empty() {
+            simulated_left_committed.push(cleaned);
+        }
+
+        assert!(
+            simulated_left_committed.is_empty(),
+            "Naked tool call XML must not leak into the conversation pane. Got: {:?}",
+            simulated_left_committed
+        );
+    }
 }
