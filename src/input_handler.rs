@@ -266,7 +266,16 @@ async fn handle_input_key(
     }
 
     // Session/workspace picker screen navigation (combined tree of workspaces + sessions)
-    if app.desktop.showing_picker() && app.handle_picker_key(key.code, agent) {
+    // For overview + harness (Coding Harness nav), we let input/conv have priority on arrows so status/conv/input work.
+    let overview_harness = app.desktop.active == ActiveDesktop::Overview
+        && app.browser_nav_items.get(app.browser_selected_nav)
+            .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+    if (app.desktop.showing_picker()
+        || app.desktop.active == ActiveDesktop::Splash
+        || app.desktop.active == ActiveDesktop::Overview)
+        && !(overview_harness && app.focused_pane == crate::app_state::Pane::Input)
+        && app.handle_picker_key(key.code, agent)
+    {
         return Ok(true);
     }
 
@@ -277,11 +286,16 @@ async fn handle_input_key(
 
     // When focused on content panes (Left/Right), use arrows for focus or desktop slide
     // (skip when wiki viewer owns the screen — its handler already processed or rejected the key)
+    // Also skip for overview+harness so arrows don't accidentally slide while using conv/input
     if app.focused_pane != crate::app_state::Pane::Input && !app.desktop.showing_wiki_viewer() {
         match key.code {
             KeyCode::Left => {
                 if app.desktop.showing_picker() {
                     // handled above in picker block
+                    return Ok(true);
+                }
+                if app.desktop.active == ActiveDesktop::Overview {
+                    // handled by handle_picker_key (cycles focus or exits to splash)
                     return Ok(true);
                 }
                 if app.desktop.active == ActiveDesktop::Workspace {
@@ -291,14 +305,16 @@ async fn handle_input_key(
                         app.needs_redraw = true;
                         return Ok(true);
                     } else if app.focused_pane == crate::app_state::Pane::Left {
-                        // on Conversation, left goes to wiki viewer if possible, else picker
-                        if !app.wiki_viewer.session_id.is_empty() {
-                            app.desktop.set_wiki_viewer();
-                        } else {
-                            app.desktop.set_picker();
-                            app.picker.focus = crate::app_state::PickerFocus::Tree;
-                            if !app.picker.loaded {
-                                app.refresh_picker();
+                        // on Conversation, left from Screen 4 goes back to Screen 2 (with content focused)
+                        app.desktop.set_overview();
+                        app.view_focus = crate::app_state::ViewFocus::Content;
+                        if !app.picker.loaded {
+                            app.refresh_picker();
+                        }
+                        if app.browser_nav_items.is_empty() {
+                            let sid = app.picker.sessions.get(app.picker.selected_session).map(|m| m.session_id.clone());
+                            if let Some(sid) = sid {
+                                app.rebuild_browser_nav_for_session(&sid);
                             }
                         }
                         app.needs_redraw = true;
@@ -317,11 +333,11 @@ async fn handle_input_key(
                     // handled above
                     return Ok(true);
                 }
-                // Only enter picker from splash, not from workspace (to prevent right arrow on 3rd screen going back to picker)
-                if app.desktop.active == ActiveDesktop::Splash && app.desktop.can_enter_picker() {
-                    app.enter_picker();
+                if app.desktop.active == ActiveDesktop::Overview {
+                    // focus cycle / snap handled in handle_picker_key
                     return Ok(true);
                 }
+                // Note: splash focus cycling and overview slide are handled earlier via handle_picker_key for Splash/Overview.
                 if !app.try_slide_to_workspace() {
                     app.focused_pane = crate::app_state::Pane::Right;
                 }
@@ -367,9 +383,13 @@ async fn handle_input_key(
         }
     }
 
-    // Suppress text input editing on splash and picker screens (input bar is hidden there)
+    // Suppress text input editing on splash/picker/overview screens (input bar is hidden there)
     // except when in adding workspace mode
-    if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker)
+    let overview_harness = matches!(app.desktop.active, ActiveDesktop::Overview)
+        && app.browser_nav_items.get(app.browser_selected_nav)
+            .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+    if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview)
+        && !overview_harness
         && !app.picker.adding_workspace
         && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
     {
@@ -388,7 +408,7 @@ async fn handle_input_key(
         if !is_cursor_move || app.focused_pane == crate::app_state::Pane::Input {
             app.apply_edit_action(action);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview) || overview_harness || app.picker.adding_workspace {
                 app.focused_pane = crate::app_state::Pane::Input;
             }
             return Ok(true);
@@ -400,7 +420,7 @@ async fn handle_input_key(
         KeyCode::Char(c) => {
             app.insert_char(c);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview) || overview_harness || app.picker.adding_workspace {
                 app.focused_pane = crate::app_state::Pane::Input;
             }
             Ok(true)

@@ -550,7 +550,11 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.needs_redraw = true;
         }
 
-        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && !app.picker.loaded {
+        if (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview))
+            && !app.picker.loaded
+        {
             app.refresh_picker();
         }
 
@@ -632,9 +636,13 @@ async fn run_app<B: ratatui::backend::Backend>(
         let workspace_display = config.workspace.display().to_string();
         let show_gauge = app.is_processing && !stop_signal.load(Ordering::SeqCst);
         let gauge_h = if show_gauge { 1 } else { 0 };
+        let overview_harness = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview)
+            && app.browser_nav_items.get(app.browser_selected_nav)
+                .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
         let show_status = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Workspace);
         let show_input = show_status
             || (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && app.picker.adding_workspace);
+        // Overview harness shows status + input + conv to right of nav (Coding Harness selected)
         let status_h = if show_status { 1 } else { 0 };
         let input_line_count = if show_input { app.input.lines().count().max(1) as u16 } else { 0 };
         let input_h = if show_input {
@@ -643,7 +651,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             0
         };
 
-        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
+        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview)
+        {
             // rough estimate; updated inside draw if possible
             app.picker.last_summary_height = 25;
         }
@@ -655,6 +666,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let search_label = match app.desktop.active {
                 crate::desktop::ActiveDesktop::Splash => "→ picker".to_string(),
                 crate::desktop::ActiveDesktop::Picker => "← splash".to_string(),
+                crate::desktop::ActiveDesktop::Overview => "← splash / nav".to_string(),
                 _ => app.search.status_label(),
             };
 
@@ -679,6 +691,12 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                 if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
                     app.picker.last_summary_height = content_area.height.saturating_sub(4).max(10);
+                } else if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash) {
+                    // lower half summary area
+                    let lower_h = (content_area.height as f32 * 0.5) as u16;
+                    app.picker.last_summary_height = lower_h.saturating_sub(4).max(5);
+                } else if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
+                    app.picker.last_summary_height = content_area.height.saturating_sub(4).max(8);
                 }
 
                 let left_focused = app.focused_pane == Pane::Left;
@@ -706,7 +724,32 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
 
                 if app.desktop.showing_wiki_viewer() {
-                    tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                    if app.wiki_viewer.selected_is_harness() {
+                        // Nav (left) + conversation (right of nav); status top + input bottom enabled outer
+                        let cols = ratatui::layout::Layout::default()
+                            .direction(ratatui::layout::Direction::Horizontal)
+                            .constraints([ratatui::layout::Constraint::Percentage(30), ratatui::layout::Constraint::Percentage(70)])
+                            .split(content_area);
+                        tui_render::draw_wiki_nav_pane(f, cols[0], &app.wiki_viewer, true);
+                        let mut dummy_rect = ratatui::layout::Rect::default();
+                        let mut dummy_cnt = 0u16;
+                        tui_render::draw_left_pane(
+                            f,
+                            &app.left_committed,
+                            &app.current_response,
+                            cols[1],
+                            &mut dummy_rect,
+                            &mut dummy_cnt,
+                            app.left_follow_output,
+                            &mut app.left_scroll,
+                            tui_render::Pane::Left,
+                            app.scroll_flash_timer,
+                            left_highlight,
+                            true,
+                        );
+                    } else {
+                        tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                    }
                 } else {
                     tui_render::draw_content_desktop(
                     f, content_area, &app.desktop,
@@ -725,6 +768,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     &tui_render::SplashData {
                         raven_art: &app.raven_art, base_url: &config.base_url,
                         model: &app.display_model, workspace: &workspace_display,
+                        splash_focus: app.splash_focus,
                     },
                     &tui_render::PickerDrawData {
                         picker_items: &app.picker.picker_items,
@@ -735,7 +779,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                         wiki_links: &app.picker.wiki_links,
                         active_link_idx: app.picker.active_link_idx,
                         summary_action: app.picker.summary_action,
+                        view_focus: app.view_focus,
+                        browser_nav_items: &app.browser_nav_items,
+                        browser_selected_nav: app.browser_selected_nav,
+                        browser_wiki_content: &app.browser_wiki_content,
+                        browser_wiki_scroll: app.browser_wiki_scroll,
                     },
+                    &app.wiki_viewer,
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,
                     &mut app.left_scroll, &mut app.right_scroll,
@@ -743,14 +793,57 @@ async fn run_app<B: ratatui::backend::Backend>(
                 );
                 }
 
-                if show_gauge && !app.desktop.showing_wiki_viewer() {
+                if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) && overview_harness {
+                    // Draw real upper status bar and input inside the right "content" column of Screen 2
+                    // so it appears as the "upper status bar" above conversation when Coding Harness selected.
+                    let hcols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
+                        .split(content_area);
+                    let right_col = hcols[2];
+                    let srect = ratatui::layout::Rect { x: right_col.x, y: content_area.y, width: right_col.width, height: 1 };
+                    tui_render::draw_status_bar(f, srect, &tui_render::StatusBarData {
+                        display_model: &app.display_model,
+                        balance_label: &app.balance_label,
+                        ctx_used_tokens: app.ctx_used_tokens,
+                        budget: &app.display_budget,
+                        mode_label: &approval_label,
+                        agent_mode: &agent_mode,
+                        goal_text: &goal_text,
+                        search_label: &search_label,
+                        tps: app.api_tps,
+                    });
+                    let i_h = 3u16;
+                    let irect = ratatui::layout::Rect {
+                        x: right_col.x,
+                        y: content_area.y + content_area.height.saturating_sub(i_h),
+                        width: right_col.width,
+                        height: i_h,
+                    };
+                    let input_focused = app.focused_pane == Pane::Input;
+                    tui_render::draw_input_bar(f, irect, &tui_render::InputBarData {
+                        input: &app.input, is_processing: app.is_processing,
+                        spinner_tick: app.spinner_tick, search_mode: app.search_mode,
+                        focused: input_focused,
+                    });
+                    if input_focused {
+                        app.clamp_cursor();
+                        let text_before = &app.input[..app.cursor_pos];
+                        let cursor_line = text_before.matches('\n').count() as u16;
+                        let last_nl = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let cursor_col = app.input[last_nl..app.cursor_pos].chars().count() as u16;
+                        f.set_cursor_position((irect.x + 1 + cursor_col, irect.y + 1 + cursor_line));
+                    }
+                }
+
+                if show_gauge && !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                     tui_render::draw_context_gauge(f, gauge_area, &tui_render::ContextGaugeData {
                         turn_rounds: app.turn_rounds, max_rounds: config.max_rounds,
                         tool_calls_this_turn: app.tool_calls_this_turn,
                     });
                 }
 
-                if show_input && !app.desktop.showing_wiki_viewer() {
+                if show_input && !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                     let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, input_area, &tui_render::InputBarData {
                         input: &app.input, is_processing: app.is_processing,
@@ -758,7 +851,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         focused: input_focused,
                     });
 
-                    if !app.desktop.showing_wiki_viewer() {
+                    if !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                         tui_render::draw_overlays(
                             f, size, input_area, &app.settings, app.pending_approval.as_deref(),
                             &app.slash_commands, &app.input, app.slash_selected,
@@ -767,7 +860,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         );
                     }
 
-                    if input_focused && !app.desktop.showing_wiki_viewer() {
+                    if input_focused && !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                         app.clamp_cursor();
                         let text_before = &app.input[..app.cursor_pos];
                         let cursor_line = text_before.matches('\n').count() as u16;
@@ -776,6 +869,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
                     }
                 }
+
+                // For Overview (Screen 2), the status/conv/input for harness case are drawn inside the content column (see tui_render).
+                // No outer full-width bars for the diorama.
 
                 if app.scroll_flash_timer > 0 { app.scroll_flash_timer -= 1; }
                 if app.desktop.tick() { app.needs_redraw = true; }

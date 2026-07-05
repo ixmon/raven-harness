@@ -9,6 +9,9 @@ pub enum ActiveDesktop {
     Splash,
     Picker,
     WikiViewer,
+    /// Screen 2: workspace picker | nav (with Coding Harness at top) | wiki content or harness (status+conv+input)
+    /// Reached by right from picker in Screen 1. Right cycles focus Picker->Nav->Content, right from Content snaps forward.
+    Overview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,6 +94,7 @@ impl DesktopState {
         self.active == ActiveDesktop::Picker && !self.is_animating()
     }
 
+    #[allow(dead_code)]
     pub fn can_enter_picker(&self) -> bool {
         !self.is_animating() && (self.active == ActiveDesktop::Splash || self.active == ActiveDesktop::Workspace)
     }
@@ -102,6 +106,15 @@ impl DesktopState {
     #[allow(dead_code)]
     pub fn can_enter_wiki_viewer(&self) -> bool {
         !self.is_animating() && (self.active == ActiveDesktop::Picker || self.active == ActiveDesktop::Workspace)
+    }
+
+    pub fn showing_overview(&self) -> bool {
+        self.active == ActiveDesktop::Overview && !self.is_animating()
+    }
+
+    #[allow(dead_code)]
+    pub fn can_enter_overview(&self) -> bool {
+        !self.is_animating() && (self.active == ActiveDesktop::Splash || self.active == ActiveDesktop::Picker)
     }
 
     pub fn start_slide_to_splash(&mut self, pane: WorkspacePane) {
@@ -150,6 +163,16 @@ impl DesktopState {
     pub fn exit_wiki_viewer_to_workspace(&mut self) {
         self.slide = None;
         self.active = ActiveDesktop::Workspace;
+    }
+
+    pub fn set_overview(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Overview;
+    }
+
+    pub fn exit_overview_to_splash(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Splash;
     }
 
     /// Advance the slide by one frame. Returns `true` while animation continues.

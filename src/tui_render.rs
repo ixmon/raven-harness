@@ -856,6 +856,7 @@ pub fn draw_left_pane(
     focused_pane: Pane,
     scroll_flash_timer: u8,
     highlight_line: Option<usize>,
+    draw_frame: bool,
 ) {
     *last_left_area = left_area;
 
@@ -970,6 +971,12 @@ pub fn draw_left_pane(
         }
     }
 
+    let title_str = if draw_frame { "  Conversation" } else { "" };
+    let subtitle = if draw_frame {
+        Some(format!("  ({} msgs)", left_committed.len()))
+    } else {
+        None
+    };
     render_scrollable_pane(
         f,
         left_area,
@@ -979,9 +986,9 @@ pub fn draw_left_pane(
         left_scroll,
         focused_pane == Pane::Left,
         scroll_flash_timer,
-        "  Conversation",
+        title_str,
         Color::Cyan,
-        Some(format!("  ({} msgs)", left_committed.len())),
+        subtitle,
     );
 }
 
@@ -1226,37 +1233,50 @@ fn render_scrollable_pane(
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
 
-    let title_line = if let Some(sub) = subtitle {
-        Line::from(vec![
-            Span::styled(
+    let block = if title.trim().is_empty() {
+        Paragraph::new(text.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(focus_style)
+                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .style(Style::default().bg(Color::Black)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((*scroll, 0))
+    } else {
+        let title_line = if let Some(sub) = subtitle {
+            Line::from(vec![
+                Span::styled(
+                    title,
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(sub, Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(Span::styled(
                 title,
                 Style::default()
                     .fg(title_color)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(sub, Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(title_color)
-                .add_modifier(Modifier::BOLD),
-        ))
+            ))
+        };
+        Paragraph::new(text.clone())
+            .block(
+                Block::default()
+                    .title(title_line)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(focus_style)
+                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .style(Style::default().bg(Color::Black)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((*scroll, 0))
     };
-
-    let block = Paragraph::new(text.clone())
-        .block(
-            Block::default()
-                .title(title_line)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(focus_style)
-                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
-                .style(Style::default().bg(Color::Black)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((*scroll, 0));
 
     f.render_widget(block, area);
 
@@ -1401,6 +1421,8 @@ pub struct SplashData<'a> {
     pub base_url: &'a str,
     pub model: &'a str,
     pub workspace: &'a str,
+    /// Which side of the first screen is highlighted (default Magenta).
+    pub splash_focus: crate::app_state::SplashFocus,
 }
 
 pub struct PickerDrawData<'a> {
@@ -1413,6 +1435,13 @@ pub struct PickerDrawData<'a> {
     pub wiki_links: &'a [crate::app_state::WikiLink],
     pub active_link_idx: usize,
     pub summary_action: crate::app_state::SummaryAction,
+    /// When in the 3-pane overview (picker | nav | content), which column has focus.
+    pub view_focus: crate::app_state::ViewFocus,
+    // Browser nav for Screen 2 (stable Harness + Wiki tree)
+    pub browser_nav_items: &'a [crate::app_state::WikiNavItem],
+    pub browser_selected_nav: usize,
+    pub browser_wiki_content: &'a str,
+    pub browser_wiki_scroll: usize,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1554,6 +1583,7 @@ pub fn draw_content_desktop(
     workspace: &WorkspaceDrawData<'_>,
     splash: &SplashData<'_>,
     picker: &PickerDrawData<'_>,
+    _wiki_viewer: &crate::app_state::WikiViewerState,
     last_left_area: &mut Rect,
     last_right_area: &mut Rect,
     last_left_line_count: &mut u16,
@@ -1608,7 +1638,144 @@ pub fn draw_content_desktop(
 
     match desktop.active {
         ActiveDesktop::Splash => {
-            draw_splash(f, content_area, splash);
+            // Horizontal split: left = magenta pane with raven + help, right = workspace picker (full height, outside magenta)
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(content_area);
+
+            let left_area = cols[0];
+            let right_area = cols[1];
+
+            let magenta_focused = splash.splash_focus == crate::app_state::SplashFocus::Magenta;
+            let picker_focused = !magenta_focused;
+
+            // Magenta pane on left enclosing the ASCII raven and help block.
+            // Bright when focused (default), gray when picker is highlighted.
+            let magenta_border = if magenta_focused {
+                Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))
+            } else {
+                Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+            };
+            let outer_block = Block::default()
+                .title(Line::from(vec![
+                    Span::styled(
+                        "  Raven Hotel",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  v{VERSION}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled("  —  Agent Harness", Style::default().fg(Color::DarkGray)),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(magenta_border)
+                .style(Style::default().bg(Color::Black));
+
+            let left_inner = outer_block.inner(left_area);
+            f.render_widget(outer_block, left_area);
+
+            // Render raven + help inside the magenta pane (full height of left column)
+            let mut left_buf = Buffer::empty(left_inner);
+            render_splash_content(&mut left_buf, left_inner, splash);
+            f.render_widget(
+                BlitWidget {
+                    src: left_buf,
+                    rel_x: 0,
+                    rel_y: 0,
+                },
+                left_inner,
+            );
+
+            // Workspace picker (tree only) on the right, full vertical space, outside the magenta pane.
+            // Gray when magenta focused (default); highlighted (cyan border) after right/tab.
+            draw_picker_tree(f, right_area, picker.picker_items, picker.selected_item, picker_focused);
+
+            *last_left_area = Rect::default();
+            *last_right_area = Rect::default();
+        }
+        ActiveDesktop::Overview => {
+            // Screen 2: workspace picker | nav | content (wiki or harness conv+status+input)
+            // Focus starts on Picker. Right cycles Picker -> Nav -> Content.
+            // Up/down affect the focused pane.
+            // Right from Content does snap to Screen 3 or 4.
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
+                .split(content_area);
+
+            let picker_area = cols[0];
+            let nav_area = cols[1];
+            let content_area = cols[2];
+
+            let is_harness = picker.browser_nav_items.get(picker.browser_selected_nav)
+                .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+            let picker_focused = picker.view_focus == crate::app_state::ViewFocus::Picker;
+            let nav_focused = picker.view_focus == crate::app_state::ViewFocus::Nav;
+            let content_focused = picker.view_focus == crate::app_state::ViewFocus::Content;
+
+            // Picker column
+            draw_picker_tree(f, picker_area, picker.picker_items, picker.selected_item, picker_focused);
+
+            // Nav column (Coding Harness at top, Wiki subtree under it; stable, no index.md)
+            draw_nav_pane_for_browser(f, nav_area, " Nav ", picker.browser_nav_items, picker.browser_selected_nav, nav_focused);
+
+            // Content column: either wiki content or harness (status + conv + input)
+            if is_harness {
+                // Allocate space at top of content col for real upper status bar (drawn in event_loop overlay for alignment)
+                // then conv, then input space at bottom.
+                let vparts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(3)])
+                    .split(content_area);
+
+                // Conversation content directly (no extra pane frame for embedded Screen 2 view)
+                let mut dummy_last = Rect::default();
+                let mut dummy_cnt = 0u16;
+                let conv_pane_focus = if content_focused { Pane::Left } else { Pane::Right };
+                draw_left_pane(
+                    f,
+                    workspace.left_committed,
+                    workspace.current_response,
+                    vparts[1],
+                    &mut dummy_last,
+                    &mut dummy_cnt,
+                    false,  // don't auto-follow, allow manual scroll with up/down
+                    left_scroll,
+                    conv_pane_focus,
+                    workspace.scroll_flash_timer,
+                    workspace.left_highlight,
+                    true,  // draw the Conversation frame with label
+                );
+
+                // Bottom space for input box (drawn as overlay in event_loop)
+                // (no block here to let real input bar appear)
+            } else {
+                // Wiki content pane -- use browser content + custom markdown like full wiki
+                let wiki_border = if content_focused { Color::Cyan } else { Color::Rgb(0x55,0x55,0x66) };
+                let txt = if picker.browser_wiki_content.is_empty() {
+                    "(wiki content for selected nav item)".to_string()
+                } else {
+                    picker.browser_wiki_content.to_string()
+                };
+                let md_text = wiki_render_markdown(&txt);
+                let preview = Paragraph::new(md_text)
+                    .wrap(Wrap { trim: true })
+                    .scroll((picker.browser_wiki_scroll as u16, 0))
+                    .block(
+                        Block::default()
+                            .title(Span::styled(" Wiki ", Style::default().fg(if content_focused { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(wiki_border))
+                            .style(Style::default().bg(Color::Black)),
+                    );
+                f.render_widget(preview, content_area);
+            }
+
             *last_left_area = Rect::default();
             *last_right_area = Rect::default();
         }
@@ -1665,6 +1832,7 @@ pub fn draw_content_desktop(
                 left_focus,
                 workspace.scroll_flash_timer,
                 workspace.left_highlight,
+                true,
             );
             draw_right_pane(
                 f,
@@ -1683,6 +1851,57 @@ pub fn draw_content_desktop(
     }
 }
 
+/// Draw only the wiki Nav pane (used by full WikiViewer and by the splash Overview 3-col).
+pub fn draw_wiki_nav_pane(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState, focused: bool) {
+    draw_nav_list(f, area, &format!(" {} ", viewer.current_file), &viewer.nav_items, viewer.selected_nav, focused || viewer.focus == crate::app_state::WikiFocus::Nav);
+}
+
+pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
+    draw_nav_list(f, area, title, items, selected, focused);
+}
+
+fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
+    let nav_border = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let mut nav_text = Text::default();
+    nav_text.lines.push(Line::from(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    let sel = selected;
+    let nitems = items.len();
+    let nav_vis = (area.height as usize).saturating_sub(2).max(1);
+    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
+        0
+    } else if sel + nav_vis / 2 >= nitems {
+        nitems.saturating_sub(nav_vis)
+    } else {
+        sel.saturating_sub(nav_vis / 2)
+    };
+    for (i, item) in items.iter().enumerate().skip(nav_off).take(nav_vis) {
+        let is_sel = i == sel;
+        let style = if is_sel {
+            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
+        } else {
+            match item.kind {
+                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
+                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
+                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
+                crate::app_state::NavItemKind::Harness => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            }
+        };
+        let prefix = if is_sel { "▶ " } else { "  " };
+        let shown = truncate_str(&format!("{}{}", prefix, item.label), area.width as usize - 4);
+        nav_text.lines.push(Line::from(Span::styled(shown, style)));
+    }
+    if items.is_empty() {
+        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
+    }
+    let nav_para = Paragraph::new(nav_text)
+        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
+    f.render_widget(nav_para, area);
+}
+
 pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -1692,47 +1911,9 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     let nav_area = cols[0];
     let content_area = cols[1];
 
-    // Nav pane with navigational elements (links + headings + files)
-    let nav_border = if viewer.focus == crate::app_state::WikiFocus::Nav {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
-    let mut nav_text = Text::default();
-    let title_label = format!(" {} ", viewer.current_file);
-    nav_text.lines.push(Line::from(Span::styled(title_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    draw_wiki_nav_pane(f, nav_area, viewer, viewer.focus == crate::app_state::WikiFocus::Nav);
+
     let sel = viewer.selected_nav;
-    let nitems = viewer.nav_items.len();
-    let nav_vis = (nav_area.height as usize).saturating_sub(2).max(1);
-    // auto scroll the nav view so the selected element is visible (centered-ish)
-    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
-        0
-    } else if sel + nav_vis / 2 >= nitems {
-        nitems.saturating_sub(nav_vis)
-    } else {
-        sel.saturating_sub(nav_vis / 2)
-    };
-    for (i, item) in viewer.nav_items.iter().enumerate().skip(nav_off).take(nav_vis) {
-        let is_sel = i == sel;
-        let style = if is_sel {
-            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-        } else {
-            match item.kind {
-                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
-                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
-                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
-            }
-        };
-        let prefix = if is_sel { "▶ " } else { "  " };
-        let shown = truncate_str(&format!("{}{}", prefix, item.label), nav_area.width as usize - 4);
-        nav_text.lines.push(Line::from(Span::styled(shown, style)));
-    }
-    if viewer.nav_items.is_empty() {
-        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
-    }
-    let nav_para = Paragraph::new(nav_text)
-        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
-    f.render_widget(nav_para, nav_area);
 
     // Content pane - larger wiki display; highlight active nav target where possible
     let content_border = if viewer.focus == crate::app_state::WikiFocus::Content {
@@ -2073,19 +2254,6 @@ fn draw_session_summary(
     f.render_widget(para, content_area);
 }
 
-pub fn draw_splash(f: &mut Frame, area: Rect, data: &SplashData<'_>) {
-    let mut tmp = Buffer::empty(area);
-    render_splash_to_buffer(&mut tmp, area, data);
-    f.render_widget(
-        BlitWidget {
-            src: tmp,
-            rel_x: 0,
-            rel_y: 0,
-        },
-        area,
-    );
-}
-
 fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) {
     let block = Block::default()
         .title(Line::from(vec![
@@ -2108,15 +2276,18 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
 
     let inner = block.inner(area);
     block.render(area, buf);
+    render_splash_content(buf, inner, data);
+}
 
-    if inner.width < 8 || inner.height < 6 {
+fn render_splash_content(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) {
+    if area.width < 8 || area.height < 6 {
         return;
     }
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(inner);
+        .split(area);
 
     let art_style = Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff));
     // Add extra padding above and to the left of the ASCII raven art
