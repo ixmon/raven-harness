@@ -1513,12 +1513,12 @@ fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState)
         if !plan.steps.is_empty() {
             let total = plan.steps.len();
             let done = plan.steps.iter().filter(|s| s.status == crate::app_state::PlanStepStatus::Done).count();
-            let mut pct = if total > 0 { (done * 100) / total } else { 0 };
+            let mut pct = done.saturating_mul(100) / total.max(1);
             if plan.current_step >= total || done >= total {
                 pct = 100;
             }
             let bar_width = 20;
-            let filled = (pct as usize * bar_width) / 100;
+            let filled = pct * bar_width / 100;
             let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
             lines.push(Line::from(Span::styled(bar, Style::default().fg(pane_color))));
         }

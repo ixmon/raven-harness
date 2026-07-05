@@ -540,55 +540,52 @@ async fn handle_input_key(
                 }
 
                 // Automatic plan mode trigger for natural language planning requests
-                if !app.plan.active && !app.pending_plan_confirmation && !app.pending_plan_request.is_some() {
-                    if is_plan_trigger_phrase(&prompt) {
-                        app.pending_plan_request = Some(prompt.clone());
-                        // Set the goal in the plan state immediately from the user's request
-                        // so the pane reflects the actual ask (e.g. birthday cake script) instead of boilerplate.
-                        app.plan.goal = prompt.clone();
-                        // Start fresh for this request
-                        app.plan.success_criteria.clear();
-                        app.plan.verification_steps.clear();
-                        app.plan.rollback.clear();
-                        app.plan.constraints.clear();
-                        app.plan.steps.clear();
-                        app.plan.current_step = 0;
-                        // Also seed the session meta goal so it isn't blank
-                        if let Ok(mut ag) = agent.try_lock() {
-                            if let Some(s) = &mut ag.session_mut() {
-                                s.meta.current_goal = prompt.clone();
-                                // Initialize a clean plan template immediately on detecting plan intent.
-                                // This way wiki/plan.md starts fresh for this run instead of carrying
-                                // over stale content from a previous plan in the same session.
-                                let _ = s.write_wiki_file(
-                                    "plan.md",
-                                    &format!("# Plan\n\n**Goal:** {}\n\n*Template will be expanded on confirmation.*", prompt)
-                                );
-                                let _ = s.save_meta();
-                            }
+                if !app.plan.active && !app.pending_plan_confirmation && app.pending_plan_request.is_none() && is_plan_trigger_phrase(&prompt) {
+                    app.pending_plan_request = Some(prompt.clone());
+                    // Set the goal in the plan state immediately from the user's request
+                    // so the pane reflects the actual ask (e.g. birthday cake script) instead of boilerplate.
+                    app.plan.goal = prompt.clone();
+                    // Start fresh for this request
+                    app.plan.success_criteria.clear();
+                    app.plan.verification_steps.clear();
+                    app.plan.rollback.clear();
+                    app.plan.constraints.clear();
+                    app.plan.steps.clear();
+                    app.plan.current_step = 0;
+                    // Also seed the session meta goal so it isn't blank
+                    if let Ok(mut ag) = agent.try_lock() {
+                        if let Some(s) = &mut ag.session_mut() {
+                            s.meta.current_goal = prompt.clone();
+                            // Initialize a clean plan template immediately on detecting plan intent.
+                            // This way wiki/plan.md starts fresh for this run instead of carrying
+                            // over stale content from a previous plan in the same session.
+                            let _ = s.write_wiki_file(
+                                "plan.md",
+                                &format!("# Plan\n\n**Goal:** {}\n\n*Template will be expanded on confirmation.*", prompt)
+                            );
+                            let _ = s.save_meta();
                         }
-                        app.left_committed.push("Do you want to enter plan mode? (y/n)".to_string());
-                        app.pending_plan_confirmation = true;
-                        app.input = "y".to_string();  // prefill yes; change to n and enter to cancel
-                        app.cursor_pos = app.input.len();
-                        app.needs_redraw = true;
-                        return Ok(true);
                     }
+                    app.left_committed.push("Do you want to enter plan mode? (y/n)".to_string());
+                    app.pending_plan_confirmation = true;
+                    app.input = "y".to_string();  // prefill yes; change to n and enter to cancel
+                    app.cursor_pos = app.input.len();
+                    app.needs_redraw = true;
+                    return Ok(true);
                 }
 
                 // In plan mode, detect "proceed" to switch to work mode and show steps
                 {
                     let current_mode = if let Ok(ag) = agent.try_lock() { ag.current_agent_mode() } else { String::new() };
-                    if current_mode == "plan" {
-                        if is_proceed_confirmation(&prompt) {
-                            if let Ok(mut ag) = agent.try_lock() {
-                                ag.set_agent_mode("work");
-                                if let Some(s) = &mut ag.session_mut() {
-                                    let _ = s.save_meta();
-                                }
+                    if current_mode == "plan" && is_proceed_confirmation(&prompt) {
+                        if let Ok(mut ag) = agent.try_lock() {
+                            ag.set_agent_mode("work");
+                            if let Some(s) = &mut ag.session_mut() {
+                                let _ = s.save_meta();
                             }
-                            app.plan.active = true;
-                            if app.plan.steps.is_empty() {
+                        }
+                        app.plan.active = true;
+                        if app.plan.steps.is_empty() {
                                 let g = app.plan.goal.to_lowercase();
                                 // Derive task-appropriate verification (prefer any already set)
                                 let mut verif = app.plan.verification_steps.clone();
@@ -625,7 +622,7 @@ async fn handle_input_key(
                                                 if t.starts_with('#') || t.starts_with("**") && t.contains("step") || t.to_lowercase().starts_with("rollback") {
                                                     in_verif = false;
                                                 } else if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ") {
-                                                    let v = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ' || (c >= '0' && c <= '9') || c == '.').trim();
+                                                    let v = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ' || c.is_ascii_digit() || c == '.').trim();
                                                     if !v.is_empty() {
                                                         extracted_verif.push(v.to_string());
                                                     }
@@ -633,7 +630,7 @@ async fn handle_input_key(
                                             }
 
                                             if let Some(rest) = t.strip_prefix(|c: char| c.is_ascii_digit()).and_then(|r| r.strip_prefix('.').or_else(|| r.strip_prefix(")"))) {
-                                                let desc = rest.trim_start_matches(|c: char| c == ' ' || c == '-' || c == '*').trim();
+                                                let desc = rest.trim_start_matches([' ', '-', '*']).trim();
                                                 if !desc.is_empty() && desc.len() > 3 && !desc.to_lowercase().starts_with("verify") {
                                                     extracted_steps.push(desc.to_string());
                                                 }
@@ -675,7 +672,7 @@ async fn handle_input_key(
                                     };
                                     let step3 = "Verify against success criteria".to_string();
                                     vec![
-                                        crate::app_state::PlanStep { description: step1, verification: verif.get(0).cloned(), status: crate::app_state::PlanStepStatus::Pending },
+                                        crate::app_state::PlanStep { description: step1, verification: verif.first().cloned(), status: crate::app_state::PlanStepStatus::Pending },
                                         crate::app_state::PlanStep { description: step2, verification: verif.get(1).cloned(), status: crate::app_state::PlanStepStatus::Pending },
                                         crate::app_state::PlanStep { description: step3, verification: verif.get(verif.len().saturating_sub(1)).cloned(), status: crate::app_state::PlanStepStatus::Pending },
                                     ]
@@ -683,7 +680,7 @@ async fn handle_input_key(
 
                                 if !plan_steps.is_empty() {
                                     plan_steps[0].status = crate::app_state::PlanStepStatus::InProgress;
-                                    if let Some(v0) = verif.get(0) {
+                                    if let Some(v0) = verif.first() {
                                         if plan_steps[0].verification.is_none() {
                                             plan_steps[0].verification = Some(v0.clone());
                                         }
@@ -696,29 +693,28 @@ async fn handle_input_key(
                             // Update wiki with approved plan + steps
                             if let Ok(mut ag) = agent.try_lock() {
                                 if let Some(s) = ag.session_mut() {
-                                    let verif = app.plan.verification_steps.iter().map(|v| format!("- {}", v)).collect::<Vec<_>>().join("\n");
-                                    let steps_str = app.plan.steps.iter().enumerate().map(|(i, st)| {
-                                        let v = st.verification.as_deref().unwrap_or("");
-                                        format!("{}. {} [verify: {}]", i+1, st.description, v)
-                                    }).collect::<Vec<_>>().join("\n");
-                                    let plan_text = format!(
-                                        "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n**Verification:**\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n**Steps:**\n{}\n\n## Execution Log\n\n(Added as work proceeds after 'proceed'.)\n",
-                                        app.plan.goal, app.plan.success_criteria, verif, app.plan.rollback, app.plan.constraints, steps_str
-                                    );
-                                    let _ = s.write_wiki_file("plan.md", &plan_text);
-                                }
+                                let verif = app.plan.verification_steps.iter().map(|v| format!("- {}", v)).collect::<Vec<_>>().join("\n");
+                                let steps_str = app.plan.steps.iter().enumerate().map(|(i, st)| {
+                                    let v = st.verification.as_deref().unwrap_or("");
+                                    format!("{}. {} [verify: {}]", i+1, st.description, v)
+                                }).collect::<Vec<_>>().join("\n");
+                                let plan_text = format!(
+                                    "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n**Verification:**\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n**Steps:**\n{}\n\n## Execution Log\n\n(Added as work proceeds after 'proceed'.)\n",
+                                    app.plan.goal, app.plan.success_criteria, verif, app.plan.rollback, app.plan.constraints, steps_str
+                                );
+                                let _ = s.write_wiki_file("plan.md", &plan_text);
                             }
-                            app.left_committed.push("Plan confirmed by user. Switching to work mode. Executing...".to_string());
+                        }
+                        app.left_committed.push("Plan confirmed by user. Switching to work mode. Executing...".to_string());
 
-                            // Also push the final verification into session meta via update_goal so the judge has good criteria
-                            if let Ok(mut ag) = agent.try_lock() {
-                                if let Some(s) = &mut ag.session_mut() {
-                                    let _ = s.update_goal(
-                                        &app.plan.goal,
-                                        Some(app.plan.verification_steps.clone()),
-                                        None,
-                                    );
-                                }
+                        // Also push the final verification into session meta via update_goal so the judge has good criteria
+                        if let Ok(mut ag) = agent.try_lock() {
+                            if let Some(s) = &mut ag.session_mut() {
+                                let _ = s.update_goal(
+                                    &app.plan.goal,
+                                    Some(app.plan.verification_steps.clone()),
+                                    None,
+                                );
                             }
                         }
                     }

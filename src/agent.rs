@@ -322,7 +322,7 @@ impl Agent {
 
             // Plan mode guard (belt & suspenders for direct calls).
             if let Some(denial) = self.plan_mode_denial(&tool_name, &raw_args) {
-                self.record_tool_denial(&tc, &denial);
+                self.record_tool_denial(tc, &denial);
                 // Create a record so the driver surfaces it in the trace pane too.
                 let rec = ActionRecord {
                     tool: tool_name.clone(),

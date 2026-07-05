@@ -94,6 +94,7 @@ pub enum PlanStepStatus {
     Pending,
     InProgress,
     Done,
+    #[allow(dead_code)]
     Failed,
 }
 

@@ -357,7 +357,7 @@ pub async fn drive_turn(
                         truncated: false,
                         estimated_tokens: 5,
                     };
-                    let _ = observer.on_tool_result(&rec);
+                    observer.on_tool_result(&rec);
                     continue;
                 }
 
