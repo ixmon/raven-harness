@@ -426,6 +426,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                         // line of the tool call block/output. No brain icons on tool lines.
                         app.trace_lines.push(format!("   ↳ {}", truncate(&summary, 120)));
                     }
+                    // Advance plan progress on WORK_COMPLETE (or similar strong completion signals)
+                    if app.plan.active && !app.plan.steps.is_empty() {
+                        app.plan.advance_on_tool_result(&summary);
+                        app.needs_redraw = true;
+                    }
                     app.right_follow_output = true;
                     app.right_scroll = 10_000;
                     app.needs_redraw = true;
@@ -470,6 +475,11 @@ async fn run_app<B: ratatui::backend::Backend>(
                     // the current agent turn and for quitting the whole TUI.
                     if stop_signal.load(Ordering::SeqCst) {
                         stop_signal.store(false, Ordering::SeqCst);
+                    }
+                    // Advance plan progress on turn completion
+                    if app.plan.active && !app.plan.steps.is_empty() {
+                        app.plan.advance_on_turn_done(&final_text);
+                        app.needs_redraw = true;
                     }
                     app.needs_redraw = true;
                 }
@@ -535,6 +545,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
+        if app.plan.active {
+            app.plan.spinner_tick = app.plan.spinner_tick.wrapping_add(1);
+            app.needs_redraw = true;
+        }
 
         if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && !app.picker.loaded {
             app.refresh_picker();
@@ -557,6 +571,63 @@ async fn run_app<B: ratatui::backend::Backend>(
         app.cached_mode_label = approval_label.clone();
         app.cached_goal_text = goal_text.clone();
         app.cached_agent_mode = agent_mode.clone();
+
+        // Sync plan pane high-level fields from session (agent uses update_goal during clarification)
+        if agent_mode == "plan" {
+            if let Ok(ag) = agent.try_lock() {
+                if let Some(s) = ag.session() {
+                    let m = &s.meta;
+                    if !m.current_goal.is_empty() {
+                        app.plan.goal = m.current_goal.clone();
+                    }
+                    if !m.achievement_tests.is_empty() {
+                        app.plan.success_criteria = m.achievement_tests.join(" | ");
+                    }
+                }
+            }
+        }
+
+        // Auto-activate plan pane when run mode is "plan" (collection phase)
+        // Do NOT pre-populate steps here -- steps appear only after user approves the plan
+        if agent_mode == "plan" {
+            if !app.plan.active {
+                app.plan.active = true;
+                if app.plan.goal.is_empty() {
+                    // Do not set any boilerplate goal here. The goal must come from the user's
+                    // actual planning request captured in the trigger (see input_handler).
+                    // Only set safe defaults for the other plan fields if needed.
+                    if app.plan.success_criteria.is_empty() {
+                        app.plan.success_criteria = "Verification passes and goal achieved".to_string();
+                    }
+                    if app.plan.verification_steps.is_empty() {
+                        let g = app.plan.goal.to_lowercase();
+                        if g.contains("python") || g.contains(".py") {
+                            app.plan.verification_steps = vec!["python3 <script>.py".into(), "check script output".into()];
+                        } else if g.contains("c++") || g.contains("cpp") || g.contains("g++") || g.contains("clang") {
+                            app.plan.verification_steps = vec![
+                                "g++ -std=c++17 -Wall -o program program.cpp".into(),
+                                "clang-tidy program.cpp -- -std=c++17".into(),
+                                "./program".into(),
+                            ];
+                        } else {
+                            app.plan.verification_steps = vec!["cargo check".into(), "cargo clippy -- -D warnings".into(), "cargo test".into()];
+                        }
+                    }
+                    if app.plan.rollback.is_empty() {
+                        app.plan.rollback = "git branch + checkpoints".to_string();
+                    }
+                    if app.plan.constraints.is_empty() {
+                        app.plan.constraints = "Stay on feature branch; keep changes reviewable".to_string();
+                    }
+                    app.plan.steps.clear();
+                    app.plan.current_step = 0;
+                }
+            }
+            app.plan.spinner_tick = app.plan.spinner_tick.wrapping_add(1);
+        } else if app.plan.active && agent_mode != "plan" && app.plan.steps.is_empty() {
+            // only auto-hide the pane if we switch away *before* the plan was approved (no steps yet)
+            app.plan.active = false;
+        }
 
         let workspace_display = config.workspace.display().to_string();
         let show_gauge = app.is_processing && !stop_signal.load(Ordering::SeqCst);
@@ -649,6 +720,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         left_focused, right_focused,
                         scroll_flash_timer: app.scroll_flash_timer,
                         left_highlight, right_highlight,
+                        plan: if app.plan.active || agent_mode == "plan" { Some(&app.plan) } else { None },
                     },
                     &tui_render::SplashData {
                         raven_art: &app.raven_art, base_url: &config.base_url,

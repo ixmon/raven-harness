@@ -121,6 +121,8 @@ pub struct RoundContext {
     pub has_session: bool,
     /// Last assistant content from session log (for malformed tool detection).
     pub log_tail: String,
+    /// Current agent mode (e.g. "plan" to allow narration during planning).
+    pub agent_mode: String,
 }
 
 /// Summary of recent actions for safety checks.
@@ -238,8 +240,10 @@ impl SteeringState {
         }
 
         // 3. Criteria-based judge
+        // Skip in plan mode — we are still in clarification; judge/define_done criteria
+        // should not force completion or nudges until after "proceed".
         if let Some(ref criteria) = ctx.criteria {
-            if !criteria.trim().is_empty() {
+            if !criteria.trim().is_empty() && ctx.agent_mode != "plan" {
                 return SteeringDecision::JudgeNeeded {
                     context: "criteria active".into(),
                 };
@@ -247,11 +251,13 @@ impl SteeringState {
         }
 
         // 4. Define-done reminder (no criteria yet, judge enabled, past round 1)
+        // Skip in plan mode.
         if ctx.criteria.is_none()
             && self.total_rounds > 1
             && ctx.has_session
             && self.enable_judge
-            && self.judge_nudges < NUDGE_BUDGET {
+            && self.judge_nudges < NUDGE_BUDGET
+            && ctx.agent_mode != "plan" {
                 self.judge_nudges += 1;
                 return SteeringDecision::Nudge {
                     message: DEFINE_DONE_REMINDER.into(),
@@ -274,9 +280,11 @@ impl SteeringState {
         }
 
         // 6. Plan narration detection
+        // Skip during plan mode — the agent is *supposed* to describe and clarify the plan.
         if detect_plan_narration(&ctx.effective_text)
             && !ctx.is_llm_error
             && self.text_nudges < MAX_TEXT_NUDGES
+            && ctx.agent_mode != "plan"
         {
             self.text_nudges += 1;
             return SteeringDecision::Nudge {
@@ -621,6 +629,7 @@ mod tests {
             last_user_request: None,
             has_session: true,
             log_tail: String::new(),
+            agent_mode: "work".into(),
         }
     }
 
@@ -635,6 +644,7 @@ mod tests {
             last_user_request: None,
             has_session: true,
             log_tail: String::new(),
+            agent_mode: "work".into(),
         }
     }
 

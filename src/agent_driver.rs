@@ -164,7 +164,14 @@ pub async fn drive_turn(
 
     let cfg = agent.current_config();
     let max_duration_secs = cfg.flags.max_duration_secs;
-    let tools_schema = tools::all_tools(&cfg.flags);
+
+    // Choose tool surface based on agent mode.
+    // In plan mode we give a curated set focused on exploration + planning state.
+    let tools_schema = if agent.current_agent_mode() == "plan" {
+        tools::plan_mode_tools(&cfg.flags)
+    } else {
+        tools::all_tools(&cfg.flags)
+    };
     let tools_for_request = cfg.tools_enabled.then(|| tools_schema.clone());
 
     let mut steering = SteeringState::new(
@@ -328,10 +335,32 @@ pub async fn drive_turn(
             steering.tools_used += tool_calls.len();
 
             let mut to_execute: Vec<ToolCall> = vec![];
+            let _current_mode = agent.current_agent_mode();
             for tc in &tool_calls {
                 if observer.should_stop() || observer.stop_tool_processing() {
                     break;
                 }
+
+                // Hard gate for Plan mode: never show babysitter approvals or execute
+                // mutating actions (write/patch/exec) until user explicitly says "proceed".
+                // This prevents action approval popups from appearing alongside the
+                // "approve the plan?" question.
+                if let Some(denial) = agent.plan_mode_denial(&tc.function.name, &tc.function.arguments) {
+                    agent.record_tool_denial(tc, &denial);
+                    // Surface the denial in the trace pane immediately.
+                    let rec = crate::agent::ActionRecord {
+                        tool: tc.function.name.clone(),
+                        args: tc.function.arguments.clone(),
+                        summary: denial.clone(),
+                        output_to_model: denial.clone(),
+                        raw_bytes: 0,
+                        truncated: false,
+                        estimated_tokens: 5,
+                    };
+                    let _ = observer.on_tool_result(&rec);
+                    continue;
+                }
+
                 if observer.approve_tool(tc).await {
                     observer.on_tool_start(&tc.function.name, &tc.function.arguments);
                     to_execute.push(tc.clone());
@@ -656,6 +685,7 @@ fn build_round_context(
         .as_ref()
         .and_then(|s| s.last_assistant_content())
         .unwrap_or_default();
+    let agent_mode = agent.current_agent_mode();
 
     RoundContext {
         effective_text: effective_text.to_string(),
@@ -667,6 +697,7 @@ fn build_round_context(
         last_user_request,
         has_session: agent.session.is_some(),
         log_tail,
+        agent_mode,
     }
 }
 

@@ -5,9 +5,9 @@ use tokio::time::{timeout, Duration};
 
 /// Run a shell command with the given workspace as cwd.
 /// Returns combined stdout + stderr, truncated for sanity.
-pub async fn exec(command: &str, workspace: &Path) -> String {
+pub async fn exec(command: &str, workspace: &Path, timeout_secs: Option<u64>) -> String {
     const EXEC_OUTPUT_TRUNCATE: usize = 8000;
-    const EXEC_TIMEOUT_SECS: u64 = 60;
+    let timeout_secs = timeout_secs.unwrap_or(120);
     if command.trim().is_empty() {
         return "⚠️ Empty command".to_string();
     }
@@ -59,7 +59,7 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
     };
 
     let output_res = timeout(
-        Duration::from_secs(EXEC_TIMEOUT_SECS),
+        Duration::from_secs(timeout_secs),
         child.wait_with_output(),
     )
     .await;
@@ -90,7 +90,7 @@ pub async fn exec(command: &str, workspace: &Path) -> String {
             // Timeout: the wait future was dropped by the timeout.
             // kill_on_drop(true) makes the Child kill itself on drop.
             // (We cannot access `child` here because it was moved into the future.)
-            "(command timed out after 60s — child process killed)".to_string()
+            format!("(command timed out after {}s — child process killed)", timeout_secs).to_string()
         }
     }
 }

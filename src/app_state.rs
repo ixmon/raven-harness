@@ -88,6 +88,101 @@ pub struct WikiViewerState {
     pub selected_nav: usize,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Default)]
+pub struct PlanStep {
+    pub description: String,
+    pub verification: Option<String>,
+    pub status: PlanStepStatus,
+}
+
+#[derive(Default)]
+pub struct PlanState {
+    pub active: bool,
+    pub goal: String,
+    pub success_criteria: String,
+    pub verification_steps: Vec<String>,
+    pub rollback: String,
+    pub constraints: String,
+    pub steps: Vec<PlanStep>,
+    pub current_step: usize,
+    pub spinner_tick: usize,
+}
+
+impl PlanState {
+    /// Mark the current step Done and advance the pointer (if possible).
+    pub fn advance_one_step(&mut self) {
+        if !self.steps.is_empty() && self.current_step < self.steps.len() {
+            self.steps[self.current_step].status = PlanStepStatus::Done;
+            self.current_step += 1;
+        }
+    }
+
+    /// Mark every step Done and move current_step to the end.
+    pub fn complete(&mut self) {
+        for s in &mut self.steps {
+            s.status = PlanStepStatus::Done;
+        }
+        if !self.steps.is_empty() {
+            self.current_step = self.steps.len();
+        }
+    }
+
+    /// Heuristic: does this text represent strong task completion for plan progress purposes?
+    pub fn is_strong_completion_signal(text: &str) -> bool {
+        let t = text.to_lowercase();
+        t.contains("work_complete")
+            || t.contains("fulfilled")
+            || t.contains("**done")
+            || t.contains("done!")
+            || t.contains("task is complete")
+            || (t.contains("successfully") && t.contains("criteria"))
+    }
+
+    /// Advance logic used on UiUpdate::Done (end of agent turn).
+    pub fn advance_on_turn_done(&mut self, final_text: &str) {
+        if !self.active || self.steps.is_empty() {
+            return;
+        }
+        self.advance_one_step();
+        if Self::is_strong_completion_signal(final_text) {
+            self.complete();
+        }
+    }
+
+    /// Advance logic used on ToolResult (especially WORK_COMPLETE).
+    pub fn advance_on_tool_result(&mut self, summary: &str) {
+        if !self.active || self.steps.is_empty() {
+            return;
+        }
+        let is_complete_signal = summary.contains("WORK_COMPLETE")
+            || summary.to_lowercase().contains("done")
+            || summary.to_lowercase().contains("fulfilled");
+        if is_complete_signal || self.current_step < self.steps.len() {
+            let idx = if self.current_step < self.steps.len() {
+                self.current_step
+            } else {
+                self.steps.len() - 1
+            };
+            self.steps[idx].status = PlanStepStatus::Done;
+            if self.current_step < self.steps.len() {
+                self.current_step += 1;
+            }
+            if is_complete_signal {
+                self.complete();
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)]
 pub struct WikiLink {
@@ -202,7 +297,7 @@ pub struct App {
     // Run mode submenu for /run-mode (talk, think, ...)
     pub agent_mode_menu_active: bool,
     pub selected_agent_mode_idx: usize,
-    pub agent_modes: [&'static str; 5],
+    pub agent_modes: [&'static str; 6],
 
     // Slash menu
     pub slash_commands: Vec<crate::input_dispatch::SlashCommand>,
@@ -245,6 +340,11 @@ pub struct App {
 
     // Full wiki viewer screen
     pub wiki_viewer: WikiViewerState,
+
+    // Plan Mode state (new pane + run mode "plan")
+    pub plan: PlanState,
+    pub pending_plan_confirmation: bool,
+    pub pending_plan_request: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -303,7 +403,7 @@ impl App {
             ],
             agent_mode_menu_active: false,
             selected_agent_mode_idx: 0,
-            agent_modes: ["talk", "think", "research", "work", "dream"],
+            agent_modes: ["talk", "think", "research", "work", "dream", "plan"],
             slash_commands: crate::input_dispatch::default_slash_commands(),
             slash_selected: 0,
             display_model: config.model.clone(),
@@ -339,6 +439,9 @@ impl App {
                 ..Default::default()
             },
             wiki_viewer: WikiViewerState::default(),
+            plan: PlanState::default(),
+            pending_plan_confirmation: false,
+            pending_plan_request: None,
         }
     }
 
@@ -1957,5 +2060,90 @@ fn remove_session_dir(session_id: &str) -> std::io::Result<()> {
         std::fs::remove_dir_all(dir)
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    use super::*;
+
+    fn make_steps(n: usize) -> Vec<PlanStep> {
+        (0..n)
+            .map(|i| PlanStep {
+                description: format!("step {}", i + 1),
+                verification: None,
+                status: PlanStepStatus::Pending,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn advance_one_step_marks_and_increments() {
+        let mut p = PlanState {
+            active: true,
+            steps: make_steps(3),
+            current_step: 0,
+            ..Default::default()
+        };
+        p.advance_one_step();
+        assert_eq!(p.current_step, 1);
+        assert!(matches!(p.steps[0].status, PlanStepStatus::Done));
+        assert!(matches!(p.steps[1].status, PlanStepStatus::Pending));
+    }
+
+    #[test]
+    fn complete_marks_all_and_goes_to_end() {
+        let mut p = PlanState {
+            active: true,
+            steps: make_steps(3),
+            current_step: 1,
+            ..Default::default()
+        };
+        p.complete();
+        assert_eq!(p.current_step, 3);
+        assert!(p.steps.iter().all(|s| matches!(s.status, PlanStepStatus::Done)));
+    }
+
+    #[test]
+    fn strong_completion_signals() {
+        assert!(PlanState::is_strong_completion_signal("**Done!** the task succeeded"));
+        assert!(PlanState::is_strong_completion_signal("WORK_COMPLETE: all good"));
+        assert!(PlanState::is_strong_completion_signal("The script runs successfully and meets all criteria."));
+        assert!(PlanState::is_strong_completion_signal("FULFILLED"));
+        assert!(!PlanState::is_strong_completion_signal("still working on it"));
+    }
+
+    #[test]
+    fn advance_on_turn_done_normal_and_forced() {
+        let mut p = PlanState {
+            active: true,
+            steps: make_steps(3),
+            current_step: 0,
+            ..Default::default()
+        };
+        p.advance_on_turn_done("I made some changes");
+        assert_eq!(p.current_step, 1);
+        assert!(matches!(p.steps[0].status, PlanStepStatus::Done));
+
+        // Force complete on Done signal
+        p.advance_on_turn_done("**Done!** everything is complete and criteria met");
+        assert_eq!(p.current_step, 3);
+        assert!(p.steps.iter().all(|s| matches!(s.status, PlanStepStatus::Done)));
+    }
+
+    #[test]
+    fn advance_on_tool_result_forces_on_work_complete() {
+        let mut p = PlanState {
+            active: true,
+            steps: make_steps(2),
+            current_step: 0,
+            ..Default::default()
+        };
+        p.advance_on_tool_result("some normal result");
+        assert_eq!(p.current_step, 1);
+
+        p.advance_on_tool_result("⭐⭐ JUDGE: WORK_COMPLETE: criteria satisfied");
+        assert_eq!(p.current_step, 2);
+        assert!(p.steps.iter().all(|s| matches!(s.status, PlanStepStatus::Done)));
     }
 }

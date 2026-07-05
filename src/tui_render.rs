@@ -15,6 +15,9 @@ use ratatui::{
     Frame,
 };
 
+const PLAN_ORANGE: Color = Color::Rgb(0xff, 0xc0, 0x40);
+const PLAN_GREEN: Color = Color::Rgb(0x60, 0xc0, 0x60);
+
 // ── Raven markdown renderer ──────────────────────────────────────────────────
 // Replaces tui_markdown with a purpose-built renderer that directly produces
 // ratatui types. Handles: headings, bold/italic/code, links, lists, code
@@ -858,30 +861,68 @@ pub fn draw_left_pane(
 
     let mut left_text = Text::default();
     let mut line_idx = 0usize;
+    let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
-        let (prefix_style, body_style) = conversation_entry_styles(entry);
-
-        let lines_iter: Vec<&str> = entry.lines().collect();
-        for (li, line) in lines_iter.iter().enumerate() {
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else if li == 0 {
-                prefix_style
-            } else {
-                body_style
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
+        let is_user = entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject");
+        if !is_user {
+            // Rich markdown rendering for assistant and system-ish messages.
+            // This preserves structure/newlines for plans, lists, code, headings, etc.
+            // (User messages stay plain for chat flow.)
+            let md = wiki_render_markdown(entry);
+            for mut line in md.lines {
+                if Some(line_idx) == highlight_line {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD);
+                    }
+                }
+                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 { /* keep a couple for md separation */ }
+                    else { left_text.lines.push(line); }
+                } else {
+                    consecutive_blanks = 0;
+                    left_text.lines.push(line);
+                }
+                line_idx += 1;
+            }
+        } else {
+            let (prefix_style, body_style) = conversation_entry_styles(entry);
+            let lines_iter: Vec<&str> = entry.lines().collect();
+            for (li, line) in lines_iter.iter().enumerate() {
+                let is_blank = line.trim().is_empty();
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 {
+                        continue;
+                    }
+                } else {
+                    consecutive_blanks = 0;
+                }
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if li == 0 {
+                    prefix_style
+                } else {
+                    body_style
+                };
+                left_text
+                    .lines
+                    .push(Line::from(Span::styled(line.to_string(), style)));
+                line_idx += 1;
+            }
         }
-        if i < left_committed.len() - 1 {
+        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
             left_text.lines.push(Line::from(""));
             line_idx += 1;
+            consecutive_blanks += 1;
         }
     }
 
@@ -1090,6 +1131,12 @@ fn conversation_entry_styles(entry: &str) -> (Style, Style) {
         (
             Style::default().fg(Color::DarkGray),
             Style::default().fg(Color::DarkGray),
+        )
+    } else if entry.contains("enter plan mode") || entry.contains("Do you want to enter plan mode") || entry.contains("Would you like to enter plan mode") {
+        // Plan mode entry confirmation question — highlighted in orange (same as plan pane) to get attention.
+        (
+            Style::default().fg(PLAN_ORANGE).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(0xff, 0xd0, 0x80)),
         )
     } else {
         (
@@ -1380,10 +1427,126 @@ pub struct WorkspaceDrawData<'a> {
     pub scroll_flash_timer: u8,
     pub left_highlight: Option<usize>,
     pub right_highlight: Option<usize>,
+    // Plan mode overlay pane (shown when run mode == "plan" or plan.active)
+    pub plan: Option<&'a crate::app_state::PlanState>,
 }
 
 /// Draw splash or workspace, or animate a horizontal slide between them.
 /// When desktop is Picker, draws the combined workspaces+sessions tree + summary (no separate sessions pane).
+fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState) {
+    let is_approved = !plan.steps.is_empty();
+    let pane_color = if is_approved { PLAN_GREEN } else { PLAN_ORANGE };
+    let title_text = if is_approved { " Plan (approved) " } else { " Plan " };
+    let block = Block::default()
+        .title(Span::styled(title_text, Style::default().fg(pane_color).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pane_color))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![];
+
+    // Key fields summary (compact)
+    lines.push(Line::from(vec![
+        Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(if plan.goal.is_empty() { "(gathering from user)" } else { &plan.goal }, Style::default().fg(Color::White)),
+    ]));
+    if !plan.success_criteria.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Success Criteria: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&plan.success_criteria, Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))),
+        ]));
+    }
+    if !plan.verification_steps.is_empty() {
+        lines.push(Line::from(Span::styled("Verification:", Style::default().fg(Color::DarkGray))));
+        for v in plan.verification_steps.iter().take(2) {
+            lines.push(Line::from(Span::styled(format!("  • {}", v), Style::default().fg(Color::Gray))));
+        }
+    }
+    if !plan.rollback.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Rollback: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&plan.rollback, Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    if !plan.constraints.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Constraints: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&plan.constraints, Style::default().fg(Color::Gray)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    if plan.steps.is_empty() {
+        // Collection / approval phase -- hide progress/step details until user approves the plan
+        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        // slow swirl: update every ~4 frames
+        let slow = spins[(plan.spinner_tick / 4) % spins.len()];
+        lines.push(Line::from(Span::styled(
+            format!("{} Steps: (to be determined)", slow),
+            Style::default().fg(Color::DarkGray)
+        )));
+        lines.push(Line::from(Span::styled(
+            "Waiting for plan approval...",
+            Style::default().fg(Color::DarkGray)
+        )));
+    } else {
+        // Execution phase: show progress + steps
+        // Progress with swirl + optional simple bar
+        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spin = spins[plan.spinner_tick % spins.len()];
+        let progress = if !plan.steps.is_empty() && plan.current_step < plan.steps.len() {
+            let st = &plan.steps[plan.current_step];
+            format!("{} Step {}/{} {}", spin, plan.current_step + 1, plan.steps.len(), st.description)
+        } else if !plan.steps.is_empty() {
+            // All steps completed (or forced on final Done / WORK_COMPLETE)
+            "✓ Plan complete".to_string()
+        } else {
+            format!("{} Preparing plan...", spin)
+        };
+        lines.push(Line::from(Span::styled(progress, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+
+        // Simple progress bar
+        if !plan.steps.is_empty() {
+            let total = plan.steps.len();
+            let done = plan.steps.iter().filter(|s| s.status == crate::app_state::PlanStepStatus::Done).count();
+            let mut pct = if total > 0 { (done * 100) / total } else { 0 };
+            if plan.current_step >= total || done >= total {
+                pct = 100;
+            }
+            let bar_width = 20;
+            let filled = (pct as usize * bar_width) / 100;
+            let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
+            lines.push(Line::from(Span::styled(bar, Style::default().fg(pane_color))));
+        }
+
+        // Step list preview
+        for (i, st) in plan.steps.iter().enumerate().take(5) {
+            let mark = if i == plan.current_step {
+                "▶ "
+            } else {
+                match st.status {
+                    crate::app_state::PlanStepStatus::Done => "✓ ",
+                    crate::app_state::PlanStepStatus::Failed => "✗ ",
+                    _ => "  ",
+                }
+            };
+            let v = if let Some(v) = &st.verification { format!(" [verify: {}]", v) } else { String::new() };
+            lines.push(Line::from(Span::styled(format!("{}{}{}", mark, st.description, v), Style::default().fg(Color::Gray))));
+        }
+    }
+
+    // Footer note about wiki storage
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Stored in: wiki/plan.md (editable outside)", Style::default().fg(Color::DarkGray))));
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    f.render_widget(para, inner);
+}
+
 pub fn draw_content_desktop(
     f: &mut Frame,
     content_area: Rect,
@@ -1461,10 +1624,23 @@ pub fn draw_content_desktop(
             *last_right_area = Rect::default();
         }
         ActiveDesktop::Workspace => {
+            let work_area = if let Some(p) = workspace.plan {
+                // Plan pane on top, ~40% height (taller for readability)
+                let plan_h = ((content_area.height as f32 * 0.40) as u16).clamp(12, content_area.height.saturating_sub(10));
+                let vsplit = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(plan_h), Constraint::Min(6)])
+                    .split(content_area);
+                draw_plan_pane(f, vsplit[0], p);
+                vsplit[1]
+            } else {
+                content_area
+            };
+
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                .split(content_area);
+                .split(work_area);
 
             let left_focus = if workspace.left_focused {
                 Pane::Left
@@ -2231,32 +2407,60 @@ fn build_left_text(
     let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
-        let (prefix_style, body_style) = conversation_entry_styles(entry);
-        let lines_iter: Vec<&str> = entry.lines().collect();
-        for (li, line) in lines_iter.iter().enumerate() {
-            let is_blank = line.trim().is_empty();
-            if is_blank {
-                consecutive_blanks += 1;
-                if consecutive_blanks > 2 {
-                    continue; // collapse excessive blank lines in display
+        let is_user = entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject");
+        if !is_user {
+            // Rich markdown for assistant responses (plans, lists etc show with proper
+            // newlines, headings, bullets, bold, code styling).
+            let md = wiki_render_markdown(entry);
+            for mut line in md.lines {
+                if Some(line_idx) == highlight_line {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD);
+                    }
                 }
-            } else {
-                consecutive_blanks = 0;
+                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks <= 2 {
+                        left_text.lines.push(line);
+                    }
+                } else {
+                    consecutive_blanks = 0;
+                    left_text.lines.push(line);
+                }
+                line_idx += 1;
             }
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else if li == 0 {
-                prefix_style
-            } else {
-                body_style
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
+        } else {
+            let (prefix_style, body_style) = conversation_entry_styles(entry);
+            let lines_iter: Vec<&str> = entry.lines().collect();
+            for (li, line) in lines_iter.iter().enumerate() {
+                let is_blank = line.trim().is_empty();
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 {
+                        continue; // collapse excessive blank lines in display
+                    }
+                } else {
+                    consecutive_blanks = 0;
+                }
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if li == 0 {
+                    prefix_style
+                } else {
+                    body_style
+                };
+                left_text
+                    .lines
+                    .push(Line::from(Span::styled(line.to_string(), style)));
+                line_idx += 1;
+            }
         }
         if i < left_committed.len() - 1 && consecutive_blanks < 2 {
             left_text.lines.push(Line::from(""));

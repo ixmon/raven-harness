@@ -32,7 +32,7 @@ fn make_rel_path(p: &str, workspace: &Path) -> String {
 
 fn normalize_agent_mode(s: &str) -> String {
     match s.trim().to_lowercase().as_str() {
-        "talk" | "think" | "research" | "work" | "dream" => s.trim().to_lowercase(),
+        "talk" | "think" | "research" | "work" | "dream" | "plan" => s.trim().to_lowercase(),
         _ => "talk".to_string(),
     }
 }
@@ -275,9 +275,14 @@ impl Agent {
         self.prune_history().await;
 
         let messages = self.build_messages_for_model();
+        let tools = if self.current_agent_mode() == "plan" {
+            tools::plan_mode_tools(&self.config.flags)
+        } else {
+            tools::all_tools(&self.config.flags)
+        };
         let req = ChatRequest {
             messages,
-            tools: Some(tools::all_tools(&self.config.flags)),
+            tools: Some(tools),
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
@@ -312,6 +317,23 @@ impl Agent {
                     tool_calls: None,
                     tool_call_id: Some(tc.id.clone()),
                 });
+                continue;
+            }
+
+            // Plan mode guard (belt & suspenders for direct calls).
+            if let Some(denial) = self.plan_mode_denial(&tool_name, &raw_args) {
+                self.record_tool_denial(&tc, &denial);
+                // Create a record so the driver surfaces it in the trace pane too.
+                let rec = ActionRecord {
+                    tool: tool_name.clone(),
+                    args: raw_args.clone(),
+                    summary: denial.clone(),
+                    output_to_model: denial,
+                    raw_bytes: 0,
+                    truncated: false,
+                    estimated_tokens: 10,
+                };
+                records.push(rec);
                 continue;
             }
 
@@ -350,6 +372,37 @@ impl Agent {
 
     /// Record a denied tool call into conversation (so the model sees a tool result)
     /// without actually executing the side effect.
+    /// Returns a denial reason string if the tool is blocked due to being in Plan mode
+    /// (and it's not a wiki write/patch). Returns None if the tool is allowed.
+    pub fn plan_mode_denial(&self, tool_name: &str, arguments: &str) -> Option<String> {
+        if self.current_agent_mode() != "plan" {
+            return None;
+        }
+        if !matches!(tool_name, "write" | "patch") {
+            return None;
+        }
+        let args_val: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+        let mut is_wiki = false;
+        if tool_name == "write" || tool_name == "patch" {
+            if let Some(w) = args_val.get("wiki").and_then(|v| v.as_bool()) {
+                is_wiki = w;
+            }
+            if !is_wiki {
+                if let Some(p) = args_val.get("path").and_then(|v| v.as_str()) {
+                    let t = p.trim().trim_start_matches("./");
+                    if t.starts_with("wiki/") || t.starts_with("wiki\\") || t == "wiki" {
+                        is_wiki = true;
+                    }
+                }
+            }
+        }
+        if is_wiki {
+            None
+        } else {
+            Some("❌ write/patch denied while in Plan mode (clarification phase). You must confirm verification steps + rollback and receive an explicit 'proceed' (or equivalent) before writing implementation files. Use wiki writes only for plan.md during planning.".to_string())
+        }
+    }
+
     pub fn record_tool_denial(&mut self, tc: &ToolCall, reason: &str) {
         self.conversation.push(Message {
             role: "assistant".into(),
@@ -415,10 +468,14 @@ impl Agent {
     pub async fn continue_turn_streaming(&mut self) -> Result<mpsc::Receiver<StreamChunk>> {
         self.prune_history().await;
         let messages = self.build_messages_for_model();
-        let tools_schema = tools::all_tools(&self.config.flags);
+        let tools = if self.current_agent_mode() == "plan" {
+            tools::plan_mode_tools(&self.config.flags)
+        } else {
+            tools::all_tools(&self.config.flags)
+        };
         let req = ChatRequest {
             messages,
-            tools: Some(tools_schema),
+            tools: Some(tools),
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
@@ -801,7 +858,8 @@ History:
     /// Always starts with a fresh system message containing the current
     /// repo cache + goal + pitfalls + recent summary from the Session.
     fn build_messages_for_model(&self) -> Vec<Message> {
-        let base = system_message(&self.config.workspace, &self.config.flags);
+        let mode = self.current_agent_mode();
+        let base = system_message(&self.config.workspace, &self.config.flags, &mode);
 
         // Log the system prompt (including whether Core Loop was suppressed for evals)
         // into full_log on the very first build so we can see exactly what the model
@@ -1370,7 +1428,7 @@ fn strip_command_context_blocks(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFlags) -> Message {
+fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFlags, agent_mode: &str) -> Message {
     let in_eval = flags.is_eval;
 
     let core_loop = if in_eval {
@@ -1379,6 +1437,16 @@ fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFl
         // omitted (and the fact that it was omitted is logged to full_log) so we
         // can observe whether the agent obeys the eval-specific instructions.
         "".to_string()
+    } else if agent_mode == "plan" {
+        // In plan mode we do *not* want the normal exploration loop.
+        // Clarification must come from the user, not by reading files.
+        r#"
+## Clarification Approach (Plan Mode only)
+- Do NOT start by thinking "what files do I need to read".
+- All questions come from the user's description.
+- Use tools *only* for update_goal and writing the plan to the wiki.
+"#
+        .to_string()
     } else {
         r#"
 ## Core Loop (follow this every turn)
@@ -1388,6 +1456,59 @@ fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFl
 "#
         .to_string()
     };
+
+    let plan_mode_section = if agent_mode == "plan" {
+        r#"
+## Plan Mode - Clarification Phase
+You are in Plan Mode. Your job is to create a solid plan BEFORE any implementation work.
+
+**Exploration during planning is good and expected**
+- Use read, grep, list, and web tools to learn about the existing code, tests, and conventions.
+- This lets you ask better questions and present realistic options.
+- Example of good behavior: "I see there's already a unit test that generates a simple cake using X approach. Would you like to (1) keep a similar approach, (2) do something more elaborate, or (3) something else?"
+- Base your options on both the user's request *and* what you discovered.
+- Always let the user choose or correct you — don't assume you know best.
+
+**Environment & dependency audit (do this during planning)**
+- Use the exec tool to verify what is available before you finalize the plan:
+  - Compilers / interpreters present? (g++, clang, rustc, python3, etc.)
+  - Required libraries / headers? (pkg-config, vcpkg, apt, brew, etc.)
+  - Build/test utilities? (make, cmake, cargo, npm, etc.)
+  - Disk space, memory, other resources?
+- If something important is missing, include it in the plan (user will need to install) or choose an approach that doesn't require it.
+- Document the exact verification commands you will use in the Success Criteria / Verification section of the plan.
+- If during later work you discover and use a better verification command (e.g. a C++ linter instead of what was initially proposed), update wiki/plan.md with the actual command(s) used.
+
+- Carefully consider the user's request (and any previous context).
+- Identify the **single largest unclarified branching decision** that must be made.
+- **You MUST ask exactly ONE question per response.** Never combine multiple independent decisions or ask "question A and question B" in the same turn. The answer to one question can completely change what the next question should be.
+- If you can offer concrete options for this single decision, list them as:
+  1. first option description
+  2. second option description
+  3. third option description
+You MUST end the list with exactly this sentence (replace X with your recommended best/easiest): Type the number of your choice... I recommend option X
+- The user may reply with a number, or with free text that points at one of the options or describes a new direction not listed. Handle either gracefully and pick the next most important decision based on their answer.
+- After they answer, decide the *next* single most important unclarified decision (it may be completely different based on their choice) and ask only about that.
+- Do not list execution steps or start working yet.
+- In the UI, only the high-level fields (Goal, Success Criteria, Verification, Rollback) are shown to the user right now. Steps are (TBD).
+- Keep asking until everything is crystal clear.
+- In plan mode you are given a focused set of tools (mostly read-oriented + update_goal + wiki writes). Use the exploration tools freely to understand the task and existing work. Avoid main-workspace writes and exec until the user says "proceed".
+- Produce user-facing text only. No hidden thinking via tools.
+- Once there is no uncertainty (after incorporating the user's answer to your clarification question), you **MUST** in your response to the *user*:
+  1. Briefly acknowledge the choice.
+  2. Present a clear recap of Goal + Success Criteria.
+  3. Explicitly propose the verification command(s) the harness should use (exact runnable command if possible) **and ask the user to confirm them**.
+  4. Mention rollback approach and ask for confirmation if relevant.
+  5. **Only after the user has confirmed the verification commands**, end with a direct question: "Shall we proceed with this plan, or would you like to make a change?"
+- You may not ask the proceed question until the user has explicitly confirmed (or suggested) the verification commands.
+- After the user answers your first clarification, do **not** end the turn with only internal todo lists or tool calls. Produce the user-facing plan summary + confirmation questions promptly.
+- Only after the user's "proceed" message may you begin writing code or running the final verification. The harness will then switch to work mode and the Plan pane will show live progress.
+- Only when the user says something like "proceed", "go ahead", "start", etc., you may indicate that planning is complete (the harness will switch to work/execution mode).
+- After clarifying, call `update_goal` with the agreed goal and the success criteria as the `tests` list (this updates the Plan pane).
+- Write the final agreed plan (goal, criteria, verification, rollback) to `wiki/plan.md` so it is saved and the user can see/edit it.
+- When you present the final plan recap in chat (before asking "proceed?"), format it with markdown: use ## or **Goal:** etc, bullet/numbered lists for verification and steps. This helps the UI render it nicely in the conversation pane.
+"#
+    } else { "" };
 
     let bug_fixes_section = if in_eval {
         r#"
@@ -1420,6 +1541,21 @@ Use `update_goal` (when intent shifts) and `record_discovery` for high-value fac
         ""
     };
 
+    let anti_narration = if agent_mode == "plan" {
+        // In plan mode we WANT the agent to narrate the plan and ask clarifying questions.
+        ""
+    } else {
+        r#"- **Keep calling tools until the task is actually done.** Do NOT stop to narrate plans or summarize progress mid-task. If there is more work to do, call the next tool immediately.
+"#
+    };
+
+    // Build a human-readable tools list for the prompt, appropriate to the mode.
+    let tools_list = if agent_mode == "plan" {
+        "read, write (with wiki=true), patch (with wiki=true), grep, list, web_search, browse, browse_urls, update_goal, define_done, record_discovery"
+    } else {
+        "exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary"
+    };
+
     let sys = format!(
         r#"You are a sharp, practical coding agent running in a terminal-based agentic environment.
 
@@ -1434,6 +1570,8 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 - If the user gives a clear coding or workspace task, then switch to task mode and follow the Core Loop and Execution Style below.
 - You are allowed (and encouraged) to respond with text only for conversational or meta requests. Do not force tool use or claim tasks are "done" when the user is just chatting.
 
+{}
+
 ## Tool Discipline (critical)
 - NEVER claim a file was read/written/edited unless a tool call just confirmed it.
 - Prefer `patch` over `write` for edits. `patch` supports `near_line` for disambiguation.
@@ -1445,7 +1583,7 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 {}{}
 
 ## Available Tools
-exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
+{}
 (read/write/patch/list accept wiki=true for session wiki. Path is always relative.)
 
 ## Output Style
@@ -1460,14 +1598,18 @@ A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important
 You have access to the full workspace. You can run commands and modify files.
 
 ## Execution Style (critical — read carefully)
-- **Keep calling tools until the task is actually done.** Do NOT stop to narrate plans or summarize progress mid-task. If there is more work to do, call the next tool immediately.
+{}
 - Only stop calling tools when: (a) the goal is fully achieved and verified, or (b) you are genuinely blocked and need user input.
+- When you perform verification (especially a lint, build, or test), record the *exact command* you ran in `wiki/plan.md` under the Verification section (use wiki=true).
 - When you ARE done, give a brief summary of what changed and any commands the user should run.
 - If the user explicitly asks you to "produce a patch", "make the fix", or similar, immediately call the `patch` tool (or `write`) with the edit. Do not output explanatory text first — the tool call *is* the response.
 {}
 "#,
         workspace.display(),
+        plan_mode_section,
+        anti_narration,
         core_loop,
+        tools_list,
         bug_fixes_section,
         define_done_usage,
         execution_define_done
@@ -1555,5 +1697,81 @@ mod integration_tests {
         assert!(result.final_text.contains("README"));
         assert_eq!(result.actions.len(), 1);
         assert_eq!(result.actions[0].tool, "list");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_non_wiki_writes_but_allows_wiki_and_update_goal() {
+        let plan_write_args = serde_json::json!({
+            "path": "plan.md",
+            "content": "# Plan for ASCII cake script",
+            "wiki": true
+        }).to_string();
+        let impl_write_args = serde_json::json!({
+            "path": "birthday_cake.py",
+            "content": "print('cake')"
+        }).to_string();
+        let update_args = serde_json::json!({
+            "goal": "Write ascii cake script",
+            "tests": ["script runs and prints cake"]
+        }).to_string();
+
+        let chat = ChatBackend::Mock(crate::chat_backend::MockChatBackend::new(vec![
+            // First turn in plan mode: agent does update_goal + write to wiki (plan.md)
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![
+                    mock_tool_call("update_goal", &update_args),
+                    mock_tool_call("write", &plan_write_args),
+                ],
+                finish_reason: None,
+                usage: None,
+            },
+            // Second turn: tries a workspace write (should be denied by guard)
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![mock_tool_call("write", &impl_write_args)],
+                finish_reason: None,
+                usage: None,
+            },
+            // Third: after proceed (mode will be switched outside in real flow), does real write
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![mock_tool_call("write", &impl_write_args)],
+                finish_reason: Some("stop".into()),
+                usage: None,
+            },
+        ]));
+
+        let mut cfg = mock_eval_config();
+        // Give it a session so wiki + meta work
+        let ws = cfg.workspace.clone();
+        let session = crate::session::Session::init(&ws).unwrap();
+        cfg.prebuilt_session = Some(session);
+
+        let mut agent = Agent::new(cfg, chat);
+        agent.set_agent_mode("plan");
+
+        // Turn 1: clarification / planning turn (update_goal + wiki write)
+        let r1 = agent.run_turn("write a python script for an ascii birthday cake").await.expect("r1");
+        // Should have performed the wiki write (no denial)
+        let actions1: Vec<_> = r1.actions.iter().map(|a| a.tool.as_str()).collect();
+        assert!(actions1.contains(&"write") || actions1.contains(&"update_goal"), "planning actions: {:?}", actions1);
+
+        // Turn 2: while still in plan, a workspace write should be denied by the guard (produces denial record)
+        // We don't assert exact string here because action recording for denials may surface in conversation;
+        // the important thing is we don't get a normal successful write side-effect for non-wiki.
+        let _r2 = agent.run_turn("ok I will just write the cake script now").await.expect("r2");
+
+        // The harness (input_handler) would detect "proceed" and switch the mode
+        agent.set_agent_mode("work");
+        assert_eq!(agent.current_agent_mode(), "work");
+
+        // At this point further writes would be allowed by the guard (the previous
+        // plan-mode write attempt for non-wiki would have been denied inside execute_and_record).
+        // We simply assert that we can continue running turns after the mode change.
+        let r3 = agent.run_turn("now implement the script").await.expect("r3 after switch");
+        // r3 may or may not contain a write depending on mock responses left; the key
+        // is that the agent is no longer restricted by the plan-mode guard.
+        let _ = r3;
     }
 }

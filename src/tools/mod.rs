@@ -81,7 +81,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "write".into(),
-                description: "Write (or overwrite) a *file*. Path must point to a file, not a directory. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed.".into(),
+                description: "Write (or overwrite) a *file*. Path must point to a file, not a directory. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed. In 'plan' mode, non-wiki writes are denied until the user says 'proceed'.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -97,7 +97,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Search/replace edit on a *file*. Path must be a file (not dir). Set wiki=true for wiki files (path e.g. 'index.md').".into(),
+                description: "Search/replace edit on a *file*. Path must be a file (not dir). Set wiki=true for wiki files (path e.g. 'index.md'). In 'plan' mode, non-wiki patches are denied until the user says 'proceed'.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -267,6 +267,199 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
                         "summary": { "type": "string", "description": "Your concise summary of the file content" }
                     },
                     "required": ["path", "mtime", "summary"]
+                }),
+            },
+        },
+    ];
+
+    if disable_update_goal {
+        tools.retain(|t| t.function.name != "update_goal");
+    }
+    tools
+}
+
+/// Tools intended for use while the agent is in "plan" / clarification mode.
+/// 
+/// The goal is to let the agent explore the codebase and existing tests so it
+/// can ask *better* questions, while still preventing it from making changes
+/// to the main workspace until the user has approved the plan.
+///
+/// We deliberately give it read-oriented tools + update_goal + the ability
+/// to write to the session wiki (for plan.md).
+pub fn plan_mode_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
+    let disable_update_goal = flags.disable_goal_tool || !flags.goal_tracking;
+
+    let mut tools = vec![
+        // Exploration / understanding tools - very useful during planning
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "read".into(),
+                description: "Read a file's contents. Set wiki=true to target the session wiki. Use this to understand existing code and tests so you can ask good clarification questions.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path (wiki=true: relative to wiki root only)" },
+                        "lines": { "type": "string", "description": "Optional range like \"10-40\"" },
+                        "full": { "type": "boolean" },
+                        "wiki": { "type": "boolean" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "grep".into(),
+                description: "Search for a pattern across files. Great for finding how something is done in the existing code or tests during planning.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string" },
+                        "path": { "type": "string" },
+                        "include": { "type": "string" },
+                        "context": { "type": "integer" },
+                        "fixed": { "type": "boolean" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "list".into(),
+                description: "List a directory. Use wiki=true for the session wiki.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "wiki": { "type": "boolean" }
+                    }
+                }),
+            },
+        },
+        // Web research tools can still be useful while planning
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "web_search".into(),
+                description: "Search the web. Returns titles, URLs, and short descriptions.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "count": { "type": "integer" }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "browse".into(),
+                description: "Fetch content from a URL. Useful for researching approaches while planning.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" },
+                        "depth": { "type": "integer" },
+                        "extract": { "type": "string" }
+                    },
+                    "required": ["url"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "browse_urls".into(),
+                description: "Fetch multiple URLs in parallel.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "urls": { "type": "array", "items": { "type": "string" } },
+                        "extract": { "type": "string" }
+                    },
+                    "required": ["urls"]
+                }),
+            },
+        },
+        // Planning-specific state tools
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "update_goal".into(),
+                description: "Update the tracked goal and success criteria for the plan you are developing.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string" },
+                        "tests": { "type": "array", "items": { "type": "string" } },
+                        "pitfalls": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["goal"]
+                }),
+            },
+        },
+        // Wiki write is how the agent maintains the living plan.md during clarification
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "write".into(),
+                description: "Write a file. In plan mode you should almost always use wiki=true to write to the session's plan.md.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" },
+                        "wiki": { "type": "boolean" }
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+        },
+        // Exec is allowed in plan mode *for environment and dependency checks only*
+        // (compilers present? needed libs? disk space? verification tools?).
+        // Do not use it to build or run the main deliverable until the plan is approved.
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "exec".into(),
+                description: "Run a shell command (for planning: check compilers, libraries, disk space, memory, available tools, versions, etc.). Do NOT use to compile/build/test the final deliverable before 'proceed'.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute (bash). Will run with the workspace as cwd."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Optional timeout in seconds (default 60)"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "patch".into(),
+                description: "Edit a file with search/replace. Prefer wiki=true in plan mode.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "search": { "type": "string" },
+                        "replace": { "type": "string" },
+                        "near_line": { "type": "integer" },
+                        "wiki": { "type": "boolean" }
+                    },
+                    "required": ["path", "search", "replace"]
                 }),
             },
         },

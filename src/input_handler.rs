@@ -19,6 +19,25 @@ use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
+/// Returns true if the prompt looks like a request to enter plan mode.
+/// Extracted for testability.
+pub(crate) fn is_plan_trigger_phrase(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    let trigger_phrases = [
+        "come up with a plan", "let's plan", "make a plan", "first plan",
+        "what's the plan", "plan the", "create a plan", "develop a plan",
+        "plan out", "plan for this"
+    ];
+    trigger_phrases.iter().any(|p| lower.contains(p)) ||
+        (lower.contains("plan") && (lower.contains("task") || lower.contains("work") || lower.contains("refactor") || lower.contains("change") || lower.contains("implement")))
+}
+
+/// Returns true for phrases that should confirm "proceed" while in plan mode.
+pub(crate) fn is_proceed_confirmation(prompt: &str) -> bool {
+    let lower = prompt.to_lowercase();
+    lower.contains("proceed") || lower.contains("go ahead") || lower.contains("let's go") || lower == "yes" || lower.contains("start executing") || lower.contains("let's do it") || lower.contains("do it") || lower.contains("go for it") || lower.contains("confirmed")
+}
+
 /// Handle a key event and update the app state accordingly.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_key_event(
@@ -421,10 +440,290 @@ async fn handle_input_key(
                 // Submit the input. If it is a slash command, dispatch it (may activate
                 // submenus for /approval-mode or /run-mode, or handle instantly).
                 // Only plain prompts go through to the agent driver.
+                // Plan mode entry confirmation dialog
+                if app.pending_plan_confirmation {
+                    app.pending_plan_confirmation = false;
+                    let submitted = app.input.trim().to_lowercase();
+                    let yes = submitted.starts_with('y');
+                    let original = app.pending_plan_request.take();
+                    app.clear_input();
+                    if yes {
+                        if let Ok(mut ag) = agent.try_lock() {
+                            ag.set_agent_mode("plan");
+                            if let Some(s) = &mut ag.session_mut() {
+                                let _ = s.save_meta();
+                            }
+                        }
+                        app.plan.active = true;
+                        app.focused_pane = crate::app_state::Pane::Input; // leave focus in input for answers
+                        // Write initial plan to wiki (with task-appropriate verification)
+                        if let Ok(mut ag) = agent.try_lock() {
+                            if let Some(s) = ag.session_mut() {
+                                let verif = app.plan.verification_steps.iter()
+                                    .map(|v| format!("- {}", v))
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+                                // Always initialize a clean, structured template on entering plan mode.
+                                // No need to manually delete wiki/plan.md between plan attempts.
+                                let plan_text = format!(
+                                    "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n**Verification:**\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n## Notes\n\n(Agent will refine this during clarification. Final approved version written on 'proceed'.)\n",
+                                    app.plan.goal, app.plan.success_criteria, verif, app.plan.rollback, app.plan.constraints
+                                );
+                                let _ = s.write_wiki_file("plan.md", &plan_text);
+                                app.left_committed.push("Plan written to session wiki/plan.md (you can edit externally too)".to_string());
+                            }
+                        }
+                        // Populate from the original request if we have it. Always use the triggering request as the Goal.
+                        if let Some(req) = original {
+                            app.plan.goal = req.clone();
+                            // Also update session meta so the goal is persisted and used by agent/judge
+                            if let Ok(mut ag) = agent.try_lock() {
+                                if let Some(s) = &mut ag.session_mut() {
+                                    s.meta.current_goal = req.clone();
+                                    let _ = s.save_meta();
+                                }
+                            }
+                        } else if app.plan.goal.is_empty() {
+                            // fallback only if no specific request captured
+                            app.plan.goal = "Plan for the current task".to_string();
+                        }
+                        if app.plan.success_criteria.is_empty() {
+                            app.plan.success_criteria = "Verification steps pass and the goal is achieved".to_string();
+                        }
+                        if app.plan.verification_steps.is_empty() {
+                            let g = app.plan.goal.to_lowercase();
+                            if g.contains("python") || g.contains(".py") {
+                                app.plan.verification_steps = vec![
+                                    "python3 <your_script>.py [args]".to_string(),
+                                    "check that output matches the expected result".to_string(),
+                                ];
+                            } else if g.contains("c++") || g.contains("cpp") || g.contains("g++") || g.contains("clang") {
+                                app.plan.verification_steps = vec![
+                                    "g++ -std=c++17 -Wall -o program program.cpp".to_string(),
+                                    "clang-tidy program.cpp -- -std=c++17".to_string(),
+                                    "./program".to_string(),
+                                ];
+                            } else if g.contains("c ") || g.contains("gcc") {
+                                app.plan.verification_steps = vec![
+                                    "gcc -Wall -o program program.c".to_string(),
+                                    "./program".to_string(),
+                                ];
+                            } else {
+                                app.plan.verification_steps = vec!["cargo check".to_string(), "cargo clippy -- -D warnings".to_string(), "cargo test".to_string()];
+                            }
+                        }
+
+                        if app.plan.rollback.is_empty() {
+                            app.plan.rollback = "git branch + checkpoints".to_string();
+                        }
+                        // Do NOT populate steps yet -- they appear only after user approves the full plan
+                        app.plan.steps.clear();
+                        app.plan.current_step = 0;
+                        app.left_committed.push("Entered Plan Mode. Run Mode set to 'plan'.".to_string());
+                        // Re-submit the original request now that we are in plan mode so the agent starts clarification
+                        if let Some(req) = app.pending_plan_request.take() {
+                            app.input = req;
+                        } else if !app.plan.goal.is_empty() {
+                            app.input = app.plan.goal.clone();
+                        }
+                        // fall through to normal submit with the (now set) input
+                    } else {
+                        app.left_committed.push("Plan mode entry cancelled.".to_string());
+                        app.needs_redraw = true;
+                        return Ok(true);
+                    }
+                }
+
                 let prompt = app.input.trim().to_string();
                 if prompt.is_empty() {
                     return Ok(true);
                 }
+
+                // Automatic plan mode trigger for natural language planning requests
+                if !app.plan.active && !app.pending_plan_confirmation && !app.pending_plan_request.is_some() {
+                    if is_plan_trigger_phrase(&prompt) {
+                        app.pending_plan_request = Some(prompt.clone());
+                        // Set the goal in the plan state immediately from the user's request
+                        // so the pane reflects the actual ask (e.g. birthday cake script) instead of boilerplate.
+                        app.plan.goal = prompt.clone();
+                        // Start fresh for this request
+                        app.plan.success_criteria.clear();
+                        app.plan.verification_steps.clear();
+                        app.plan.rollback.clear();
+                        app.plan.constraints.clear();
+                        app.plan.steps.clear();
+                        app.plan.current_step = 0;
+                        // Also seed the session meta goal so it isn't blank
+                        if let Ok(mut ag) = agent.try_lock() {
+                            if let Some(s) = &mut ag.session_mut() {
+                                s.meta.current_goal = prompt.clone();
+                                // Initialize a clean plan template immediately on detecting plan intent.
+                                // This way wiki/plan.md starts fresh for this run instead of carrying
+                                // over stale content from a previous plan in the same session.
+                                let _ = s.write_wiki_file(
+                                    "plan.md",
+                                    &format!("# Plan\n\n**Goal:** {}\n\n*Template will be expanded on confirmation.*", prompt)
+                                );
+                                let _ = s.save_meta();
+                            }
+                        }
+                        app.left_committed.push("Do you want to enter plan mode? (y/n)".to_string());
+                        app.pending_plan_confirmation = true;
+                        app.input = "y".to_string();  // prefill yes; change to n and enter to cancel
+                        app.cursor_pos = app.input.len();
+                        app.needs_redraw = true;
+                        return Ok(true);
+                    }
+                }
+
+                // In plan mode, detect "proceed" to switch to work mode and show steps
+                {
+                    let current_mode = if let Ok(ag) = agent.try_lock() { ag.current_agent_mode() } else { String::new() };
+                    if current_mode == "plan" {
+                        if is_proceed_confirmation(&prompt) {
+                            if let Ok(mut ag) = agent.try_lock() {
+                                ag.set_agent_mode("work");
+                                if let Some(s) = &mut ag.session_mut() {
+                                    let _ = s.save_meta();
+                                }
+                            }
+                            app.plan.active = true;
+                            if app.plan.steps.is_empty() {
+                                let g = app.plan.goal.to_lowercase();
+                                // Derive task-appropriate verification (prefer any already set)
+                                let mut verif = app.plan.verification_steps.clone();
+                                if verif.is_empty() {
+                                    if g.contains("python") || g.contains(".py") {
+                                        verif = vec!["python3 birthday_cake.py".to_string(), "output contains recognizable ASCII cake".to_string()];
+                                    } else if g.contains("c++") || g.contains("cpp") || g.contains("g++") || g.contains("clang") {
+                                        verif = vec![
+                                            "g++ -std=c++17 -Wall -o program program.cpp".to_string(),
+                                            "clang-tidy program.cpp -- -std=c++17".to_string(),
+                                            "./program".to_string(),
+                                        ];
+                                    } else {
+                                        verif = vec!["cargo check".to_string(), "cargo clippy -- -D warnings".to_string(), "cargo test".to_string()];
+                                    }
+                                }
+                                app.plan.verification_steps = verif.clone();
+
+                                // Try to extract real steps and (especially) verification from the plan.md the agent wrote during clarification.
+                                // This is how language-specific checks (C++ lint etc) end up in the plan instead of stale cargo defaults.
+                                let mut extracted_steps: Vec<String> = vec![];
+                                let mut extracted_verif: Vec<String> = vec![];
+                                if let Ok(ag) = agent.try_lock() {
+                                    if let Some(s) = ag.session() {
+                                        let plan_content = s.read_wiki_file("plan.md", None, false, 100);
+                                        let mut in_verif = false;
+                                        for line in plan_content.lines() {
+                                            let t = line.trim();
+                                            if t.eq_ignore_ascii_case("**verification:**") || t.eq_ignore_ascii_case("verification:") || t.to_lowercase().starts_with("**verification") {
+                                                in_verif = true;
+                                                continue;
+                                            }
+                                            if in_verif {
+                                                if t.starts_with('#') || t.starts_with("**") && t.contains("step") || t.to_lowercase().starts_with("rollback") {
+                                                    in_verif = false;
+                                                } else if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ") {
+                                                    let v = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ' || (c >= '0' && c <= '9') || c == '.').trim();
+                                                    if !v.is_empty() {
+                                                        extracted_verif.push(v.to_string());
+                                                    }
+                                                }
+                                            }
+
+                                            if let Some(rest) = t.strip_prefix(|c: char| c.is_ascii_digit()).and_then(|r| r.strip_prefix('.').or_else(|| r.strip_prefix(")"))) {
+                                                let desc = rest.trim_start_matches(|c: char| c == ' ' || c == '-' || c == '*').trim();
+                                                if !desc.is_empty() && desc.len() > 3 && !desc.to_lowercase().starts_with("verify") {
+                                                    extracted_steps.push(desc.to_string());
+                                                }
+                                            } else if t.starts_with("- ") || t.starts_with("* ") {
+                                                let desc = t[2..].trim();
+                                                if !desc.is_empty() && desc.len() > 5 && !desc.to_lowercase().contains("rollback") && !desc.to_lowercase().contains("constraint") && !desc.to_lowercase().contains("verify") {
+                                                    extracted_steps.push(desc.to_string());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Prefer verification the agent wrote in its plan.md (this is how C++/other language checks get in)
+                                if !extracted_verif.is_empty() {
+                                    verif = extracted_verif;
+                                }
+                                app.plan.verification_steps = verif.clone();
+
+                                let mut plan_steps = if !extracted_steps.is_empty() {
+                                    extracted_steps.into_iter().take(5).map(|d| crate::app_state::PlanStep {
+                                        description: d,
+                                        verification: None,
+                                        status: crate::app_state::PlanStepStatus::Pending,
+                                    }).collect::<Vec<_>>()
+                                } else {
+                                    // Fallback to meaningful task-aware steps
+                                    let step1 = if g.contains("python") || g.contains(".py") || g.contains("script") {
+                                        "Write the script / implementation".to_string()
+                                    } else if g.contains("test") || g.contains("fix") {
+                                        "Implement the fix / changes".to_string()
+                                    } else {
+                                        "Implement the solution".to_string()
+                                    };
+                                    let step2 = if g.contains("python") || g.contains("script") {
+                                        "Run / execute the script".to_string()
+                                    } else {
+                                        "Build and test changes".to_string()
+                                    };
+                                    let step3 = "Verify against success criteria".to_string();
+                                    vec![
+                                        crate::app_state::PlanStep { description: step1, verification: verif.get(0).cloned(), status: crate::app_state::PlanStepStatus::Pending },
+                                        crate::app_state::PlanStep { description: step2, verification: verif.get(1).cloned(), status: crate::app_state::PlanStepStatus::Pending },
+                                        crate::app_state::PlanStep { description: step3, verification: verif.get(verif.len().saturating_sub(1)).cloned(), status: crate::app_state::PlanStepStatus::Pending },
+                                    ]
+                                };
+
+                                if !plan_steps.is_empty() {
+                                    plan_steps[0].status = crate::app_state::PlanStepStatus::InProgress;
+                                    if let Some(v0) = verif.get(0) {
+                                        if plan_steps[0].verification.is_none() {
+                                            plan_steps[0].verification = Some(v0.clone());
+                                        }
+                                    }
+                                }
+
+                                app.plan.steps = plan_steps;
+                                app.plan.current_step = 0;
+                            }
+                            // Update wiki with approved plan + steps
+                            if let Ok(mut ag) = agent.try_lock() {
+                                if let Some(s) = ag.session_mut() {
+                                    let verif = app.plan.verification_steps.iter().map(|v| format!("- {}", v)).collect::<Vec<_>>().join("\n");
+                                    let steps_str = app.plan.steps.iter().enumerate().map(|(i, st)| {
+                                        let v = st.verification.as_deref().unwrap_or("");
+                                        format!("{}. {} [verify: {}]", i+1, st.description, v)
+                                    }).collect::<Vec<_>>().join("\n");
+                                    let plan_text = format!(
+                                        "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n**Verification:**\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n**Steps:**\n{}\n\n## Execution Log\n\n(Added as work proceeds after 'proceed'.)\n",
+                                        app.plan.goal, app.plan.success_criteria, verif, app.plan.rollback, app.plan.constraints, steps_str
+                                    );
+                                    let _ = s.write_wiki_file("plan.md", &plan_text);
+                                }
+                            }
+                            app.left_committed.push("Plan confirmed by user. Switching to work mode. Executing...".to_string());
+
+                            // Also push the final verification into session meta via update_goal so the judge has good criteria
+                            if let Ok(mut ag) = agent.try_lock() {
+                                if let Some(s) = &mut ag.session_mut() {
+                                    let _ = s.update_goal(
+                                        &app.plan.goal,
+                                        Some(app.plan.verification_steps.clone()),
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
                 app.left_committed.push(format!("> {}", prompt));
                 app.clear_input();
                 app.needs_redraw = true;
@@ -462,6 +761,7 @@ async fn handle_input_key(
                     config,
                     keystore,
                     agent,
+                    pending_plan_confirmation: &mut app.pending_plan_confirmation,
                 };
 
                 match crate::input_dispatch::dispatch_slash_command(&prompt, &mut ctx) {
@@ -557,6 +857,7 @@ async fn handle_input_key(
                                                         name: "system".into(),
                                                         summary: format!("🔍 Super Judge: WORK_COMPLETE — {}", note),
                                                     }).await;
+                                                    // Advance plan if active
                                                     break;
                                                 }
                                                 raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
@@ -754,6 +1055,44 @@ pub fn get_filtered_commands<'a>(
         .iter()
         .filter(|cmd| prefix.is_empty() || cmd.name.starts_with(prefix))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_various_plan_triggers() {
+        assert!(is_plan_trigger_phrase("come up with a plan to write a script"));
+        assert!(is_plan_trigger_phrase("let's plan this out"));
+        assert!(is_plan_trigger_phrase("make a plan for the refactor"));
+        assert!(is_plan_trigger_phrase("plan the implementation"));
+        assert!(is_plan_trigger_phrase("create a plan for this task"));
+        assert!(is_plan_trigger_phrase("what's the plan for the work"));
+        assert!(is_plan_trigger_phrase("plan for this change"));
+        // The broad "plan" + context
+        assert!(is_plan_trigger_phrase("I want to plan the task"));
+        assert!(is_plan_trigger_phrase("plan out the new feature"));
+        // Negative
+        assert!(!is_plan_trigger_phrase("what is your plan for dinner"));
+        assert!(!is_plan_trigger_phrase("just talk about the plan"));
+    }
+
+    #[test]
+    fn detects_proceed_variants() {
+        assert!(is_proceed_confirmation("proceed"));
+        assert!(is_proceed_confirmation("let's proceed with the plan"));
+        assert!(is_proceed_confirmation("go ahead"));
+        assert!(is_proceed_confirmation("yes"));
+        assert!(is_proceed_confirmation("let's do it"));
+        assert!(is_proceed_confirmation("do it"));
+        assert!(is_proceed_confirmation("go for it"));
+        assert!(is_proceed_confirmation("confirmed"));
+        assert!(is_proceed_confirmation("start executing"));
+        // Ambiguous should not be over-eager in this fn (the agent may still ask for clarity)
+        assert!(!is_proceed_confirmation("maybe"));
+        assert!(!is_proceed_confirmation("sounds good"));
+    }
 }
 
 

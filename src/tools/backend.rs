@@ -195,7 +195,8 @@ async fn real_execute(
     match name {
         "exec" => {
             let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            Ok(exec(cmd, workspace).await)
+            let timeout_secs = args.get("timeout_secs").and_then(|v| v.as_u64());
+            Ok(exec(cmd, workspace, timeout_secs).await)
         }
         "read" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");

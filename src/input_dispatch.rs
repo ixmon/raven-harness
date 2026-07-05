@@ -46,6 +46,7 @@ pub struct SlashContext<'a> {
     pub config: &'a Config,
     pub keystore: &'a Keystore,
     pub agent: &'a Arc<Mutex<Agent>>,
+    pub pending_plan_confirmation: &'a mut bool,
 }
 
 fn clear_slash_input(ctx: &mut SlashContext<'_>) {
@@ -189,6 +190,17 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             scroll_left(ctx.left_committed);
             SlashDispatch::Handled
         }
+        "plan" => {
+            // Trigger plan mode entry confirmation dialog
+            *ctx.pending_plan_confirmation = true;
+            ctx.left_committed.push("Do you want to enter plan mode? (y/n)".to_string());
+            ctx.input.clear();
+            *ctx.input = "y".to_string();  // prefill; edit to n to cancel
+            *ctx.cursor_pos = ctx.input.len();
+            clear_slash_input(ctx);
+            *ctx.slash_selected = 0;
+            SlashDispatch::Handled
+        }
         "run-mode" => {
             let parts: Vec<&str> = prompt
                 .trim_start_matches('/')
@@ -197,7 +209,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             if parts.len() > 1 {
                 // direct set via arg, e.g. /run-mode research
                 let arg = parts[1].to_lowercase();
-                let normalized = if ["talk", "think", "research", "work", "dream"]
+                let normalized = if ["talk", "think", "research", "work", "dream", "plan"]
                     .contains(&arg.as_str())
                 {
                     arg
@@ -221,7 +233,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                 *ctx.selected_agent_mode_idx = 0;
                 if let Ok(ag) = ctx.agent.try_lock() {
                     let current = ag.current_agent_mode();
-                    if let Some(idx) = ["talk", "think", "research", "work", "dream"]
+                    if let Some(idx) = ["talk", "think", "research", "work", "dream", "plan"]
                         .iter()
                         .position(|&m| m == current)
                     {
@@ -337,7 +349,7 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "run-mode",
-            desc: "Set run mode (talk, think, research, work, dream)",
+            desc: "Set run mode (talk, think, research, work, dream, plan)",
         },
         SlashCommand {
             name: "settings",
@@ -380,7 +392,7 @@ Available commands:
 /reset         Reset conversation memory (session goals stay)
 /status        Show endpoint, model, workspace
 /approval-mode Change execution approval mode (Babysitter / Spring Break / Vegas / Thunderdome)
-/run-mode      Set run mode (talk, think, research, work, dream)
+/run-mode      Set run mode (talk, think, research, work, dream, plan)
 /settings      Manage inference endpoints (add/switch/edit/delete)
 /search        Search conversation or trace (or Ctrl-F)
 /quit or /exit Quit the TUI
@@ -496,6 +508,7 @@ mod tests {
         let mut right_scroll = 0;
         let mut left_follow_output = true;
         let mut right_follow_output = true;
+        let mut pending_plan_confirmation = false;
 
         let mut ctx = SlashContext {
             left_committed: &mut left,
@@ -524,6 +537,7 @@ mod tests {
             config: &config,
             keystore: &ks,
             agent: &agent,
+            pending_plan_confirmation: &mut pending_plan_confirmation,
         };
         let result = dispatch_slash_command("/status", &mut ctx);
         assert!(matches!(result, SlashDispatch::Handled));
