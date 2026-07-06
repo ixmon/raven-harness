@@ -108,6 +108,7 @@ impl DesktopState {
         !self.is_animating() && (self.active == ActiveDesktop::Picker || self.active == ActiveDesktop::Workspace)
     }
 
+    #[allow(dead_code)]
     pub fn showing_overview(&self) -> bool {
         self.active == ActiveDesktop::Overview && !self.is_animating()
     }
@@ -155,6 +156,7 @@ impl DesktopState {
         self.active = ActiveDesktop::WikiViewer;
     }
 
+    #[allow(dead_code)]
     pub fn exit_wiki_viewer_to_picker(&mut self) {
         self.slide = None;
         self.active = ActiveDesktop::Picker;

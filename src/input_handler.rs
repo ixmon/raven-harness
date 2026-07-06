@@ -12,31 +12,19 @@ use std::sync::Mutex;
 use crate::desktop::ActiveDesktop;
 use crate::input_dispatch::apply_settings_actions;
 use crate::keystore::Keystore;
-use crate::tui_render::Pane as RenderPane;
 use raven_tui::agent::Agent;
 use raven_tui::config::Config;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
-/// Returns true if the prompt looks like a request to enter plan mode.
-/// Extracted for testability.
-pub(crate) fn is_plan_trigger_phrase(prompt: &str) -> bool {
-    let lower = prompt.to_lowercase();
-    let trigger_phrases = [
-        "come up with a plan", "let's plan", "make a plan", "first plan",
-        "what's the plan", "plan the", "create a plan", "develop a plan",
-        "plan out", "plan for this"
-    ];
-    trigger_phrases.iter().any(|p| lower.contains(p)) ||
-        (lower.contains("plan") && (lower.contains("task") || lower.contains("work") || lower.contains("refactor") || lower.contains("change") || lower.contains("implement")))
-}
-
-/// Returns true for phrases that should confirm "proceed" while in plan mode.
-pub(crate) fn is_proceed_confirmation(prompt: &str) -> bool {
-    let lower = prompt.to_lowercase();
-    lower.contains("proceed") || lower.contains("go ahead") || lower.contains("let's go") || lower == "yes" || lower.contains("start executing") || lower.contains("let's do it") || lower.contains("do it") || lower.contains("go for it") || lower.contains("confirmed")
-}
+use crate::plan_flow::{
+    dispatch_plan_slash, format_plan_execution_user_prompt,
+    plan_loop_active, route_plan_entry_intent, spawn_plan_answer_submit,
+    reconcile_plan_execution, spawn_proceed_feedback_work, submit_plan_loop_input,
+    sync_plan_from_agent, sync_plan_to_agent,
+    PlanInputRouting, PlanLoopUserOutcome,
+};
 
 /// Handle a key event and update the app state accordingly.
 #[allow(clippy::too_many_arguments)]
@@ -240,6 +228,75 @@ async fn handle_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
     }
 }
 
+/// Dispatch a slash command from the input buffer (shared by idle and in-flight paths).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_slash_input(
+    app: &mut App,
+    config: &Config,
+    keystore: &Keystore,
+    agent: &Arc<TokioMutex<Agent>>,
+    prompt: &str,
+    stop: &Arc<AtomicBool>,
+    update_tx: &mpsc::Sender<crate::event_loop::UiUpdate>,
+    approval_req_tx: mpsc::Sender<(String, oneshot::Sender<bool>)>,
+    queued_interject: &Arc<Mutex<Option<String>>>,
+    instant_interject: &Arc<Mutex<Option<String>>>,
+    spawn_agent_on_prompt: bool,
+) -> crate::input_dispatch::SlashDispatch {
+    use crate::tui_render::Pane as RenderPane;
+
+    let focused = match app.focused_pane {
+        crate::app_state::Pane::Left => RenderPane::Left,
+        crate::app_state::Pane::Right => RenderPane::Right,
+        crate::app_state::Pane::Input => RenderPane::Right,
+    };
+    let mut ctx = crate::input_dispatch::SlashContext {
+        left_committed: &mut app.left_committed,
+        trace_lines: &mut app.trace_lines,
+        current_response: &app.current_response,
+        current_thinking: &app.current_thinking,
+        input: &mut app.input,
+        cursor_pos: &mut app.cursor_pos,
+        slash_commands: &app.slash_commands,
+        slash_selected: &mut app.slash_selected,
+        mode_menu_active: &mut app.mode_menu_active,
+        selected_mode_idx: &mut app.selected_mode_idx,
+        agent_mode_menu_active: &mut app.agent_mode_menu_active,
+        selected_agent_mode_idx: &mut app.selected_agent_mode_idx,
+        settings: &mut app.settings,
+        search: &mut app.search,
+        focused_pane: focused,
+        left_scroll: &mut app.left_scroll,
+        right_scroll: &mut app.right_scroll,
+        left_follow_output: &mut app.left_follow_output,
+        right_follow_output: &mut app.right_follow_output,
+        last_left_line_count: app.last_left_line_count,
+        last_right_line_count: app.last_right_line_count,
+        last_left_area_h: app.last_left_area.height,
+        last_right_area_h: app.last_right_area.height,
+        config,
+        keystore,
+        agent,
+    };
+
+    let result = crate::input_dispatch::dispatch_slash_command(prompt, &mut ctx);
+    if spawn_agent_on_prompt {
+        if let crate::input_dispatch::SlashDispatch::AgentPrompt(()) = result {
+            spawn_agent_turn(
+                app,
+                agent,
+                prompt.to_string(),
+                stop,
+                update_tx,
+                &approval_req_tx,
+                queued_interject,
+                instant_interject,
+            );
+        }
+    }
+    result
+}
+
 /// Handle input keys (when not in special modes).
 #[allow(clippy::too_many_arguments)]
 async fn handle_input_key(
@@ -268,8 +325,7 @@ async fn handle_input_key(
     // Session/workspace picker screen navigation (combined tree of workspaces + sessions)
     // For overview + harness (Coding Harness nav), we let input/conv have priority on arrows so status/conv/input work.
     let overview_harness = app.desktop.active == ActiveDesktop::Overview
-        && app.browser_nav_items.get(app.browser_selected_nav)
-            .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+        && app.browser_selected_is_harness();
     if (app.desktop.showing_picker()
         || app.desktop.active == ActiveDesktop::Splash
         || app.desktop.active == ActiveDesktop::Overview)
@@ -386,8 +442,7 @@ async fn handle_input_key(
     // Suppress text input editing on splash/picker/overview screens (input bar is hidden there)
     // except when in adding workspace mode
     let overview_harness = matches!(app.desktop.active, ActiveDesktop::Overview)
-        && app.browser_nav_items.get(app.browser_selected_nav)
-            .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+        && app.browser_selected_is_harness();
     if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview)
         && !overview_harness
         && !app.picker.adding_workspace
@@ -427,6 +482,36 @@ async fn handle_input_key(
         }
         KeyCode::Enter => {
             if app.is_processing {
+                let prompt = app.input.trim().to_string();
+                if !prompt.is_empty()
+                    && crate::input_dispatch::slash_ok_while_processing(&prompt)
+                {
+                    match dispatch_slash_input(
+                        app,
+                        config,
+                        keystore,
+                        agent,
+                        &prompt,
+                        stop,
+                        &update_tx,
+                        approval_req_tx.clone(),
+                        queued_interject,
+                        instant_interject,
+                        false,
+                    )
+                    .await
+                    {
+                        crate::input_dispatch::SlashDispatch::Handled => {
+                            app.needs_redraw = true;
+                            return Ok(true);
+                        }
+                        crate::input_dispatch::SlashDispatch::Quit => {
+                            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return Ok(true);
+                        }
+                        crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {}
+                    }
+                }
                 // Submit queued interject or instant interject
                 if is_ctrl {
                     app.submit_instant_interject(
@@ -460,501 +545,132 @@ async fn handle_input_key(
                 // Submit the input. If it is a slash command, dispatch it (may activate
                 // submenus for /approval-mode or /run-mode, or handle instantly).
                 // Only plain prompts go through to the agent driver.
-                // Plan mode entry confirmation dialog
-                if app.pending_plan_confirmation {
-                    app.pending_plan_confirmation = false;
-                    let submitted = app.input.trim().to_lowercase();
-                    let yes = submitted.starts_with('y');
-                    let original = app.pending_plan_request.take();
-                    app.clear_input();
-                    if yes {
-                        if let Ok(mut ag) = agent.try_lock() {
-                            ag.set_agent_mode("plan");
-                            if let Some(s) = &mut ag.session_mut() {
-                                let _ = s.save_meta();
-                            }
-                        }
-                        app.plan.active = true;
-                        app.focused_pane = crate::app_state::Pane::Input; // leave focus in input for answers
-                        // Write initial plan to wiki (with task-appropriate verification)
-                        if let Ok(mut ag) = agent.try_lock() {
-                            if let Some(s) = ag.session_mut() {
-                                let verif = app.plan.verification_steps.iter()
-                                    .map(|v| format!("- {}", v))
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
-                                // Always initialize a clean, structured template on entering plan mode.
-                                // No need to manually delete wiki/plan.md between plan attempts.
-                                let plan_text = format!(
-                                    "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n**Verification:**\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n## Notes\n\n(Agent will refine this during clarification. Final approved version written on 'proceed'.)\n",
-                                    app.plan.goal, app.plan.success_criteria, verif, app.plan.rollback, app.plan.constraints
-                                );
-                                let _ = s.write_wiki_file("plan.md", &plan_text);
-                                app.left_committed.push("Plan written to session wiki/plan.md (you can edit externally too)".to_string());
-                            }
-                        }
-                        // Populate from the original request if we have it. Always use the triggering request as the Goal.
-                        if let Some(req) = original {
-                            app.plan.goal = req.clone();
-                            // Also update session meta so the goal is persisted and used by agent/judge
-                            if let Ok(mut ag) = agent.try_lock() {
-                                if let Some(s) = &mut ag.session_mut() {
-                                    s.meta.current_goal = req.clone();
-                                    let _ = s.save_meta();
-                                }
-                            }
-                        } else if app.plan.goal.is_empty() {
-                            // fallback only if no specific request captured
-                            app.plan.goal = "Plan for the current task".to_string();
-                        }
-                        if app.plan.success_criteria.is_empty() {
-                            app.plan.success_criteria = "Verification steps pass and the goal is achieved".to_string();
-                        }
-                        if app.plan.verification_steps.is_empty() {
-                            let g = app.plan.goal.to_lowercase();
-                            if g.contains("python") || g.contains(".py") {
-                                app.plan.verification_steps = vec![
-                                    "python3 <your_script>.py [args]".to_string(),
-                                    "check that output matches the expected result".to_string(),
-                                ];
-                            } else if g.contains("c++") || g.contains("cpp") || g.contains("g++") || g.contains("clang") {
-                                app.plan.verification_steps = vec![
-                                    "g++ -std=c++17 -Wall -o program program.cpp".to_string(),
-                                    "clang-tidy program.cpp -- -std=c++17".to_string(),
-                                    "./program".to_string(),
-                                ];
-                            } else if g.contains("c ") || g.contains("gcc") {
-                                app.plan.verification_steps = vec![
-                                    "gcc -Wall -o program program.c".to_string(),
-                                    "./program".to_string(),
-                                ];
-                            } else {
-                                app.plan.verification_steps = vec!["cargo check".to_string(), "cargo clippy -- -D warnings".to_string(), "cargo test".to_string()];
-                            }
-                        }
-
-                        if app.plan.rollback.is_empty() {
-                            app.plan.rollback = "git branch + checkpoints".to_string();
-                        }
-                        // Do NOT populate steps yet -- they appear only after user approves the full plan
-                        app.plan.steps.clear();
-                        app.plan.current_step = 0;
-                        app.left_committed.push("Entered Plan Mode. Run Mode set to 'plan'.".to_string());
-                        // Re-submit the original request now that we are in plan mode so the agent starts clarification
-                        if let Some(req) = app.pending_plan_request.take() {
-                            app.input = req;
-                        } else if !app.plan.goal.is_empty() {
-                            app.input = app.plan.goal.clone();
-                        }
-                        // fall through to normal submit with the (now set) input
-                    } else {
-                        app.left_committed.push("Plan mode entry cancelled.".to_string());
-                        app.needs_redraw = true;
-                        return Ok(true);
-                    }
-                }
-
                 let prompt = app.input.trim().to_string();
                 if prompt.is_empty() {
                     return Ok(true);
                 }
 
-                // Automatic plan mode trigger for natural language planning requests
-                if !app.plan.active && !app.pending_plan_confirmation && app.pending_plan_request.is_none() && is_plan_trigger_phrase(&prompt) {
-                    app.pending_plan_request = Some(prompt.clone());
-                    // Set the goal in the plan state immediately from the user's request
-                    // so the pane reflects the actual ask (e.g. birthday cake script) instead of boilerplate.
-                    app.plan.goal = prompt.clone();
-                    // Start fresh for this request
-                    app.plan.success_criteria.clear();
-                    app.plan.verification_steps.clear();
-                    app.plan.rollback.clear();
-                    app.plan.constraints.clear();
-                    app.plan.steps.clear();
-                    app.plan.current_step = 0;
-                    // Also seed the session meta goal so it isn't blank
-                    if let Ok(mut ag) = agent.try_lock() {
-                        if let Some(s) = &mut ag.session_mut() {
-                            s.meta.current_goal = prompt.clone();
-                            // Initialize a clean plan template immediately on detecting plan intent.
-                            // This way wiki/plan.md starts fresh for this run instead of carrying
-                            // over stale content from a previous plan in the same session.
-                            let _ = s.write_wiki_file(
-                                "plan.md",
-                                &format!("# Plan\n\n**Goal:** {}\n\n*Template will be expanded on confirmation.*", prompt)
-                            );
-                            let _ = s.save_meta();
-                        }
-                    }
-                    app.left_committed.push("Do you want to enter plan mode? (y/n)".to_string());
-                    app.pending_plan_confirmation = true;
-                    app.input = "y".to_string();  // prefill yes; change to n and enter to cancel
-                    app.cursor_pos = app.input.len();
+                let backend = {
+                    let ag = agent.lock().await;
+                    ag.llm_backend()
+                };
+                let flags = &config.flags;
+                let workspace = config.workspace.display().to_string();
+
+                if prompt.starts_with("/plan") {
+                    app.clear_input();
                     app.needs_redraw = true;
+                    let _ = dispatch_plan_slash(&prompt, app, agent);
                     return Ok(true);
                 }
 
-                // In plan mode, detect "proceed" to switch to work mode and show steps
-                {
-                    let current_mode = if let Ok(ag) = agent.try_lock() { ag.current_agent_mode() } else { String::new() };
-                    if current_mode == "plan" && is_proceed_confirmation(&prompt) {
-                        if let Ok(mut ag) = agent.try_lock() {
-                            ag.set_agent_mode("work");
-                            if let Some(s) = &mut ag.session_mut() {
-                                let _ = s.save_meta();
-                            }
-                        }
-                        app.plan.active = true;
-                        if app.plan.steps.is_empty() {
-                                let g = app.plan.goal.to_lowercase();
-                                // Derive task-appropriate verification (prefer any already set)
-                                let mut verif = app.plan.verification_steps.clone();
-                                if verif.is_empty() {
-                                    if g.contains("python") || g.contains(".py") {
-                                        verif = vec!["python3 birthday_cake.py".to_string(), "output contains recognizable ASCII cake".to_string()];
-                                    } else if g.contains("c++") || g.contains("cpp") || g.contains("g++") || g.contains("clang") {
-                                        verif = vec![
-                                            "g++ -std=c++17 -Wall -o program program.cpp".to_string(),
-                                            "clang-tidy program.cpp -- -std=c++17".to_string(),
-                                            "./program".to_string(),
-                                        ];
-                                    } else {
-                                        verif = vec!["cargo check".to_string(), "cargo clippy -- -D warnings".to_string(), "cargo test".to_string()];
-                                    }
-                                }
-                                app.plan.verification_steps = verif.clone();
-
-                                // Try to extract real steps and (especially) verification from the plan.md the agent wrote during clarification.
-                                // This is how language-specific checks (C++ lint etc) end up in the plan instead of stale cargo defaults.
-                                let mut extracted_steps: Vec<String> = vec![];
-                                let mut extracted_verif: Vec<String> = vec![];
-                                if let Ok(ag) = agent.try_lock() {
-                                    if let Some(s) = ag.session() {
-                                        let plan_content = s.read_wiki_file("plan.md", None, false, 100);
-                                        let mut in_verif = false;
-                                        for line in plan_content.lines() {
-                                            let t = line.trim();
-                                            if t.eq_ignore_ascii_case("**verification:**") || t.eq_ignore_ascii_case("verification:") || t.to_lowercase().starts_with("**verification") {
-                                                in_verif = true;
-                                                continue;
-                                            }
-                                            if in_verif {
-                                                if t.starts_with('#') || t.starts_with("**") && t.contains("step") || t.to_lowercase().starts_with("rollback") {
-                                                    in_verif = false;
-                                                } else if t.starts_with("- ") || t.starts_with("* ") || t.starts_with("1. ") {
-                                                    let v = t.trim_start_matches(|c: char| c == '-' || c == '*' || c == ' ' || c.is_ascii_digit() || c == '.').trim();
-                                                    if !v.is_empty() {
-                                                        extracted_verif.push(v.to_string());
-                                                    }
-                                                }
-                                            }
-
-                                            if let Some(rest) = t.strip_prefix(|c: char| c.is_ascii_digit()).and_then(|r| r.strip_prefix('.').or_else(|| r.strip_prefix(")"))) {
-                                                let desc = rest.trim_start_matches([' ', '-', '*']).trim();
-                                                if !desc.is_empty() && desc.len() > 3 && !desc.to_lowercase().starts_with("verify") {
-                                                    extracted_steps.push(desc.to_string());
-                                                }
-                                            } else if t.starts_with("- ") || t.starts_with("* ") {
-                                                let desc = t[2..].trim();
-                                                if !desc.is_empty() && desc.len() > 5 && !desc.to_lowercase().contains("rollback") && !desc.to_lowercase().contains("constraint") && !desc.to_lowercase().contains("verify") {
-                                                    extracted_steps.push(desc.to_string());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Prefer verification the agent wrote in its plan.md (this is how C++/other language checks get in)
-                                if !extracted_verif.is_empty() {
-                                    verif = extracted_verif;
-                                }
-                                app.plan.verification_steps = verif.clone();
-
-                                let mut plan_steps = if !extracted_steps.is_empty() {
-                                    extracted_steps.into_iter().take(5).map(|d| crate::app_state::PlanStep {
-                                        description: d,
-                                        verification: None,
-                                        status: crate::app_state::PlanStepStatus::Pending,
-                                    }).collect::<Vec<_>>()
-                                } else {
-                                    // Fallback to meaningful task-aware steps
-                                    let step1 = if g.contains("python") || g.contains(".py") || g.contains("script") {
-                                        "Write the script / implementation".to_string()
-                                    } else if g.contains("test") || g.contains("fix") {
-                                        "Implement the fix / changes".to_string()
-                                    } else {
-                                        "Implement the solution".to_string()
-                                    };
-                                    let step2 = if g.contains("python") || g.contains("script") {
-                                        "Run / execute the script".to_string()
-                                    } else {
-                                        "Build and test changes".to_string()
-                                    };
-                                    let step3 = "Verify against success criteria".to_string();
-                                    vec![
-                                        crate::app_state::PlanStep { description: step1, verification: verif.first().cloned(), status: crate::app_state::PlanStepStatus::Pending },
-                                        crate::app_state::PlanStep { description: step2, verification: verif.get(1).cloned(), status: crate::app_state::PlanStepStatus::Pending },
-                                        crate::app_state::PlanStep { description: step3, verification: verif.get(verif.len().saturating_sub(1)).cloned(), status: crate::app_state::PlanStepStatus::Pending },
-                                    ]
-                                };
-
-                                if !plan_steps.is_empty() {
-                                    plan_steps[0].status = crate::app_state::PlanStepStatus::InProgress;
-                                    if let Some(v0) = verif.first() {
-                                        if plan_steps[0].verification.is_none() {
-                                            plan_steps[0].verification = Some(v0.clone());
-                                        }
-                                    }
-                                }
-
-                                app.plan.steps = plan_steps;
-                                app.plan.current_step = 0;
-                            }
-                            // Update wiki with approved plan + steps
-                            if let Ok(mut ag) = agent.try_lock() {
-                                if let Some(s) = ag.session_mut() {
-                                let verif = app.plan.verification_steps.iter().map(|v| format!("- {}", v)).collect::<Vec<_>>().join("\n");
-                                let steps_str = app.plan.steps.iter().enumerate().map(|(i, st)| {
-                                    let v = st.verification.as_deref().unwrap_or("");
-                                    format!("{}. {} [verify: {}]", i+1, st.description, v)
-                                }).collect::<Vec<_>>().join("\n");
-                                let plan_text = format!(
-                                    "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n**Verification:**\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n**Steps:**\n{}\n\n## Execution Log\n\n(Added as work proceeds after 'proceed'.)\n",
-                                    app.plan.goal, app.plan.success_criteria, verif, app.plan.rollback, app.plan.constraints, steps_str
-                                );
-                                let _ = s.write_wiki_file("plan.md", &plan_text);
-                            }
-                        }
-                        app.left_committed.push("Plan confirmed by user. Switching to work mode. Executing...".to_string());
-
-                        // Also push the final verification into session meta via update_goal so the judge has good criteria
-                        if let Ok(mut ag) = agent.try_lock() {
-                            if let Some(s) = &mut ag.session_mut() {
-                                let _ = s.update_goal(
-                                    &app.plan.goal,
-                                    Some(app.plan.verification_steps.clone()),
-                                    None,
-                                );
-                            }
+                if app.plan.pending_observe_prompt.is_some() {
+                    if let Ok(mut ag) = agent.try_lock() {
+                        if let Some(msg) = ag.apply_user_observation(&prompt) {
+                            sync_plan_from_agent(&mut app.plan, &ag);
+                            app.left_committed.push(format!("> {}", prompt));
+                            app.left_committed.push(msg.clone());
+                            ag.push_message(
+                                "user",
+                                &format!(
+                                    "[User observation recorded] {}\n\nContinue with the plan from the next step.",
+                                    prompt
+                                ),
+                            );
+                            app.clear_input();
+                            app.needs_redraw = true;
+                            // Fall through to dispatch as agent prompt to resume work.
                         }
                     }
                 }
 
-                app.left_committed.push(format!("> {}", prompt));
+                let mut agent_prompt = prompt.clone();
+                if plan_loop_active(&app.plan) {
+                    app.clear_input();
+                    match submit_plan_loop_input(app, agent, &prompt) {
+                        PlanLoopUserOutcome::SpawnAnswer {
+                            user_input,
+                            question,
+                        } => {
+                            app.is_processing = true;
+                            app.needs_redraw = true;
+                            spawn_plan_answer_submit(
+                                app,
+                                backend.clone(),
+                                flags.clone(),
+                                workspace.clone(),
+                                update_tx.clone(),
+                                user_input,
+                                question,
+                            );
+                            return Ok(true);
+                        }
+                        PlanLoopUserOutcome::SpawnProceedFeedback { user_input } => {
+                            app.is_processing = true;
+                            app.needs_redraw = true;
+                            spawn_proceed_feedback_work(
+                                app,
+                                backend.clone(),
+                                flags.clone(),
+                                workspace.clone(),
+                                update_tx.clone(),
+                                user_input,
+                            );
+                            return Ok(true);
+                        }
+                        PlanLoopUserOutcome::StartExecution => {
+                            app.left_committed
+                                .push("▶ Plan approved — starting execution.".to_string());
+                            agent_prompt = format_plan_execution_user_prompt(
+                                &app.plan,
+                                &config.workspace,
+                            );
+                        }
+                        PlanLoopUserOutcome::Consumed => {
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                match route_plan_entry_intent(app, agent, &backend, flags, &prompt).await {
+                    PlanInputRouting::Stop => {
+                        app.needs_redraw = true;
+                        return Ok(true);
+                    }
+                    PlanInputRouting::Continue | PlanInputRouting::Pass => {}
+                }
+
+                if agent_prompt.starts_with("Execute the approved plan.") {
+                    app.left_committed
+                        .push("▶ Plan approved — starting execution.".to_string());
+                } else {
+                    app.left_committed.push(format!("> {}", agent_prompt));
+                }
                 app.clear_input();
                 app.needs_redraw = true;
 
-                // Prepare slash context (dispatch uses the prompt string; many /cmds mutate via ctx)
-                let focused = match app.focused_pane {
-                    crate::app_state::Pane::Left => RenderPane::Left,
-                    crate::app_state::Pane::Right => RenderPane::Right,
-                    crate::app_state::Pane::Input => RenderPane::Right,
-                };
-                let mut ctx = crate::input_dispatch::SlashContext {
-                    left_committed: &mut app.left_committed,
-                    trace_lines: &mut app.trace_lines,
-                    current_response: &app.current_response,
-                    current_thinking: &app.current_thinking,
-                    input: &mut app.input,
-                    cursor_pos: &mut app.cursor_pos,
-                    slash_commands: &app.slash_commands,
-                    slash_selected: &mut app.slash_selected,
-                    mode_menu_active: &mut app.mode_menu_active,
-                    selected_mode_idx: &mut app.selected_mode_idx,
-                    agent_mode_menu_active: &mut app.agent_mode_menu_active,
-                    selected_agent_mode_idx: &mut app.selected_agent_mode_idx,
-                    settings: &mut app.settings,
-                    search: &mut app.search,
-                    focused_pane: focused,
-                    left_scroll: &mut app.left_scroll,
-                    right_scroll: &mut app.right_scroll,
-                    left_follow_output: &mut app.left_follow_output,
-                    right_follow_output: &mut app.right_follow_output,
-                    last_left_line_count: app.last_left_line_count,
-                    last_right_line_count: app.last_right_line_count,
-                    last_left_area_h: app.last_left_area.height,
-                    last_right_area_h: app.last_right_area.height,
+                match dispatch_slash_input(
+                    app,
                     config,
                     keystore,
                     agent,
-                    pending_plan_confirmation: &mut app.pending_plan_confirmation,
-                };
-
-                match crate::input_dispatch::dispatch_slash_command(&prompt, &mut ctx) {
-                    crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {
-                        // Starting a fresh turn: ensure any prior stop (from Esc abort) is cleared
-                        // so the new drive_turn isn't immediately aborted by a stale flag.
-                        stop.store(false, std::sync::atomic::Ordering::SeqCst);
-                        app.is_processing = true;
-                        app.needs_redraw = true;
-
-                        let agent_c = agent.clone();
-                        let tx_c = update_tx.clone();
-                        let appr_c = approval_req_tx.clone();
-                        let stop_c = stop.clone();
-                        let q_c = queued_interject.clone();
-                        let i_c = instant_interject.clone();
-                        let prompt_c = prompt;
-
-                        tokio::spawn(async move {
-                            let mut ag = agent_c.lock().await;
-                            let mode = ag.current_exec_mode();
-                            let agent_mode = ag.current_agent_mode();
-                            let mut obs = crate::event_loop::TuiObserver {
-                                tx: tx_c.clone(),
-                                approval_req_tx: appr_c,
-                                stop: stop_c.clone(),
-                                queued: q_c,
-                                instant: i_c,
-                                denials_this_turn: 0,
-                                halt_tools: false,
-                                exec_mode: mode,
-                            };
-                            let res = raven_tui::agent_driver::drive_turn(&mut ag, &prompt_c, &mut obs).await;
-                            match res {
-                                Ok(r) => {
-                                    // In "work" mode, run the Super Judge before declaring Done
-                                    if agent_mode == "work" {
-                                        const MAX_SUPER_JUDGE_CYCLES: u32 = 3;
-                                        let mut last_text = r.final_text.clone();
-                                        let mut all_actions = r.actions.clone();
-                                        let mut cycle = 0u32;
-
-                                        loop {
-                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "⏹ Stopped (Esc)".into(),
-                                                }).await;
-                                                break;
-                                            }
-                                            if cycle >= MAX_SUPER_JUDGE_CYCLES {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "🔍 Super Judge: max review cycles reached, accepting".into(),
-                                                }).await;
-                                                break;
-                                            }
-                                            cycle += 1;
-
-                                            // Brief pause for UX (shows Processing off briefly)
-                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "⏹ Stopped (Esc)".into(),
-                                                }).await;
-                                                break;
-                                            }
-                                            let _ = tx_c.send(crate::event_loop::UiUpdate::SuperJudgeBegin).await;
-                                            let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                name: "system".into(),
-                                                summary: format!("🔍 Super Judge reviewing work (cycle {}/{})", cycle, MAX_SUPER_JUDGE_CYCLES),
-                                            }).await;
-
-                                            // Use the headless Super Judge observer (its review may run to completion;
-                                            // subsequent nudges and loops will abort on stop).
-                                            let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
-                                            let verdict = raven_tui::super_judge::run_super_judge_with_observer(
-                                                &mut ag, &last_text, &all_actions, &mut sj_obs,
-                                            ).await;
-
-                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "⏹ Stopped (Esc)".into(),
-                                                }).await;
-                                                break;
-                                            }
-
-                                            match verdict {
-                                                raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: WORK_COMPLETE — {}", note),
-                                                    }).await;
-                                                    // Advance plan if active
-                                                    break;
-                                                }
-                                                raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: "🔍 Super Judge: NEEDS_WORK — nudging agent".to_string(),
-                                                    }).await;
-                                                    if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                        let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                            name: "system".into(),
-                                                            summary: "⏹ Stopped (Esc)".into(),
-                                                        }).await;
-                                                        break;
-                                                    }
-                                                    // Inject feedback and re-run
-                                                    let nudge = format!(
-                                                        "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
-                                                        feedback
-                                                    );
-                                                    match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs).await {
-                                                        Ok(r2) => {
-                                                            last_text = r2.final_text.clone();
-                                                            all_actions.extend(r2.actions);
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_c.send(crate::event_loop::UiUpdate::Error(
-                                                                format!("Super Judge re-run error: {}", e)
-                                                            )).await;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: DEATH_SPIRAL detected — {}", feedback),
-                                                    }).await;
-                                                    // Inject anti-spiral guidance as final message
-                                                    ag.push_message("user", &format!(
-                                                        "[🔍 SUPER JUDGE — DEATH SPIRAL DETECTED]: {}\n\n\
-                                                         Stop repeating the same approach. Try something completely different.",
-                                                        feedback
-                                                    ));
-                                                    break;
-                                                }
-                                                raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
-                                                    }).await;
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
-                                            final_text: last_text,
-                                        }).await;
-                                    } else {
-                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
-                                            final_text: r.final_text,
-                                        }).await;
-                                    }
-                                    let _ = tx_c.send(crate::event_loop::UiUpdate::Usage {
-                                        prompt_tokens: Some(r.metrics.prompt_tokens as u32),
-                                        completion_tokens: Some(r.metrics.completion_tokens as u32),
-                                        total_tokens: Some(r.metrics.total_tokens as u32),
-                                    }).await;
-                                }
-                                Err(e) => {
-                                    let _ = tx_c.send(crate::event_loop::UiUpdate::Error(e.to_string())).await;
-                                }
-                            }
-                        });
-                    }
+                    &agent_prompt,
+                    stop,
+                    &update_tx,
+                    approval_req_tx.clone(),
+                    queued_interject,
+                    instant_interject,
+                    true,
+                )
+                .await
+                {
                     crate::input_dispatch::SlashDispatch::Handled => {
                         app.needs_redraw = true;
                     }
                     crate::input_dispatch::SlashDispatch::Quit => {
                         stop.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
+                    crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {}
                 }
             }
             Ok(true)
@@ -1073,42 +789,266 @@ pub fn get_filtered_commands<'a>(
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Run an agent turn in the background so the TUI event loop can keep animating.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_agent_turn(
+    app: &mut App,
+    agent: &Arc<TokioMutex<Agent>>,
+    prompt: String,
+    stop: &Arc<AtomicBool>,
+    update_tx: &mpsc::Sender<crate::event_loop::UiUpdate>,
+    approval_req_tx: &mpsc::Sender<(String, oneshot::Sender<bool>)>,
+    queued_interject: &Arc<Mutex<Option<String>>>,
+    instant_interject: &Arc<Mutex<Option<String>>>,
+) {
+    stop.store(false, std::sync::atomic::Ordering::SeqCst);
+    app.is_processing = true;
+    app.needs_redraw = true;
 
-    #[test]
-    fn detects_various_plan_triggers() {
-        assert!(is_plan_trigger_phrase("come up with a plan to write a script"));
-        assert!(is_plan_trigger_phrase("let's plan this out"));
-        assert!(is_plan_trigger_phrase("make a plan for the refactor"));
-        assert!(is_plan_trigger_phrase("plan the implementation"));
-        assert!(is_plan_trigger_phrase("create a plan for this task"));
-        assert!(is_plan_trigger_phrase("what's the plan for the work"));
-        assert!(is_plan_trigger_phrase("plan for this change"));
-        // The broad "plan" + context
-        assert!(is_plan_trigger_phrase("I want to plan the task"));
-        assert!(is_plan_trigger_phrase("plan out the new feature"));
-        // Negative
-        assert!(!is_plan_trigger_phrase("what is your plan for dinner"));
-        assert!(!is_plan_trigger_phrase("just talk about the plan"));
+    let agent_c = agent.clone();
+    let tx_c = update_tx.clone();
+    let appr_c = approval_req_tx.clone();
+    let stop_c = stop.clone();
+    let q_c = queued_interject.clone();
+    let i_c = instant_interject.clone();
+    let prompt_c = prompt;
+    let exec_mode_c = app.live_exec_mode.clone();
+
+    if let Ok(mut ag) = agent.try_lock() {
+        if let Ok(mut slot) = app.live_exec_mode.lock() {
+            *slot = ag.current_exec_mode();
+        }
+        let workspace = ag.workspace().to_path_buf();
+        let wiki = ag
+            .session()
+            .as_ref()
+            .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
+        reconcile_plan_execution(&mut app.plan, &ag, wiki.as_deref());
+        sync_plan_to_agent(&mut ag, &app.plan, &workspace);
     }
 
-    #[test]
-    fn detects_proceed_variants() {
-        assert!(is_proceed_confirmation("proceed"));
-        assert!(is_proceed_confirmation("let's proceed with the plan"));
-        assert!(is_proceed_confirmation("go ahead"));
-        assert!(is_proceed_confirmation("yes"));
-        assert!(is_proceed_confirmation("let's do it"));
-        assert!(is_proceed_confirmation("do it"));
-        assert!(is_proceed_confirmation("go for it"));
-        assert!(is_proceed_confirmation("confirmed"));
-        assert!(is_proceed_confirmation("start executing"));
-        // Ambiguous should not be over-eager in this fn (the agent may still ask for clarity)
-        assert!(!is_proceed_confirmation("maybe"));
-        assert!(!is_proceed_confirmation("sounds good"));
-    }
+    tokio::spawn(async move {
+        let mut ag = agent_c.lock().await;
+        let agent_mode = ag.current_agent_mode();
+        let mut obs = crate::event_loop::TuiObserver {
+            tx: tx_c.clone(),
+            approval_req_tx: appr_c,
+            stop: stop_c.clone(),
+            queued: q_c,
+            instant: i_c,
+            denials_this_turn: 0,
+            halt_tools: false,
+            exec_mode: exec_mode_c,
+        };
+        let res = raven_tui::agent_driver::drive_turn(&mut ag, &prompt_c, &mut obs).await;
+        match res {
+            Ok(r) => {
+                // Plan execution has per-step verification; Super Judge mid-plan derails
+                // the agent (denies patches during review, false DEATH_SPIRAL on normal edits).
+                let plan_executing = ag.plan_tool_context().plan_executing;
+                if agent_mode == "work" && !plan_executing {
+                    const MAX_SUPER_JUDGE_CYCLES: u32 = 3;
+                    let mut last_text = r.final_text.clone();
+                    let mut all_actions = r.actions.clone();
+                    let mut cycle = 0u32;
+
+                    loop {
+                        if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary: "⏹ Stopped (Esc)".into(),
+                                })
+                                .await;
+                            break;
+                        }
+                        if cycle >= MAX_SUPER_JUDGE_CYCLES {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary:
+                                        "🔍 Super Judge: max review cycles reached, accepting"
+                                            .into(),
+                                })
+                                .await;
+                            break;
+                        }
+                        cycle += 1;
+
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary: "⏹ Stopped (Esc)".into(),
+                                })
+                                .await;
+                            break;
+                        }
+                        let _ = tx_c
+                            .send(crate::event_loop::UiUpdate::SuperJudgeBegin)
+                            .await;
+                        let _ = tx_c
+                            .send(crate::event_loop::UiUpdate::ToolResult {
+                                name: "system".into(),
+                                summary: format!(
+                                    "🔍 Super Judge reviewing work (cycle {}/{})",
+                                    cycle, MAX_SUPER_JUDGE_CYCLES
+                                ),
+                            })
+                            .await;
+
+                        let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
+                        let verdict = raven_tui::super_judge::run_super_judge_with_observer(
+                            &mut ag, &last_text, &all_actions, &mut sj_obs,
+                        )
+                        .await;
+
+                        if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary: "⏹ Stopped (Esc)".into(),
+                                })
+                                .await;
+                            break;
+                        }
+
+                        match verdict {
+                            raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: format!(
+                                            "🔍 Super Judge: WORK_COMPLETE — {}",
+                                            note
+                                        ),
+                                    })
+                                    .await;
+                                break;
+                            }
+                            raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: "🔍 Super Judge: NEEDS_WORK — nudging agent"
+                                            .to_string(),
+                                    })
+                                    .await;
+                                if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let _ = tx_c
+                                        .send(crate::event_loop::UiUpdate::ToolResult {
+                                            name: "system".into(),
+                                            summary: "⏹ Stopped (Esc)".into(),
+                                        })
+                                        .await;
+                                    break;
+                                }
+                                let nudge = format!(
+                                    "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
+                                    feedback
+                                );
+                                match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs)
+                                    .await
+                                {
+                                    Ok(r2) => {
+                                        last_text = r2.final_text.clone();
+                                        all_actions.extend(r2.actions);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_c
+                                            .send(crate::event_loop::UiUpdate::Error(format!(
+                                                "Super Judge re-run error: {}",
+                                                e
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                }
+                            }
+                            raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: format!(
+                                            "🔍 Super Judge: DEATH_SPIRAL detected — {}",
+                                            feedback
+                                        ),
+                                    })
+                                    .await;
+                                if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let _ = tx_c
+                                        .send(crate::event_loop::UiUpdate::ToolResult {
+                                            name: "system".into(),
+                                            summary: "⏹ Stopped (Esc)".into(),
+                                        })
+                                        .await;
+                                    break;
+                                }
+                                let nudge = format!(
+                                    "[🔍 SUPER JUDGE — DEATH SPIRAL DETECTED]: {}\n\n\
+                                     Stop repeating the same approach. Try something completely different.",
+                                    feedback
+                                );
+                                match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs)
+                                    .await
+                                {
+                                    Ok(r2) => {
+                                        last_text = r2.final_text.clone();
+                                        all_actions.extend(r2.actions);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_c
+                                            .send(crate::event_loop::UiUpdate::Error(format!(
+                                                "Super Judge re-run error: {}",
+                                                e
+                                            )))
+                                            .await;
+                                    }
+                                }
+                                break;
+                            }
+                            raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
+                                    })
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+
+                    let _ = tx_c
+                        .send(crate::event_loop::UiUpdate::Done {
+                            final_text: last_text,
+                        })
+                        .await;
+                } else {
+                    let _ = tx_c
+                        .send(crate::event_loop::UiUpdate::Done {
+                            final_text: r.final_text,
+                        })
+                        .await;
+                }
+                let _ = tx_c
+                    .send(crate::event_loop::UiUpdate::Usage {
+                        prompt_tokens: Some(r.metrics.prompt_tokens as u32),
+                        completion_tokens: Some(r.metrics.completion_tokens as u32),
+                        total_tokens: Some(r.metrics.total_tokens as u32),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx_c
+                    .send(crate::event_loop::UiUpdate::Error(e.to_string()))
+                    .await;
+            }
+        }
+    });
 }
+
+
 
 

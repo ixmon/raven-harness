@@ -18,6 +18,34 @@ use ratatui::{
 const PLAN_ORANGE: Color = Color::Rgb(0xff, 0xc0, 0x40);
 const PLAN_GREEN: Color = Color::Rgb(0x60, 0xc0, 0x60);
 
+fn is_plan_entry_confirm(entry: &str) -> bool {
+    let t = entry.trim();
+    t.starts_with("Enter plan mode?")
+}
+
+fn push_attention_entry(
+    left_text: &mut Text<'static>,
+    entry: &str,
+    highlight_line: Option<usize>,
+    line_idx: &mut usize,
+    fg: Color,
+) {
+    let style = if Some(*line_idx) == highlight_line {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    };
+    for line in entry.lines() {
+        left_text
+            .lines
+            .push(Line::from(Span::styled(line.to_string(), style)));
+        *line_idx += 1;
+    }
+}
+
 // ── Raven markdown renderer ──────────────────────────────────────────────────
 // Replaces tui_markdown with a purpose-built renderer that directly produces
 // ratatui types. Handles: headings, bold/italic/code, links, lists, code
@@ -778,15 +806,18 @@ pub fn draw_mode_menu(
     f.render_widget(menu_block, menu_area);
 }
 
-pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: Rect) {
+pub fn draw_confirmation_modal(
+    f: &mut Frame,
+    dialog: &crate::confirmation_dialog::ConfirmationDialog,
+    screen: Rect,
+    input_area: Rect,
+) {
+    let view = dialog.view();
     let modal_w = screen.width.saturating_sub(4).clamp(44, 64);
-    // Inner text width: borders (2) + default paragraph padding (2).
     let inner_w = modal_w.saturating_sub(4) as usize;
     let available_h = input_area.y.saturating_sub(screen.y + 1).max(7);
-    // Header + detail + spacer + Y/N + top/bottom borders.
     let max_desc_lines = ((available_h as usize).saturating_sub(5)).clamp(1, 4);
-    let (kind, detail) = desc.split_once(": ").unwrap_or(("action", desc));
-    let detail_lines = wrap_approval_lines(detail, inner_w, max_desc_lines);
+    let detail_lines = wrap_approval_lines(&view.detail, inner_w, max_desc_lines);
 
     let body_lines = 1 + detail_lines.len() + 1 + 1;
     let modal_h = (body_lines as u16 + 2).clamp(7, available_h);
@@ -796,18 +827,19 @@ pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: 
     let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
 
     let detail_style = Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa));
-    let mut popup_lines = vec![Line::from(vec![
-        Span::styled(
-            kind,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " — sandbox approval needed",
+    let mut headline_spans = vec![Span::styled(
+        view.headline.as_str(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !view.headline_suffix.is_empty() {
+        headline_spans.push(Span::styled(
+            view.headline_suffix,
             Style::default().fg(Color::DarkGray),
-        ),
-    ])];
+        ));
+    }
+    let mut popup_lines = vec![Line::from(headline_spans)];
     for line in detail_lines {
         popup_lines.push(Line::from(Span::styled(line, detail_style)));
     }
@@ -830,14 +862,14 @@ pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: 
     let popup = Paragraph::new(Text::from(popup_lines)).block(
         Block::default()
             .title(Span::styled(
-                " Action Approval ",
+                view.title,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(view.border_color)
                     .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(view.border_color))
             .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
     );
     f.render_widget(Clear, modal_area);
@@ -865,33 +897,9 @@ pub fn draw_left_pane(
     let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
-        let is_user = entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject");
-        if !is_user {
-            // Rich markdown rendering for assistant and system-ish messages.
-            // This preserves structure/newlines for plans, lists, code, headings, etc.
-            // (User messages stay plain for chat flow.)
-            let md = wiki_render_markdown(entry);
-            for mut line in md.lines {
-                if Some(line_idx) == highlight_line {
-                    for sp in &mut line.spans {
-                        sp.style = sp.style
-                            .fg(Color::Black)
-                            .bg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD);
-                    }
-                }
-                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 { /* keep a couple for md separation */ }
-                    else { left_text.lines.push(line); }
-                } else {
-                    consecutive_blanks = 0;
-                    left_text.lines.push(line);
-                }
-                line_idx += 1;
-            }
-        } else {
+        if is_plan_entry_confirm(entry) {
+            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
+        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
             let (prefix_style, body_style) = conversation_entry_styles(entry);
             let lines_iter: Vec<&str> = entry.lines().collect();
             for (li, line) in lines_iter.iter().enumerate() {
@@ -917,6 +925,31 @@ pub fn draw_left_pane(
                 left_text
                     .lines
                     .push(Line::from(Span::styled(line.to_string(), style)));
+                line_idx += 1;
+            }
+        } else {
+            // Rich markdown rendering for assistant and system-ish messages.
+            // This preserves structure/newlines for plans, lists, code, headings, etc.
+            // (User messages stay plain for chat flow.)
+            let md = wiki_render_markdown(entry);
+            for mut line in md.lines {
+                if Some(line_idx) == highlight_line {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD);
+                    }
+                }
+                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 { /* keep a couple for md separation */ }
+                    else { left_text.lines.push(line); }
+                } else {
+                    consecutive_blanks = 0;
+                    left_text.lines.push(line);
+                }
                 line_idx += 1;
             }
         }
@@ -1075,7 +1108,7 @@ pub fn draw_overlays(
     screen: Rect,
     input_area: Rect,
     settings: &SettingsModal,
-    pending_approval: Option<&str>,
+    pending_confirmation: Option<&crate::confirmation_dialog::ConfirmationDialog>,
     slash_commands: &[SlashCommand],
     input: &str,
     slash_selected: usize,
@@ -1086,8 +1119,8 @@ pub fn draw_overlays(
     agent_modes: &[&str],
     selected_agent_mode_idx: usize,
 ) {
-    if let Some(desc) = pending_approval {
-        draw_approval_popup(f, desc, screen, input_area);
+    if let Some(dialog) = pending_confirmation {
+        draw_confirmation_modal(f, dialog, screen, input_area);
     }
     if input.starts_with('/') && !input.is_empty() {
         draw_slash_menu(f, input_area, slash_commands, input, slash_selected);
@@ -1181,6 +1214,49 @@ fn trace_line_style(line: &str) -> Style {
     }
 }
 
+/// Horizontal space reserved inside a scrollable pane: scrollbar(1) + borders(2) + padding(2).
+const PANE_INNER_WIDTH_RESERVE: u16 = 5;
+const PANE_BORDER_HEIGHT: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneScrollMetrics {
+    line_count: u16,
+    content_height: u16,
+    max_scroll: u16,
+}
+
+/// Compute wrapped-line scroll limits for a scrollable pane.
+///
+/// The Paragraph widget uses `Wrap { trim: false }`, so logical lines wider than
+/// the inner width occupy multiple visual rows. `max_scroll` is derived from the
+/// visible content height (inside borders, minus an optional title row).
+fn pane_scroll_metrics(area: Rect, text: &Text, has_title: bool) -> PaneScrollMetrics {
+    let title_height = u16::from(has_title);
+    let content_height = area.height.saturating_sub(PANE_BORDER_HEIGHT + title_height);
+    let inner_width = area.width.saturating_sub(PANE_INNER_WIDTH_RESERVE).max(1) as usize;
+    let line_count = count_visual_lines(text, inner_width);
+    let max_scroll = line_count.saturating_sub(content_height);
+    PaneScrollMetrics {
+        line_count,
+        content_height,
+        max_scroll,
+    }
+}
+
+fn count_visual_lines(text: &Text, inner_width: usize) -> u16 {
+    let inner_width = inner_width.max(1);
+    let mut visual_lines: u16 = 0;
+    for line in text.lines.iter() {
+        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if line_width == 0 {
+            visual_lines += 1; // empty line still takes 1 row
+        } else {
+            visual_lines += line_width.div_ceil(inner_width) as u16;
+        }
+    }
+    visual_lines
+}
+
 fn render_scrollable_pane(
     f: &mut Frame,
     area: Rect,
@@ -1194,27 +1270,13 @@ fn render_scrollable_pane(
     title_color: Color,
     subtitle: Option<String>,
 ) {
-    // Compute *visual* line count (accounting for wrapping).
-    // The Paragraph widget uses Wrap { trim: false }, so lines longer
-    // than the content width wrap to multiple visual lines. We must count
-    // wrapped lines for correct scroll limits; otherwise the max scroll
-    // is too small and you can never reach the bottom.
-    let content_height = area.height.saturating_sub(2);
-    // Inner width = area width minus borders (2) minus horizontal padding (2)
-    let inner_width = area.width.saturating_sub(4).max(1) as usize;
-    let mut visual_lines: u16 = 0;
-    for line in text.lines.iter() {
-        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        if line_width == 0 {
-            visual_lines += 1; // empty line still takes 1 row
-        } else {
-            // Ceiling division: how many rows does this line occupy?
-            visual_lines += line_width.div_ceil(inner_width) as u16;
-        }
-    }
-    let line_count = visual_lines;
+    let has_title = !title.trim().is_empty();
+    let PaneScrollMetrics {
+        line_count,
+        content_height,
+        max_scroll,
+    } = pane_scroll_metrics(area, text, has_title);
     *last_line_count = line_count;
-    let max_scroll = line_count.saturating_sub(content_height);
     if follow_output {
         *scroll = max_scroll;
     } else {
@@ -1384,6 +1446,98 @@ fn wrap_approval_lines(s: &str, width: usize, max_lines: usize) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod scroll_metrics_tests {
+    use super::{count_visual_lines, pane_scroll_metrics};
+    use ratatui::{
+        layout::Rect,
+        text::{Line, Text},
+    };
+
+    fn text_from_lines(lines: &[&str]) -> Text<'static> {
+        Text::from(
+            lines
+                .iter()
+                .map(|s| Line::from(s.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn empty_text_single_visual_line() {
+        let text = Text::default();
+        assert_eq!(count_visual_lines(&text, 10), 0);
+    }
+
+    #[test]
+    fn short_lines_one_row_each() {
+        let text = text_from_lines(&["hello", "world"]);
+        assert_eq!(count_visual_lines(&text, 20), 2);
+    }
+
+    #[test]
+    fn long_line_wraps_to_multiple_rows() {
+        let text = text_from_lines(&["abcdefghijklmnop"]); // 16 chars
+        assert_eq!(count_visual_lines(&text, 10), 2);
+        assert_eq!(count_visual_lines(&text, 5), 4);
+    }
+
+    #[test]
+    fn empty_logical_line_counts_as_one_row() {
+        let text = text_from_lines(&[""]);
+        assert_eq!(count_visual_lines(&text, 10), 1);
+    }
+
+    #[test]
+    fn titled_pane_reduces_content_height() {
+        let area = Rect::new(0, 0, 30, 12);
+        let text = text_from_lines(&["line"]);
+        let untitled = pane_scroll_metrics(area, &text, false);
+        let titled = pane_scroll_metrics(area, &text, true);
+        assert_eq!(untitled.content_height, 10);
+        assert_eq!(titled.content_height, 9);
+    }
+
+    #[test]
+    fn inner_width_reserves_scrollbar_and_padding() {
+        let area = Rect::new(0, 0, 20, 10);
+        // inner width = 20 - 5 = 15
+        let text = text_from_lines(&["x".repeat(30).as_str()]);
+        assert_eq!(count_visual_lines(&text, 15), 2);
+        let metrics = pane_scroll_metrics(area, &text, false);
+        assert_eq!(metrics.line_count, 2);
+        assert_eq!(metrics.content_height, 8);
+        assert_eq!(metrics.max_scroll, 0);
+    }
+
+    #[test]
+    fn max_scroll_allows_reaching_bottom() {
+        let area = Rect::new(0, 0, 20, 8);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let text = Text::from(
+            lines
+                .iter()
+                .map(|s| Line::from(s.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let metrics = pane_scroll_metrics(area, &text, true);
+        // height 8 - borders 2 - title 1 = 5 visible rows; 20 lines -> max_scroll 15
+        assert_eq!(metrics.content_height, 5);
+        assert_eq!(metrics.line_count, 20);
+        assert_eq!(metrics.max_scroll, 15);
+    }
+
+    #[test]
+    fn metrics_are_stable_across_calls() {
+        let area = Rect::new(0, 0, 25, 10);
+        let text = text_from_lines(&["alpha", "beta beta beta beta"]);
+        let first = pane_scroll_metrics(area, &text, true);
+        let second = pane_scroll_metrics(area, &text, true);
+        assert_eq!(first, second);
+        assert!(first.max_scroll <= first.line_count);
+    }
+}
+
+#[cfg(test)]
 mod approval_popup_tests {
     use super::{char_count, wrap_approval_lines};
 
@@ -1510,18 +1664,53 @@ fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState)
     lines.push(Line::from(""));
 
     if plan.steps.is_empty() {
-        // Collection / approval phase -- hide progress/step details until user approves the plan
         let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        // slow swirl: update every ~4 frames
         let slow = spins[(plan.spinner_tick / 4) % spins.len()];
-        lines.push(Line::from(Span::styled(
-            format!("{} Steps: (to be determined)", slow),
-            Style::default().fg(Color::DarkGray)
-        )));
-        lines.push(Line::from(Span::styled(
-            "Waiting for plan approval...",
-            Style::default().fg(Color::DarkGray)
-        )));
+        match plan.loop_phase {
+            crate::app_state::PlanLoopPhase::FetchingQuestion
+            | crate::app_state::PlanLoopPhase::FetchingProposal => {
+                lines.push(Line::from(Span::styled(
+                    format!("{slow} Planning… (JSON loop)"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            crate::app_state::PlanLoopPhase::AwaitingUserAnswer => {
+                if let Some(q) = &plan.pending_question {
+                    lines.push(Line::from(Span::styled(
+                        format!("❓ {}", q.prompt),
+                        Style::default().fg(Color::Rgb(0xff, 0xcc, 0x66)),
+                    )));
+                    for (i, opt) in q.options.iter().enumerate() {
+                        let rec = q
+                            .recommend
+                            .as_deref()
+                            .is_some_and(|r| r == opt.id)
+                            .then_some(" ★");
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "  {}. {}{}",
+                                i + 1,
+                                opt.label,
+                                rec.unwrap_or_default()
+                            ),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                }
+            }
+            crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
+                lines.push(Line::from(Span::styled(
+                    "📋 Review proposal in chat — ready to proceed?",
+                    Style::default().fg(Color::Rgb(0xcc, 0xff, 0xcc)),
+                )));
+            }
+            _ => {
+                lines.push(Line::from(Span::styled(
+                    format!("{slow} Steps: (to be determined)"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
     } else {
         // Execution phase: show progress + steps
         // Progress with swirl + optional simple bar
@@ -1529,7 +1718,19 @@ fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState)
         let spin = spins[plan.spinner_tick % spins.len()];
         let progress = if !plan.steps.is_empty() && plan.current_step < plan.steps.len() {
             let st = &plan.steps[plan.current_step];
-            format!("{} Step {}/{} {}", spin, plan.current_step + 1, plan.steps.len(), st.description)
+            let observe = plan
+                .pending_observe_prompt
+                .as_deref()
+                .map(|p| format!(" — waiting: {}", p))
+                .unwrap_or_default();
+            format!(
+                "{} Step {}/{} {}{}",
+                spin,
+                plan.current_step + 1,
+                plan.steps.len(),
+                st.description,
+                observe
+            )
         } else if !plan.steps.is_empty() {
             // All steps completed (or forced on final Done / WORK_COMPLETE)
             "✓ Plan complete".to_string()
@@ -1563,8 +1764,20 @@ fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState)
                     _ => "  ",
                 }
             };
-            let v = if let Some(v) = &st.verification { format!(" [verify: {}]", v) } else { String::new() };
-            lines.push(Line::from(Span::styled(format!("{}{}{}", mark, st.description, v), Style::default().fg(Color::Gray))));
+            let tier = st
+                .tier
+                .map(|t| format!(" [{}]", t.pane_label()))
+                .unwrap_or_default();
+            let v = st
+                .verification
+                .as_deref()
+                .or(st.observe_prompt.as_deref())
+                .map(|v| format!(" ({})", v))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("{}{}{}{}", mark, st.description, tier, v),
+                Style::default().fg(Color::Gray),
+            )));
         }
     }
 
@@ -1712,8 +1925,10 @@ pub fn draw_content_desktop(
             let nav_area = cols[1];
             let content_area = cols[2];
 
-            let is_harness = picker.browser_nav_items.get(picker.browser_selected_nav)
-                .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+            let is_harness = crate::app_state::browser_nav_is_harness(
+                picker.browser_nav_items,
+                picker.browser_selected_nav,
+            );
             let picker_focused = picker.view_focus == crate::app_state::ViewFocus::Picker;
             let nav_focused = picker.view_focus == crate::app_state::ViewFocus::Nav;
             let content_focused = picker.view_focus == crate::app_state::ViewFocus::Content;
@@ -2578,10 +2793,37 @@ fn build_left_text(
     let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
-        let is_user = entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject");
-        if !is_user {
-            // Rich markdown for assistant responses (plans, lists etc show with proper
-            // newlines, headings, bullets, bold, code styling).
+        if is_plan_entry_confirm(entry) {
+            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
+        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
+            let (prefix_style, body_style) = conversation_entry_styles(entry);
+            let lines_iter: Vec<&str> = entry.lines().collect();
+            for (li, line) in lines_iter.iter().enumerate() {
+                let is_blank = line.trim().is_empty();
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 {
+                        continue;
+                    }
+                } else {
+                    consecutive_blanks = 0;
+                }
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if li == 0 {
+                    prefix_style
+                } else {
+                    body_style
+                };
+                left_text
+                    .lines
+                    .push(Line::from(Span::styled(line.to_string(), style)));
+                line_idx += 1;
+            }
+        } else {
             let md = wiki_render_markdown(entry);
             for mut line in md.lines {
                 if Some(line_idx) == highlight_line {
@@ -2602,34 +2844,6 @@ fn build_left_text(
                     consecutive_blanks = 0;
                     left_text.lines.push(line);
                 }
-                line_idx += 1;
-            }
-        } else {
-            let (prefix_style, body_style) = conversation_entry_styles(entry);
-            let lines_iter: Vec<&str> = entry.lines().collect();
-            for (li, line) in lines_iter.iter().enumerate() {
-                let is_blank = line.trim().is_empty();
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 {
-                        continue; // collapse excessive blank lines in display
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                }
-                let style = if Some(line_idx) == highlight_line {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD)
-                } else if li == 0 {
-                    prefix_style
-                } else {
-                    body_style
-                };
-                left_text
-                    .lines
-                    .push(Line::from(Span::styled(line.to_string(), style)));
                 line_idx += 1;
             }
         }
@@ -2764,20 +2978,14 @@ fn render_scrollable_pane_buf(
     title_color: Color,
     subtitle: Option<String>,
 ) {
-    // Compute visual (wrapped) line count — same as render_scrollable_pane
-    let inner_width = area.width.saturating_sub(4).max(1) as usize;
-    let mut visual_lines: u16 = 0;
-    for line in text.lines.iter() {
-        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        if line_width == 0 {
-            visual_lines += 1;
-        } else {
-            visual_lines += line_width.div_ceil(inner_width) as u16;
-        }
-    }
-    let line_count = visual_lines;
+    let has_title = !title.trim().is_empty();
+    let PaneScrollMetrics {
+        line_count,
+        max_scroll,
+        ..
+    } = pane_scroll_metrics(area, text, has_title);
     *last_line_count = line_count;
-    *scroll = (*scroll).min(line_count.saturating_sub(1));
+    *scroll = (*scroll).min(max_scroll);
 
     let focus_style = if focused {
         if scroll_flash_timer > 0 {

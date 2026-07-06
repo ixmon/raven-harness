@@ -67,6 +67,10 @@ pub struct RuntimeFlags {
     /// profiles can set it too.
     pub enable_judge: bool,
 
+    /// Use a cheap LLM call to classify plan-entry and proceed intent when
+    /// heuristics fire (interactive TUI). Disable with RAVEN_PLAN_INTENT_LLM=0.
+    pub plan_intent_llm: bool,
+
     // ── Safety limits ──────────────────────────────────────────────────
     /// Hard wall-clock timeout for a single turn (seconds).
     /// When elapsed, drive_turn() stops the agent regardless of judge/nudge state.
@@ -108,6 +112,10 @@ impl RuntimeFlags {
 
         let enable_judge = false; // set by CLI --enable-judge; env never sets this
 
+        let plan_intent_llm = std::env::var("RAVEN_PLAN_INTENT_LLM")
+            .map(|v| v != "0" && v.to_lowercase() != "false")
+            .unwrap_or(true);
+
         let color_depth = std::env::var("RAVEN_COLOR_DEPTH").ok();
         let vault_password = std::env::var("RAVEN_VAULT_PASSWORD").ok();
 
@@ -121,6 +129,7 @@ impl RuntimeFlags {
             disable_goal_tool,
             no_initial_goal,
             enable_judge,
+            plan_intent_llm,
             color_depth,
             vault_password,
             max_duration_secs,

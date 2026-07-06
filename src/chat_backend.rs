@@ -59,6 +59,7 @@ impl MockChatBackend {
                     completion_tokens: Some(0),
                     total_tokens: Some(0),
                 }),
+                reasoning_content: None,
             },
         }
     }
@@ -110,12 +111,14 @@ mod tests {
                 tool_calls: vec![mock_tool_call("list", r#"{"path":"."}"#)],
                 finish_reason: None,
                 usage: None,
+                reasoning_content: None,
             },
             ChatResponse {
                 content: "done".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -125,6 +128,8 @@ mod tests {
             temperature: 0.0,
             max_tokens: 100,
             stream: false,
+            reasoning_enabled: None,
+            json_object_mode: None,
         };
 
         let r1 = backend.chat(req.clone()).await.unwrap();

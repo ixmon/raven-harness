@@ -51,6 +51,8 @@ pub trait TurnObserver: Send {
     fn on_tool_start(&mut self, _name: &str, _args: &str) {}
     /// A tool finished executing.
     fn on_tool_result(&mut self, _record: &ActionRecord) {}
+    /// Plan execution state changed (e.g. after `complete_plan_step`).
+    fn on_plan_sync(&mut self, _state: &crate::plan_execution::PlanExecutionState) {}
     /// Should this tool call be allowed to execute?
     /// For interactive use this may prompt the user.
     async fn approve_tool(&mut self, _tc: &ToolCall) -> bool {
@@ -165,13 +167,11 @@ pub async fn drive_turn(
     let cfg = agent.current_config();
     let max_duration_secs = cfg.flags.max_duration_secs;
 
-    // Choose tool surface based on agent mode.
-    // In plan mode we give a curated set focused on exploration + planning state.
-    let tools_schema = if agent.current_agent_mode() == "plan" {
-        tools::plan_mode_tools(&cfg.flags)
-    } else {
-        tools::all_tools(&cfg.flags)
-    };
+    let tools_schema = tools::tools_for_agent(
+        &agent.current_agent_mode(),
+        &cfg.flags,
+        agent.plan_tool_context(),
+    );
     let tools_for_request = cfg.tools_enabled.then(|| tools_schema.clone());
 
     let mut steering = SteeringState::new(
@@ -365,13 +365,40 @@ pub async fn drive_turn(
                     observer.on_tool_start(&tc.function.name, &tc.function.arguments);
                     to_execute.push(tc.clone());
                 } else {
-                    let deny = format!(
-                        "DENIED: The user refused to approve this {} action. \
-                         Do NOT retry the same action. \
-                         Either try a different approach, ask the user what they want, \
-                         or explain what you were trying to do and why.",
-                        tc.function.name
-                    );
+                    let deny = if tc.function.name == "exec" {
+                        let cmd = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                            .ok()
+                            .and_then(|v| {
+                                v.get("command")
+                                    .and_then(|c| c.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .unwrap_or_default();
+                        if crate::tools::is_privileged_package_install(&cmd)
+                            || crate::tools::command_uses_sudo(&cmd)
+                        {
+                            format!(
+                                "DENIED: The user refused this privileged exec (`{cmd}`). \
+                                 Do NOT retry sudo or package installs. \
+                                 First re-check whether the dependency is already available \
+                                 (dpkg -l, pkg-config --modversion, which, ldconfig -p, g++ --version). \
+                                 If something is still missing, give the user the exact command to run \
+                                 in their own terminal — the TUI cannot enter a sudo password."
+                            )
+                        } else {
+                            "DENIED: The user refused to approve this exec action. \
+                             Do NOT retry the same command. Try a different approach or ask the user."
+                                .to_string()
+                        }
+                    } else {
+                        format!(
+                            "DENIED: The user refused to approve this {} action. \
+                             Do NOT retry the same action. \
+                             Either try a different approach, ask the user what they want, \
+                             or explain what you were trying to do and why.",
+                            tc.function.name
+                        )
+                    };
                     agent.record_tool_denial(tc, &deny);
                     if observer.should_stop() || observer.stop_tool_processing() {
                         break;
@@ -395,6 +422,9 @@ pub async fn drive_turn(
                 let recs = agent.execute_and_record_tool_calls(&[tc]).await;
                 for r in &recs {
                     observer.on_tool_result(r);
+                    if matches!(r.tool.as_str(), "complete_plan_step" | "revise_plan_step") {
+                        observer.on_plan_sync(agent.plan_execution());
+                    }
                     estimated_tool_tokens += r.estimated_tokens as u64;
                     if r.tool == "read_summary" && r.output_to_model.contains("(fresh summary)") {
                         cache_summary_hits += 1;
@@ -686,6 +716,8 @@ fn build_round_context(
         .and_then(|s| s.last_assistant_content())
         .unwrap_or_default();
     let agent_mode = agent.current_agent_mode();
+    let exec = agent.plan_execution();
+    let plan_executing = exec.active && !exec.steps.is_empty();
 
     RoundContext {
         effective_text: effective_text.to_string(),
@@ -698,6 +730,10 @@ fn build_round_context(
         has_session: agent.session.is_some(),
         log_tail,
         agent_mode,
+        plan_executing,
+        plan_current_step: exec.current_step,
+        plan_total_steps: exec.steps.len(),
+        plan_pending_observe: exec.pending_observe_prompt.is_some(),
     }
 }
 

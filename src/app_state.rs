@@ -105,11 +105,13 @@ pub struct WikiViewerState {
     pub selected_nav: usize,
 }
 
+pub(crate) fn browser_nav_is_harness(items: &[WikiNavItem], selected: usize) -> bool {
+    items.get(selected).is_some_and(|it| it.kind == NavItemKind::Harness)
+}
+
 impl WikiViewerState {
     pub fn selected_is_harness(&self) -> bool {
-        self.nav_items.get(self.selected_nav)
-            .map(|it| it.kind == NavItemKind::Harness)
-            .unwrap_or(false)
+        browser_nav_is_harness(&self.nav_items, self.selected_nav)
     }
 }
 
@@ -123,11 +125,70 @@ pub enum PlanStepStatus {
     Failed,
 }
 
+/// Verification tier for a planned step (see docs/plan-mode-improvements.md).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum PlanStepTier {
+    #[default]
+    Exec,
+    Check,
+    Attested,
+    Observe,
+}
+
+impl PlanStepTier {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "exec" => Some(Self::Exec),
+            "check" => Some(Self::Check),
+            "attested" => Some(Self::Attested),
+            "observe" => Some(Self::Observe),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Check => "check",
+            Self::Attested => "attested",
+            Self::Observe => "observe",
+        }
+    }
+
+    /// Short label for the plan pane step list.
+    pub fn pane_label(self) -> &'static str {
+        match self {
+            Self::Exec => "exec",
+            Self::Check => "check",
+            Self::Attested => "attested",
+            Self::Observe => "observe",
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct PlanStep {
     pub description: String,
     pub verification: Option<String>,
+    pub tier: Option<PlanStepTier>,
+    pub note: Option<String>,
+    pub observe_prompt: Option<String>,
     pub status: PlanStepStatus,
+}
+
+/// Harness-driven JSON plan loop phase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlanLoopPhase {
+    #[default]
+    Idle,
+    /// Waiting for clarify JSON from the model.
+    FetchingQuestion,
+    /// Showing a structured question; waiting for user answer.
+    AwaitingUserAnswer,
+    /// Waiting for proposal JSON from the model.
+    FetchingProposal,
+    /// Showing final proposal; waiting for proceed consent.
+    AwaitingProceedConsent,
 }
 
 #[derive(Default)]
@@ -141,10 +202,22 @@ pub struct PlanState {
     pub steps: Vec<PlanStep>,
     pub current_step: usize,
     pub spinner_tick: usize,
+    /// Observe-tier: prompt shown to user before agent continues.
+    pub pending_observe_prompt: Option<String>,
+    pub pending_observe_step: Option<usize>,
+    /// True after the agent invites "proceed?" — user assent counts only then.
+    pub recap_offered: bool,
+    /// JSON-driven plan loop (clarify → propose → consent).
+    pub loop_phase: PlanLoopPhase,
+    pub initial_request: String,
+    pub qa_history: Vec<raven_tui::plan_protocol::PlanQaEntry>,
+    pub pending_question: Option<raven_tui::plan_protocol::PlanQuestion>,
+    pub pending_proposal: Option<raven_tui::plan_protocol::PlanProposal>,
 }
 
 impl PlanState {
     /// Mark the current step Done and advance the pointer (if possible).
+    #[allow(dead_code)]
     pub fn advance_one_step(&mut self) {
         if !self.steps.is_empty() && self.current_step < self.steps.len() {
             self.steps[self.current_step].status = PlanStepStatus::Done;
@@ -163,6 +236,7 @@ impl PlanState {
     }
 
     /// Heuristic: does this text represent strong task completion for plan progress purposes?
+    #[allow(dead_code)]
     pub fn is_strong_completion_signal(text: &str) -> bool {
         let t = text.to_lowercase();
         t.contains("work_complete")
@@ -173,38 +247,13 @@ impl PlanState {
             || (t.contains("successfully") && t.contains("criteria"))
     }
 
-    /// Advance logic used on UiUpdate::Done (end of agent turn).
-    pub fn advance_on_turn_done(&mut self, final_text: &str) {
+    /// Whole-plan completion from judge WORK_COMPLETE only (not per-turn heuristics).
+    pub fn complete_on_work_complete_signal(&mut self, summary: &str) {
         if !self.active || self.steps.is_empty() {
             return;
         }
-        self.advance_one_step();
-        if Self::is_strong_completion_signal(final_text) {
+        if summary.contains("WORK_COMPLETE") {
             self.complete();
-        }
-    }
-
-    /// Advance logic used on ToolResult (especially WORK_COMPLETE).
-    pub fn advance_on_tool_result(&mut self, summary: &str) {
-        if !self.active || self.steps.is_empty() {
-            return;
-        }
-        let is_complete_signal = summary.contains("WORK_COMPLETE")
-            || summary.to_lowercase().contains("done")
-            || summary.to_lowercase().contains("fulfilled");
-        if is_complete_signal || self.current_step < self.steps.len() {
-            let idx = if self.current_step < self.steps.len() {
-                self.current_step
-            } else {
-                self.steps.len() - 1
-            };
-            self.steps[idx].status = PlanStepStatus::Done;
-            if self.current_step < self.steps.len() {
-                self.current_step += 1;
-            }
-            if is_complete_signal {
-                self.complete();
-            }
         }
     }
 }
@@ -285,6 +334,9 @@ pub struct App {
     pub focused_pane: Pane,
     pub scroll_flash_timer: u8,
 
+    // Agent turn queued from async plan-loop proceed classification.
+    pub deferred_agent_prompt: Option<String>,
+
     // Processing state
     pub is_processing: bool,
     pub spinner_tick: usize,
@@ -311,15 +363,16 @@ pub struct App {
     #[allow(dead_code)]
     pub last_turn_end: Option<std::time::Instant>,
 
-    // Approval
-    pub pending_approval: Option<String>,
-    pub approval_responder: Option<tokio::sync::oneshot::Sender<bool>>,
+    // Modal confirmations (tool approval, plan entry, …)
+    pub pending_confirmation: Option<crate::confirmation_dialog::ConfirmationDialog>,
     pub needs_redraw: bool,
 
     // Mode menu
     pub mode_menu_active: bool,
     pub selected_mode_idx: usize,
     pub approval_modes: [&'static str; 4],
+    /// Live approval mode for in-flight agent turns (TuiObserver reads this).
+    pub live_exec_mode: std::sync::Arc<std::sync::Mutex<raven_tui::session::ExecApprovalMode>>,
 
     // Run mode submenu for /run-mode (talk, think, ...)
     pub agent_mode_menu_active: bool,
@@ -382,8 +435,6 @@ pub struct App {
 
     // Plan Mode state (new pane + run mode "plan")
     pub plan: PlanState,
-    pub pending_plan_confirmation: bool,
-    pub pending_plan_request: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -414,6 +465,7 @@ impl App {
             right_follow_output: true,
             focused_pane: Pane::Left,
             scroll_flash_timer: 0,
+            deferred_agent_prompt: None,
             is_processing: false,
             spinner_tick: 0,
             tool_calls_this_turn: 0,
@@ -429,8 +481,7 @@ impl App {
             generation_active_time: 0.0,
             last_token_time: None,
             last_turn_end: None,
-            pending_approval: None,
-            approval_responder: None,
+            pending_confirmation: None,
             needs_redraw: true,
             mode_menu_active: false,
             selected_mode_idx: 0,
@@ -440,6 +491,9 @@ impl App {
                 "Vegas - Yolo in sandbox",
                 "Thunderdome - eternal Yolo, anytime, anywhere",
             ],
+            live_exec_mode: std::sync::Arc::new(std::sync::Mutex::new(
+                raven_tui::session::ExecApprovalMode::Babysitter,
+            )),
             agent_mode_menu_active: false,
             selected_agent_mode_idx: 0,
             agent_modes: ["talk", "think", "research", "work", "dream", "plan"],
@@ -485,9 +539,13 @@ impl App {
             },
             wiki_viewer: WikiViewerState::default(),
             plan: PlanState::default(),
-            pending_plan_confirmation: false,
-            pending_plan_request: None,
         }
+    }
+
+    pub fn plan_entry_dialog_open(&self) -> bool {
+        self.pending_confirmation
+            .as_ref()
+            .is_some_and(|d| d.is_plan_entry())
     }
 
     pub fn try_slide_to_splash(&mut self) -> bool {
@@ -843,10 +901,15 @@ impl App {
             *slot = Some(text.clone());
         }
         stop.store(true, Ordering::SeqCst);
-        if let Some(tx) = self.approval_responder.take() {
-            let _ = tx.send(false);
+        match self.pending_confirmation.take() {
+            Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
+                responder, ..
+            }) => {
+                let _ = responder.send(false);
+            }
+            Some(crate::confirmation_dialog::ConfirmationDialog::PlanEntry { .. }) => {}
+            None => {}
         }
-        self.pending_approval = None;
         self.left_committed
             .push(format!("You (interject, now): {}", text));
         self.trace_lines
@@ -893,34 +956,40 @@ impl App {
         self.needs_redraw = true;
     }
 
-    /// Handle a key when the approval dialog is open.
-    /// Returns `true` if the key was consumed (caller should `continue`).
-    pub fn handle_approval_key(&mut self, key: crossterm::event::KeyEvent) -> bool {
-        if self.pending_approval.is_none() {
-            return false;
-        }
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                if let Some(tx) = self.approval_responder.take() {
-                    let _ = tx.send(true);
-                }
-                self.pending_approval = None;
-                self.left_committed.push("✅ Action approved".to_string());
+    /// Handle a key when a confirmation modal is open.
+    pub fn handle_confirmation_key(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> crate::confirmation_dialog::ConfirmationKeyOutcome {
+        use crate::confirmation_dialog::{ConfirmationDialog, ConfirmationKeyOutcome};
+        let Some(dialog) = self.pending_confirmation.take() else {
+            return ConfirmationKeyOutcome::NotHandled;
+        };
+        let confirmed = match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => true,
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => false,
+            _ => {
+                self.pending_confirmation = Some(dialog);
+                return ConfirmationKeyOutcome::Handled;
+            }
+        };
+        match dialog {
+            ConfirmationDialog::ToolApproval { responder, .. } => {
+                let _ = responder.send(confirmed);
+                self.left_committed.push(if confirmed {
+                    "✅ Action approved".to_string()
+                } else {
+                    "⛔ Action denied".to_string()
+                });
                 self.left_follow_output = true;
                 self.left_scroll = 10_000;
+                ConfirmationKeyOutcome::Handled
             }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                if let Some(tx) = self.approval_responder.take() {
-                    let _ = tx.send(false);
-                }
-                self.pending_approval = None;
-                self.left_committed.push("⛔ Action denied".to_string());
-                self.left_follow_output = true;
-                self.left_scroll = 10_000;
-            }
-            _ => {}
+            ConfirmationDialog::PlanEntry { goal } => ConfirmationKeyOutcome::PlanEntry {
+                goal,
+                confirmed,
+            },
         }
-        true
     }
 
     /// Handle a key when the /mode selection menu is open.
@@ -965,6 +1034,9 @@ impl App {
                     if let Some(s) = &mut ag.session_mut() {
                         let _ = s.save_meta();
                     }
+                }
+                if let Ok(mut slot) = self.live_exec_mode.lock() {
+                    *slot = mode;
                 }
                 self.mode_menu_active = false;
                 self.clear_input();
@@ -1902,112 +1974,271 @@ impl App {
         }
     }
 
-    /// Switch focus or move selection in picker. Returns true if handled.
-    pub fn handle_picker_key(&mut self, key: KeyCode, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) -> bool {
-        use crate::app_state::{PickerFocus, SplashFocus};
-        if !(self.desktop.showing_picker()
+    pub(crate) fn browser_selected_is_harness(&self) -> bool {
+        browser_nav_is_harness(&self.browser_nav_items, self.browser_selected_nav)
+    }
+
+    fn reset_left_pane_for_harness(&mut self) {
+        self.left_follow_output = false;
+        self.left_scroll = 0;
+    }
+
+    fn is_picker_key_active(&self) -> bool {
+        self.desktop.showing_picker()
             || self.desktop.active == crate::desktop::ActiveDesktop::Splash
-            || self.desktop.active == crate::desktop::ActiveDesktop::Overview)
+            || self.desktop.active == crate::desktop::ActiveDesktop::Overview
+    }
+
+    fn focus_overview_to_content(&mut self) {
+        self.view_focus = ViewFocus::Content;
+        if self.browser_selected_is_harness() {
+            self.reset_left_pane_for_harness();
+        }
+    }
+
+    fn activate_overview_harness_session(
+        &mut self,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) {
+        let sid = self
+            .picker
+            .sessions
+            .get(self.picker.selected_session)
+            .map(|m| m.session_id.clone());
+        if let Some(sid) = sid {
+            self.activate_session_by_id(&sid, agent);
+        } else {
+            self.desktop.set_workspace();
+        }
+    }
+
+    fn enter_wiki_from_overview_content(&mut self) {
+        if let Some(item) = self.browser_nav_items.get(self.browser_selected_nav) {
+            if item.kind != NavItemKind::Harness {
+                self.wiki_viewer.session_id = self
+                    .picker
+                    .sessions
+                    .get(self.picker.selected_session)
+                    .map(|m| m.session_id.clone())
+                    .unwrap_or_default();
+                self.wiki_viewer.current_file = item.target_file.clone();
+                self.load_wiki_viewer_content();
+            }
+        }
+        self.enter_wiki_viewer();
+    }
+
+    /// On splash, when magenta pane is focused, only allow focus-switch keys.
+    fn handle_splash_magenta_picker_key(&mut self, key: KeyCode) -> bool {
+        use crate::app_state::{PickerFocus, SplashFocus};
+        if self.desktop.active != crate::desktop::ActiveDesktop::Splash
+            || self.splash_focus == SplashFocus::Picker
         {
             return false;
         }
+        match key {
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
+                self.splash_focus = SplashFocus::Picker;
+                self.picker.focus = PickerFocus::Tree;
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => {
+                self.needs_redraw = true;
+                true
+            }
+            _ => true,
+        }
+    }
 
-        // On splash, when magenta pane is focused (default), only allow focus-switch keys;
-        // swallow others so they don't affect the (gray) picker tree selection.
-        if self.desktop.active == crate::desktop::ActiveDesktop::Splash
-            && self.splash_focus != SplashFocus::Picker
-        {
-            match key {
-                KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                    self.splash_focus = SplashFocus::Picker;
-                    self.picker.focus = PickerFocus::Tree;
-                    self.needs_redraw = true;
-                    return true;
-                }
-                KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => {
-                    self.needs_redraw = true;
-                    return true;
-                }
-                _ => return true,
-            }
-        }
-        // Handle trust confirmation for add workspace
-        if let Some(p) = self.picker.confirm_trust_path.clone() {
-            match key {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    self.picker.confirm_trust_path = None;
-                    self.clear_input();
-                    // Perform init and trust
-                    match raven_tui::session::Session::init(&p) {
-                        Ok(mut new_sess) => {
-                            // auto-trust since user confirmed in TUI
-                            new_sess.meta.trusted = true;
-                            let _ = new_sess.save_meta();
-                            // build cache
-                            let _ = raven_tui::session::ensure_repo_cache(&mut new_sess);
-                            if let Ok(mut ag) = agent.try_lock() {
-                                *ag.session_mut() = Some(new_sess);
-                            }
-                            // reload lists
-                            self.refresh_picker();
-                            self.needs_redraw = true;
+    fn handle_picker_trust_confirm_key(
+        &mut self,
+        key: KeyCode,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        let Some(p) = self.picker.confirm_trust_path.clone() else {
+            return false;
+        };
+        match key {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.picker.confirm_trust_path = None;
+                self.clear_input();
+                match raven_tui::session::Session::init(&p) {
+                    Ok(mut new_sess) => {
+                        new_sess.meta.trusted = true;
+                        let _ = new_sess.save_meta();
+                        let _ = raven_tui::session::ensure_repo_cache(&mut new_sess);
+                        if let Ok(mut ag) = agent.try_lock() {
+                            *ag.session_mut() = Some(new_sess);
                         }
-                        Err(e) => {
-                            self.left_committed.push(format!("Error: {}", e));
-                            self.needs_redraw = true;
-                        }
+                        self.refresh_picker();
+                        self.needs_redraw = true;
                     }
-                    return true;
+                    Err(e) => {
+                        self.left_committed.push(format!("Error: {}", e));
+                        self.needs_redraw = true;
+                    }
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.picker.confirm_trust_path = None;
-                    self.clear_input();
-                    self.needs_redraw = true;
-                    return true;
-                }
-                _ => return true,
+                true
             }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.picker.confirm_trust_path = None;
+                self.clear_input();
+                self.needs_redraw = true;
+                true
+            }
+            _ => true,
         }
+    }
+
+    fn handle_overview_picker_key(
+        &mut self,
+        key: KeyCode,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        use crate::app_state::SplashFocus;
         match key {
             KeyCode::Up | KeyCode::Char('k') => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                    match self.view_focus {
-                        ViewFocus::Picker => {
-                            if self.picker.selected_item > 0 {
-                                self.picker.selected_item -= 1;
-                                self.sync_picker_selection();
-                                self.refresh_picker_summary();
-                                self.prepare_overview_for_session(agent);
-                            }
-                        }
-                        ViewFocus::Nav => {
-                            if self.browser_selected_nav > 0 {
-                                self.browser_selected_nav -= 1;
-                            }
-                            self.update_browser_preview_from_nav();
-                        }
-                        ViewFocus::Content => {
-                            let on_harness = self.browser_nav_items.get(self.browser_selected_nav)
-                                .map(|it| it.kind == NavItemKind::Harness).unwrap_or(false);
-                            if on_harness {
-                                self.left_scroll = self.left_scroll.saturating_sub(1);
-                            } else {
-                                self.browser_wiki_scroll = self.browser_wiki_scroll.saturating_sub(1);
-                            }
+                match self.view_focus {
+                    ViewFocus::Picker => {
+                        if self.picker.selected_item > 0 {
+                            self.picker.selected_item -= 1;
+                            self.sync_picker_selection();
+                            self.refresh_picker_summary();
+                            self.prepare_overview_for_session(agent);
                         }
                     }
-                    self.needs_redraw = true;
-                    return true;
+                    ViewFocus::Nav => {
+                        if self.browser_selected_nav > 0 {
+                            self.browser_selected_nav -= 1;
+                        }
+                        self.update_browser_preview_from_nav();
+                    }
+                    ViewFocus::Content => {
+                        if self.browser_selected_is_harness() {
+                            self.left_scroll = self.left_scroll.saturating_sub(1);
+                        } else {
+                            self.browser_wiki_scroll = self.browser_wiki_scroll.saturating_sub(1);
+                        }
+                    }
                 }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                match self.view_focus {
+                    ViewFocus::Picker => {
+                        if self.picker.selected_item + 1 < self.picker.picker_items.len() {
+                            self.picker.selected_item += 1;
+                            self.sync_picker_selection();
+                            self.refresh_picker_summary();
+                            self.prepare_overview_for_session(agent);
+                        }
+                    }
+                    ViewFocus::Nav => {
+                        if self.browser_selected_nav + 1 < self.browser_nav_items.len() {
+                            self.browser_selected_nav += 1;
+                        }
+                        self.update_browser_preview_from_nav();
+                    }
+                    ViewFocus::Content => {
+                        if self.browser_selected_is_harness() {
+                            self.left_scroll = self.left_scroll.saturating_add(1);
+                        } else {
+                            self.browser_wiki_scroll = self.browser_wiki_scroll.saturating_add(1);
+                        }
+                    }
+                }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                match self.view_focus {
+                    ViewFocus::Picker => {
+                        self.desktop.exit_overview_to_splash();
+                        self.splash_focus = SplashFocus::Picker;
+                    }
+                    ViewFocus::Nav => {
+                        self.view_focus = ViewFocus::Picker;
+                    }
+                    ViewFocus::Content => {
+                        self.view_focus = ViewFocus::Nav;
+                    }
+                }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                match self.view_focus {
+                    ViewFocus::Picker => {
+                        self.view_focus = ViewFocus::Nav;
+                    }
+                    ViewFocus::Nav => {
+                        self.focus_overview_to_content();
+                    }
+                    ViewFocus::Content => {
+                        if self.browser_selected_is_harness() {
+                            self.activate_overview_harness_session(agent);
+                        } else {
+                            self.enter_wiki_from_overview_content();
+                        }
+                    }
+                }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Enter => {
+                if self.view_focus == ViewFocus::Content {
+                    if self.browser_selected_is_harness() {
+                        self.reset_left_pane_for_harness();
+                        self.activate_overview_harness_session(agent);
+                    } else {
+                        self.enter_wiki_viewer();
+                    }
+                } else if self.view_focus == ViewFocus::Nav {
+                    self.view_focus = ViewFocus::Content;
+                } else {
+                    let item = self.picker.picker_items.get(self.picker.selected_item).cloned();
+                    self.sync_picker_selection();
+                    if let Some(item) = item {
+                        if item.session_id.is_some() || item.depth == 1 {
+                            self.activate_selected_session(agent);
+                        }
+                    }
+                }
+                self.needs_redraw = true;
+                true
+            }
+            KeyCode::Tab => {
+                self.view_focus = match self.view_focus {
+                    ViewFocus::Picker => ViewFocus::Nav,
+                    ViewFocus::Nav => ViewFocus::Content,
+                    ViewFocus::Content => ViewFocus::Picker,
+                };
+                if self.view_focus == ViewFocus::Content && self.browser_selected_is_harness() {
+                    self.reset_left_pane_for_harness();
+                }
+                self.needs_redraw = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_picker_screen_key(
+        &mut self,
+        key: KeyCode,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        use crate::app_state::{PickerFocus, SplashFocus};
+        match key {
+            KeyCode::Up | KeyCode::Char('k') => {
                 match self.picker.focus {
                     PickerFocus::Tree => {
                         if self.picker.selected_item > 0 {
                             self.picker.selected_item -= 1;
                             self.sync_picker_selection();
                             self.refresh_picker_summary();
-                            if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                                self.prepare_overview_for_session(agent);
-                            }
                         }
                     }
                     PickerFocus::Summary => {
@@ -2020,44 +2251,12 @@ impl App {
                 true
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                    match self.view_focus {
-                        ViewFocus::Picker => {
-                            if self.picker.selected_item + 1 < self.picker.picker_items.len() {
-                                self.picker.selected_item += 1;
-                                self.sync_picker_selection();
-                                self.refresh_picker_summary();
-                                self.prepare_overview_for_session(agent);
-                            }
-                        }
-                        ViewFocus::Nav => {
-                            if self.browser_selected_nav + 1 < self.browser_nav_items.len() {
-                                self.browser_selected_nav += 1;
-                            }
-                            self.update_browser_preview_from_nav();
-                        }
-                        ViewFocus::Content => {
-                            let on_harness = self.browser_nav_items.get(self.browser_selected_nav)
-                                .map(|it| it.kind == NavItemKind::Harness).unwrap_or(false);
-                            if on_harness {
-                                self.left_scroll = self.left_scroll.saturating_add(1);
-                            } else {
-                                self.browser_wiki_scroll = self.browser_wiki_scroll.saturating_add(1);
-                            }
-                        }
-                    }
-                    self.needs_redraw = true;
-                    return true;
-                }
                 match self.picker.focus {
                     PickerFocus::Tree => {
                         if self.picker.selected_item + 1 < self.picker.picker_items.len() {
                             self.picker.selected_item += 1;
                             self.sync_picker_selection();
                             self.refresh_picker_summary();
-                            if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                                self.prepare_overview_for_session(agent);
-                            }
                         }
                     }
                     PickerFocus::Summary => {
@@ -2070,34 +2269,14 @@ impl App {
                 true
             }
             KeyCode::Left | KeyCode::Char('h') => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                    match self.view_focus {
-                        ViewFocus::Picker => {
-                            self.desktop.exit_overview_to_splash();
-                            self.splash_focus = SplashFocus::Picker;
-                            self.needs_redraw = true;
-                            return true;
-                        }
-                        ViewFocus::Nav => {
-                            self.view_focus = ViewFocus::Picker;
-                            self.needs_redraw = true;
-                            return true;
-                        }
-                        ViewFocus::Content => {
-                            self.view_focus = ViewFocus::Nav;
-                            self.needs_redraw = true;
-                            return true;
-                        }
-                    }
+                if self.desktop.active == crate::desktop::ActiveDesktop::Splash
+                    && self.splash_focus == SplashFocus::Picker
+                {
+                    self.splash_focus = SplashFocus::Magenta;
+                    self.needs_redraw = true;
+                    return true;
                 }
-                if self.desktop.active == crate::desktop::ActiveDesktop::Splash {
-                    if self.splash_focus == SplashFocus::Picker {
-                        self.splash_focus = SplashFocus::Magenta;
-                        self.needs_redraw = true;
-                        return true;
-                    }
-                    // on magenta, left may exit to prior (workspace) via caller, fallthrough ok
-                }
+                // on magenta, left may exit to prior (workspace) via caller, fallthrough ok
                 match self.picker.focus {
                     PickerFocus::Summary => {
                         self.picker.focus = PickerFocus::Tree;
@@ -2118,53 +2297,15 @@ impl App {
                             self.prepare_overview_for_session(agent);
                             self.desktop.set_overview();
                             self.view_focus = ViewFocus::Picker;
-                            self.wiki_viewer.session_id = self.picker.sessions.get(self.picker.selected_session).map(|m| m.session_id.clone()).unwrap_or_default();
+                            self.wiki_viewer.session_id = self
+                                .picker
+                                .sessions
+                                .get(self.picker.selected_session)
+                                .map(|m| m.session_id.clone())
+                                .unwrap_or_default();
                             self.wiki_viewer.focus = WikiFocus::Nav;
                             self.needs_redraw = true;
                             return true;
-                        } else if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                            // In Screen 2, right cycles focus or snaps from Content
-                            match self.view_focus {
-                                ViewFocus::Picker => {
-                                    self.view_focus = ViewFocus::Nav;
-                                    self.needs_redraw = true;
-                                    return true;
-                                }
-                                ViewFocus::Nav => {
-                                    self.view_focus = ViewFocus::Content;
-                                    if self.browser_nav_items.get(self.browser_selected_nav).map_or(false, |it| it.kind == NavItemKind::Harness) {
-                                        self.left_follow_output = false;
-                                        self.left_scroll = 0;
-                                    }
-                                    self.needs_redraw = true;
-                                    return true;
-                                }
-                                ViewFocus::Content => {
-                                    let on_harness = self.browser_nav_items.get(self.browser_selected_nav)
-                                        .map(|it| it.kind == NavItemKind::Harness).unwrap_or(false);
-                                    if on_harness {
-                                        // Right on conversation pane -> Screen 4 full workspace
-                                        let sid = self.picker.sessions.get(self.picker.selected_session).map(|m| m.session_id.clone());
-                                        if let Some(sid) = sid {
-                                            self.activate_session_by_id(&sid, agent);
-                                        } else {
-                                            self.desktop.set_workspace();
-                                        }
-                                    } else {
-                                        // Right on wiki pane -> Screen 3 (nav + wiki)
-                                        if let Some(item) = self.browser_nav_items.get(self.browser_selected_nav) {
-                                            if item.kind != NavItemKind::Harness {
-                                                self.wiki_viewer.session_id = self.picker.sessions.get(self.picker.selected_session).map(|m| m.session_id.clone()).unwrap_or_default();
-                                                self.wiki_viewer.current_file = item.target_file.clone();
-                                                self.load_wiki_viewer_content();
-                                            }
-                                        }
-                                        self.enter_wiki_viewer();
-                                    }
-                                    self.needs_redraw = true;
-                                    return true;
-                                }
-                            }
                         }
                         self.picker.focus = PickerFocus::Summary;
                         self.picker.summary_scroll = 0;
@@ -2180,38 +2321,6 @@ impl App {
                 true
             }
             KeyCode::Enter => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                    if self.view_focus == ViewFocus::Content {
-                        let on_harness = self.browser_nav_items.get(self.browser_selected_nav)
-                            .map(|it| it.kind == NavItemKind::Harness).unwrap_or(false);
-                        if on_harness {
-                            self.left_follow_output = false;
-                            self.left_scroll = 0;
-                            let sid = self.picker.sessions.get(self.picker.selected_session).map(|m| m.session_id.clone());
-                            if let Some(sid) = sid {
-                                self.activate_session_by_id(&sid, agent);
-                            } else {
-                                self.desktop.set_workspace();
-                            }
-                        } else {
-                            self.enter_wiki_viewer();
-                        }
-                    } else if self.view_focus == ViewFocus::Nav {
-                        // enter on nav item: move focus to content
-                        self.view_focus = ViewFocus::Content;
-                    } else {
-                        // on picker enter: launch like before
-                        let item = self.picker.picker_items.get(self.picker.selected_item).cloned();
-                        self.sync_picker_selection();
-                        if let Some(item) = item {
-                            if item.session_id.is_some() || item.depth == 1 {
-                                self.activate_selected_session(agent);
-                            }
-                        }
-                    }
-                    self.needs_redraw = true;
-                    return true;
-                }
                 match self.picker.focus {
                     PickerFocus::Tree => {
                         let item = self.picker.picker_items.get(self.picker.selected_item).cloned();
@@ -2248,26 +2357,13 @@ impl App {
                 true
             }
             KeyCode::Tab => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Splash && self.splash_focus == SplashFocus::Picker {
+                if self.desktop.active == crate::desktop::ActiveDesktop::Splash
+                    && self.splash_focus == SplashFocus::Picker
+                {
                     // Tab while picker highlighted on splash: slide to 3-col
                     self.prepare_overview_for_session(agent);
                     self.desktop.set_overview();
                     self.wiki_viewer.focus = WikiFocus::Nav;
-                    self.needs_redraw = true;
-                    return true;
-                }
-                if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-                    // Tab cycles focus in Screen 2 like right
-                    let prev = self.view_focus;
-                    self.view_focus = match prev {
-                        ViewFocus::Picker => ViewFocus::Nav,
-                        ViewFocus::Nav => ViewFocus::Content,
-                        ViewFocus::Content => ViewFocus::Picker,
-                    };
-                    if self.view_focus == ViewFocus::Content && self.browser_nav_items.get(self.browser_selected_nav).map_or(false, |it| it.kind == NavItemKind::Harness) {
-                        self.left_follow_output = false;
-                        self.left_scroll = 0;
-                    }
                     self.needs_redraw = true;
                     return true;
                 }
@@ -2426,6 +2522,27 @@ impl App {
         }
     }
 
+    /// Switch focus or move selection in picker. Returns true if handled.
+    pub fn handle_picker_key(
+        &mut self,
+        key: KeyCode,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        if !self.is_picker_key_active() {
+            return false;
+        }
+        if self.handle_splash_magenta_picker_key(key) {
+            return true;
+        }
+        if self.handle_picker_trust_confirm_key(key, agent) {
+            return true;
+        }
+        if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
+            return self.handle_overview_picker_key(key, agent);
+        }
+        self.handle_picker_screen_key(key, agent)
+    }
+
     fn activate_selected_session(&mut self, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) {
         let sess_id = if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
             meta.session_id.clone()
@@ -2478,7 +2595,7 @@ impl App {
         self.focused_pane = Pane::Left;
 
         let banner = format!(
-            "Raven Hotel - Loaded session\nSession: {}\n\nUse ↑/↓ in panes, arrows to navigate, /help for commands.",
+            "Raven Hotel - Loaded session\nSession: {}",
             session_id
         );
         self.left_committed.push(banner);
@@ -2511,6 +2628,9 @@ mod plan_tests {
             .map(|i| PlanStep {
                 description: format!("step {}", i + 1),
                 verification: None,
+                tier: None,
+                note: None,
+                observe_prompt: None,
                 status: PlanStepStatus::Pending,
             })
             .collect()
@@ -2553,36 +2673,18 @@ mod plan_tests {
     }
 
     #[test]
-    fn advance_on_turn_done_normal_and_forced() {
+    fn work_complete_signal_completes_plan() {
         let mut p = PlanState {
             active: true,
             steps: make_steps(3),
-            current_step: 0,
+            current_step: 1,
             ..Default::default()
         };
-        p.advance_on_turn_done("I made some changes");
+        p.complete_on_work_complete_signal("still working");
         assert_eq!(p.current_step, 1);
-        assert!(matches!(p.steps[0].status, PlanStepStatus::Done));
 
-        // Force complete on Done signal
-        p.advance_on_turn_done("**Done!** everything is complete and criteria met");
+        p.complete_on_work_complete_signal("⭐⭐ JUDGE: WORK_COMPLETE: criteria satisfied");
         assert_eq!(p.current_step, 3);
-        assert!(p.steps.iter().all(|s| matches!(s.status, PlanStepStatus::Done)));
-    }
-
-    #[test]
-    fn advance_on_tool_result_forces_on_work_complete() {
-        let mut p = PlanState {
-            active: true,
-            steps: make_steps(2),
-            current_step: 0,
-            ..Default::default()
-        };
-        p.advance_on_tool_result("some normal result");
-        assert_eq!(p.current_step, 1);
-
-        p.advance_on_tool_result("⭐⭐ JUDGE: WORK_COMPLETE: criteria satisfied");
-        assert_eq!(p.current_step, 2);
         assert!(p.steps.iter().all(|s| matches!(s.status, PlanStepStatus::Done)));
     }
 }

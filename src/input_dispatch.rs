@@ -46,7 +46,6 @@ pub struct SlashContext<'a> {
     pub config: &'a Config,
     pub keystore: &'a Keystore,
     pub agent: &'a Arc<Mutex<Agent>>,
-    pub pending_plan_confirmation: &'a mut bool,
 }
 
 fn clear_slash_input(ctx: &mut SlashContext<'_>) {
@@ -66,6 +65,22 @@ pub fn filtered_slash_commands<'a>(
         .iter()
         .filter(|cmd| prefix.is_empty() || cmd.name.starts_with(prefix))
         .collect()
+}
+
+/// Slash commands safe to run while the agent turn is in flight (UI/meta only).
+pub fn slash_ok_while_processing(prompt: &str) -> bool {
+    if !prompt.starts_with('/') {
+        return false;
+    }
+    let parts: Vec<&str> = prompt.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let cmd = parts[0].trim_start_matches('/');
+    matches!(
+        cmd,
+        "approval-mode" | "run-mode" | "status" | "settings" | "search" | "help" | "?"
+    )
 }
 
 /// Dispatch a `/command` prompt. Returns `AgentPrompt` if the text should go to the model.
@@ -188,17 +203,6 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                 "Use ↑/↓ to select approval mode, Enter to confirm, Esc to cancel.".to_string(),
             );
             scroll_left(ctx.left_committed);
-            SlashDispatch::Handled
-        }
-        "plan" => {
-            // Trigger plan mode entry confirmation dialog
-            *ctx.pending_plan_confirmation = true;
-            ctx.left_committed.push("Do you want to enter plan mode? (y/n)".to_string());
-            ctx.input.clear();
-            *ctx.input = "y".to_string();  // prefill; edit to n to cancel
-            *ctx.cursor_pos = ctx.input.len();
-            clear_slash_input(ctx);
-            *ctx.slash_selected = 0;
             SlashDispatch::Handled
         }
         "run-mode" => {
@@ -348,6 +352,10 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
             desc: "Change execution approval mode",
         },
         SlashCommand {
+            name: "plan",
+            desc: "Enter plan mode (/plan status, /plan cancel)",
+        },
+        SlashCommand {
             name: "run-mode",
             desc: "Set run mode (talk, think, research, work, dream, plan)",
         },
@@ -392,6 +400,9 @@ Available commands:
 /reset         Reset conversation memory (session goals stay)
 /status        Show endpoint, model, workspace
 /approval-mode Change execution approval mode (Babysitter / Spring Break / Vegas / Thunderdome)
+/plan          Enter plan mode (optional goal text after /plan)
+/plan status   Show current plan goal, steps, and progress
+/plan cancel   Exit plan mode and clear pending entry
 /run-mode      Set run mode (talk, think, research, work, dream, plan)
 /settings      Manage inference endpoints (add/switch/edit/delete)
 /search        Search conversation or trace (or Ctrl-F)
@@ -508,8 +519,6 @@ mod tests {
         let mut right_scroll = 0;
         let mut left_follow_output = true;
         let mut right_follow_output = true;
-        let mut pending_plan_confirmation = false;
-
         let mut ctx = SlashContext {
             left_committed: &mut left,
             trace_lines: &mut trace,
@@ -537,11 +546,16 @@ mod tests {
             config: &config,
             keystore: &ks,
             agent: &agent,
-            pending_plan_confirmation: &mut pending_plan_confirmation,
         };
         let result = dispatch_slash_command("/status", &mut ctx);
         assert!(matches!(result, SlashDispatch::Handled));
-        assert!(input.is_empty());
-        assert_eq!(cursor_pos, 0);
+    }
+
+    #[test]
+    fn slash_ok_while_processing_whitelists_meta_commands() {
+        assert!(slash_ok_while_processing("/approval-mode"));
+        assert!(slash_ok_while_processing("/run-mode work"));
+        assert!(!slash_ok_while_processing("/plan cancel"));
+        assert!(!slash_ok_while_processing("hello"));
     }
 }

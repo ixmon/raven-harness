@@ -35,6 +35,8 @@ pub enum UiUpdate {
     Thinking(String),
     ToolStart { name: String, args: String },
     ToolResult { name: String, summary: String },
+    /// Plan execution progress (sent while agent mutex is held — no try_lock needed).
+    PlanSync(raven_tui::plan_md::PlanExecutionState),
     RoundLimitHit {
         #[allow(dead_code)]
         continuation: u32,
@@ -55,6 +57,19 @@ pub enum UiUpdate {
         completion_tokens: Option<u32>,
         total_tokens: Option<u32>,
     },
+    /// Plan loop posted an interim status line (e.g. ready-for-proposal message).
+    PlanLoopStatusMessage(String),
+    /// Clarify fetch finished (question or error). `qa_entry` set when user just answered.
+    PlanLoopClarifyDone {
+        result: Result<raven_tui::plan_protocol::PlanModelPayload, String>,
+        qa_entry: Option<raven_tui::plan_protocol::PlanQaEntry>,
+    },
+    /// Proposal fetch finished.
+    PlanLoopProposalDone(Result<raven_tui::plan_protocol::PlanModelPayload, String>),
+    /// User chose to leave structured plan loop during answer classification.
+    PlanLoopExitDiscuss,
+    /// Proceed-gate response classified (proceed / cancel / not revision).
+    PlanLoopProceedClassified(raven_tui::plan_intent::PlanProceedIntent),
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -91,7 +106,7 @@ pub struct TuiObserver {
     pub(crate) instant: Arc<Mutex<Option<String>>>,
     pub(crate) denials_this_turn: u32,
     pub(crate) halt_tools: bool,
-    pub(crate) exec_mode: ExecApprovalMode,
+    pub(crate) exec_mode: Arc<std::sync::Mutex<ExecApprovalMode>>,
 }
 
 #[async_trait]
@@ -103,6 +118,9 @@ impl TurnObserver for TuiObserver {
     }
     fn on_tool_result(&mut self, record: &ActionRecord) {
         let _ = self.tx.try_send(UiUpdate::ToolResult { name: record.tool.clone(), summary: record.summary.clone() });
+    }
+    fn on_plan_sync(&mut self, state: &raven_tui::plan_execution::PlanExecutionState) {
+        let _ = self.tx.try_send(UiUpdate::PlanSync(state.clone()));
     }
     fn on_nudge(&mut self, count: u32, max: u32) {
         let _ = self.tx.try_send(UiUpdate::ToolResult {
@@ -180,7 +198,12 @@ impl TuiObserver {
                 .unwrap_or_default();
             cmd.contains("cd /") || cmd.contains("/etc") || cmd.contains("/root") || cmd.contains("curl ") || cmd.contains("wget ") || cmd.contains("nc ")
         } else { false };
-        match self.exec_mode {
+        let mode = self
+            .exec_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(ExecApprovalMode::Babysitter);
+        match mode {
             ExecApprovalMode::Babysitter => is_mutating,
             ExecApprovalMode::SpringBreak => false,
             ExecApprovalMode::Vegas => name == "exec" && is_outside,
@@ -203,7 +226,17 @@ impl TuiObserver {
             "exec" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
                 let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                format!("exec: {}", truncate(cmd, 72))
+                let lower = cmd.to_lowercase();
+                if lower.contains("sudo")
+                    && (lower.contains("apt") || lower.contains("dnf") || lower.contains("yum") || lower.contains("pacman") || lower.contains("brew"))
+                {
+                    format!(
+                        "Install system package (sudo): {} — approve for agent to install, or deny and install yourself",
+                        truncate(cmd, 56)
+                    )
+                } else {
+                    format!("exec: {}", truncate(cmd, 72))
+                }
             }
             "update_goal" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
@@ -354,8 +387,14 @@ async fn run_app<B: ratatui::backend::Backend>(
         instant: instant_interject.clone(),
         denials_this_turn: 0,
         halt_tools: false,
-        exec_mode: agent.lock().await.current_exec_mode(),
+        exec_mode: app.live_exec_mode.clone(),
     };
+
+    if let Ok(ag) = agent.try_lock() {
+        if let Ok(mut slot) = app.live_exec_mode.lock() {
+            *slot = ag.current_exec_mode();
+        }
+    }
 
     app.needs_redraw = true;
 
@@ -414,6 +453,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.right_scroll = 10_000;
                     app.needs_redraw = true;
                 }
+                UiUpdate::PlanSync(exec) => {
+                    if app.plan.active && !app.plan.steps.is_empty() {
+                        crate::plan_flow::apply_execution_to_plan(&mut app.plan, &exec);
+                        app.needs_redraw = true;
+                    }
+                }
                 UiUpdate::ToolResult { name, summary } => {
                     if name == "system" && summary.contains("JUDGE") {
                         app.trace_lines.push(format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140)));
@@ -426,9 +471,17 @@ async fn run_app<B: ratatui::backend::Backend>(
                         // line of the tool call block/output. No brain icons on tool lines.
                         app.trace_lines.push(format!("   ↳ {}", truncate(&summary, 120)));
                     }
-                    // Advance plan progress on WORK_COMPLETE (or similar strong completion signals)
                     if app.plan.active && !app.plan.steps.is_empty() {
-                        app.plan.advance_on_tool_result(&summary);
+                        if name == "complete_plan_step" {
+                            if let Some(observe) = &app.plan.pending_observe_prompt {
+                                app.left_committed.push(format!(
+                                    "👁 Plan step requires your observation: {}",
+                                    observe
+                                ));
+                            }
+                        } else if summary.contains("WORK_COMPLETE") {
+                            app.plan.complete_on_work_complete_signal(&summary);
+                        }
                         app.needs_redraw = true;
                     }
                     app.right_follow_output = true;
@@ -476,10 +529,21 @@ async fn run_app<B: ratatui::backend::Backend>(
                     if stop_signal.load(Ordering::SeqCst) {
                         stop_signal.store(false, Ordering::SeqCst);
                     }
-                    // Advance plan progress on turn completion
                     if app.plan.active && !app.plan.steps.is_empty() {
-                        app.plan.advance_on_turn_done(&final_text);
+                        if let Ok(ag) = agent.try_lock() {
+                            crate::plan_flow::sync_plan_from_agent(&mut app.plan, &ag);
+                        }
+                        if final_text.contains("WORK_COMPLETE") {
+                            app.plan.complete_on_work_complete_signal(&final_text);
+                        }
                         app.needs_redraw = true;
+                    }
+                    let in_plan_mode = agent
+                        .try_lock()
+                        .map(|ag| ag.current_agent_mode() == "plan")
+                        .unwrap_or(false);
+                    if in_plan_mode && crate::plan_flow::detect_plan_recap_invite(&final_text) {
+                        app.plan.recap_offered = true;
                     }
                     app.needs_redraw = true;
                 }
@@ -511,8 +575,71 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.right_scroll = 10_000;
                     app.needs_redraw = true;
                 }
+                UiUpdate::PlanLoopStatusMessage(msg) => {
+                    if !msg.trim().is_empty() {
+                        app.left_committed.push(msg);
+                    }
+                    app.current_response = "⠋ Drafting proposal…\n".to_string();
+                    app.plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingProposal;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopClarifyDone { result, qa_entry } => {
+                    crate::plan_flow::apply_plan_clarify_done(&mut app, &agent, result, qa_entry);
+                    app.current_response.clear();
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopProposalDone(result) => {
+                    crate::plan_flow::apply_plan_proposal_done(&mut app, &agent, result);
+                    app.current_response.clear();
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopExitDiscuss => {
+                    crate::plan_flow::apply_plan_exit_discuss(&mut app, &agent);
+                    app.current_response.clear();
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopProceedClassified(intent) => {
+                    match intent {
+                        raven_tui::plan_intent::PlanProceedIntent::Proceed => {
+                            crate::plan_flow::confirm_plan_proceed(&mut app, &agent);
+                            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+                            app.plan.pending_proposal = None;
+                            app.plan.recap_offered = false;
+                            app.left_committed
+                                .push("▶ Plan approved — starting execution.".to_string());
+                            app.deferred_agent_prompt = Some(
+                                crate::plan_flow::format_plan_execution_user_prompt(
+                                    &app.plan,
+                                    &config.workspace,
+                                ),
+                            );
+                        }
+                        raven_tui::plan_intent::PlanProceedIntent::Cancel => {
+                            crate::plan_flow::cancel_plan_mode(&mut app, &agent);
+                        }
+                        raven_tui::plan_intent::PlanProceedIntent::ContinuePlanning => {}
+                    }
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
                 _ => {}
             }
+        }
+
+        if let Some(prompt) = app.deferred_agent_prompt.take() {
+            input_handler::spawn_agent_turn(
+                &mut app,
+                &agent,
+                prompt,
+                &stop_signal,
+                &tx,
+                &approval_req_tx,
+                &queued_interject,
+                &instant_interject,
+            );
         }
 
         // Balance updates
@@ -526,8 +653,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         // user approval. We store them so the UI can show the popup and the key
         // handler can respond with Y/N.
         while let Ok((desc, responder)) = approval_req_rx.try_recv() {
-            app.pending_approval = Some(desc);
-            app.approval_responder = Some(responder);
+            app.pending_confirmation = Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
+                description: desc,
+                responder,
+            });
             app.needs_redraw = true;
         }
 
@@ -600,29 +729,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                     // Do not set any boilerplate goal here. The goal must come from the user's
                     // actual planning request captured in the trigger (see input_handler).
                     // Only set safe defaults for the other plan fields if needed.
-                    if app.plan.success_criteria.is_empty() {
-                        app.plan.success_criteria = "Verification passes and goal achieved".to_string();
-                    }
-                    if app.plan.verification_steps.is_empty() {
-                        let g = app.plan.goal.to_lowercase();
-                        if g.contains("python") || g.contains(".py") {
-                            app.plan.verification_steps = vec!["python3 <script>.py".into(), "check script output".into()];
-                        } else if g.contains("c++") || g.contains("cpp") || g.contains("g++") || g.contains("clang") {
-                            app.plan.verification_steps = vec![
-                                "g++ -std=c++17 -Wall -o program program.cpp".into(),
-                                "clang-tidy program.cpp -- -std=c++17".into(),
-                                "./program".into(),
-                            ];
-                        } else {
-                            app.plan.verification_steps = vec!["cargo check".into(), "cargo clippy -- -D warnings".into(), "cargo test".into()];
-                        }
-                    }
-                    if app.plan.rollback.is_empty() {
-                        app.plan.rollback = "git branch + checkpoints".to_string();
-                    }
-                    if app.plan.constraints.is_empty() {
-                        app.plan.constraints = "Stay on feature branch; keep changes reviewable".to_string();
-                    }
+                    crate::plan_flow::apply_plan_field_defaults(
+                        &mut app.plan,
+                        crate::plan_flow::VerificationDefaultsKind::AutoActivate,
+                    );
                     app.plan.steps.clear();
                     app.plan.current_step = 0;
                 }
@@ -633,12 +743,29 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.plan.active = false;
         }
 
+        if app.plan.active
+            && !app.plan.steps.is_empty()
+            && !app.is_processing
+            && agent_mode == "work"
+        {
+            if let Ok(ag) = agent.try_lock() {
+                let wiki = ag
+                    .session()
+                    .as_ref()
+                    .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
+                crate::plan_flow::reconcile_plan_execution(
+                    &mut app.plan,
+                    &ag,
+                    wiki.as_deref(),
+                );
+            }
+        }
+
         let workspace_display = config.workspace.display().to_string();
         let show_gauge = app.is_processing && !stop_signal.load(Ordering::SeqCst);
         let gauge_h = if show_gauge { 1 } else { 0 };
         let overview_harness = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview)
-            && app.browser_nav_items.get(app.browser_selected_nav)
-                .map(|it| it.kind == crate::app_state::NavItemKind::Harness).unwrap_or(false);
+            && app.browser_selected_is_harness();
         let show_status = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Workspace);
         let show_input = show_status
             || (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && app.picker.adding_workspace);
@@ -853,7 +980,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                     if !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                         tui_render::draw_overlays(
-                            f, size, input_area, &app.settings, app.pending_approval.as_deref(),
+                            f, size, input_area, &app.settings, app.pending_confirmation.as_ref(),
                             &app.slash_commands, &app.input, app.slash_selected,
                             app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
                             app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
@@ -886,10 +1013,41 @@ async fn run_app<B: ratatui::backend::Backend>(
                     stop_signal.store(true, Ordering::SeqCst);
                     break;
                 }
-                // Handle tool approval popup (Y/N) before general input
-                if app.handle_approval_key(*k) {
-                    app.needs_redraw = true;
-                    continue;
+                // Handle confirmation modals (tool approval, plan entry, …) before general input
+                match app.handle_confirmation_key(*k) {
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::NotHandled => {}
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::Handled => {
+                        app.needs_redraw = true;
+                        continue;
+                    }
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::PlanEntry {
+                        goal,
+                        confirmed,
+                    } => {
+                        let outcome = crate::plan_flow::apply_plan_entry_modal_response(
+                            &mut app, &agent, goal, confirmed,
+                        );
+                        if matches!(
+                            outcome,
+                            crate::plan_flow::PlanSubmitOutcome::StartPlanLoop
+                                | crate::plan_flow::PlanSubmitOutcome::Continue(_)
+                        ) {
+                            app.is_processing = true;
+                            let backend = {
+                                let ag = agent.lock().await;
+                                ag.llm_backend()
+                            };
+                            crate::plan_flow::spawn_fetch_clarification(
+                                &mut app,
+                                backend,
+                                config.flags.clone(),
+                                config.workspace.display().to_string(),
+                                tx.clone(),
+                            );
+                        }
+                        app.needs_redraw = true;
+                        continue;
+                    }
                 }
             }
             let _ = input_handler::handle_key_event(
