@@ -2,7 +2,11 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use crate::conversation_pane::build_conversation_text;
 use crate::desktop::{ActiveDesktop, DesktopState, SlideDirection};
+use crate::list_pane::{
+    list_focus_border_style, list_selection_style, list_unselected_style, list_visible_offset,
+};
 use crate::markdown_pane::{highlight_markdown_viewport, markdown_viewport, nav_highlight_search};
 use crate::md_render::render_markdown;
 use crate::plan_pane_render::draw_plan_pane;
@@ -19,36 +23,6 @@ use ratatui::{
     layout::Alignment,
     Frame,
 };
-
-const PLAN_ORANGE: Color = Color::Rgb(0xff, 0xc0, 0x40);
-
-fn is_plan_entry_confirm(entry: &str) -> bool {
-    let t = entry.trim();
-    t.starts_with("Enter plan mode?")
-}
-
-fn push_attention_entry(
-    left_text: &mut Text<'static>,
-    entry: &str,
-    highlight_line: Option<usize>,
-    line_idx: &mut usize,
-    fg: Color,
-) {
-    let style = if Some(*line_idx) == highlight_line {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(fg).add_modifier(Modifier::BOLD)
-    };
-    for line in entry.lines() {
-        left_text
-            .lines
-            .push(Line::from(Span::styled(line.to_string(), style)));
-        *line_idx += 1;
-    }
-}
 
 // markdown rendering: see md_render.rs
 
@@ -525,117 +499,8 @@ pub fn draw_left_pane(
 ) {
     *last_left_area = left_area;
 
-    let mut left_text = Text::default();
-    let mut line_idx = 0usize;
-    let mut consecutive_blanks = 0usize;
-
-    for (i, entry) in left_committed.iter().enumerate() {
-        if is_plan_entry_confirm(entry) {
-            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
-        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-            let (prefix_style, body_style) = conversation_entry_styles(entry);
-            let lines_iter: Vec<&str> = entry.lines().collect();
-            for (li, line) in lines_iter.iter().enumerate() {
-                let is_blank = line.trim().is_empty();
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 {
-                        continue;
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                }
-                let style = if Some(line_idx) == highlight_line {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD)
-                } else if li == 0 {
-                    prefix_style
-                } else {
-                    body_style
-                };
-                left_text
-                    .lines
-                    .push(Line::from(Span::styled(line.to_string(), style)));
-                line_idx += 1;
-            }
-        } else {
-            // Rich markdown rendering for assistant and system-ish messages.
-            // This preserves structure/newlines for plans, lists, code, headings, etc.
-            // (User messages stay plain for chat flow.)
-            let md = render_markdown(entry);
-            for mut line in md.lines {
-                if Some(line_idx) == highlight_line {
-                    for sp in &mut line.spans {
-                        sp.style = sp.style
-                            .fg(Color::Black)
-                            .bg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD);
-                    }
-                }
-                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 { /* keep a couple for md separation */ }
-                    else { left_text.lines.push(line); }
-                } else {
-                    consecutive_blanks = 0;
-                    left_text.lines.push(line);
-                }
-                line_idx += 1;
-            }
-        }
-        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
-            left_text.lines.push(Line::from(""));
-            line_idx += 1;
-            consecutive_blanks += 1;
-        }
-    }
-
-    if !current_response.is_empty() {
-        left_text.lines.push(Line::from(Span::styled(
-            "Agent (streaming):",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        )));
-        line_idx += 1;
-
-        let lines: Vec<&str> = current_response.lines().collect();
-        let has_partial = !current_response.ends_with('\n');
-        let complete_count = if has_partial {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len()
-        };
-
-        for line in &lines[..complete_count] {
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
-        }
-
-        if has_partial {
-            if let Some(partial) = lines.last() {
-                left_text.lines.push(Line::from(Span::styled(
-                    partial.to_string(),
-                    Style::default()
-                        .fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
-        }
-    }
+    let mut left_text =
+        build_conversation_text(left_committed, current_response, highlight_line);
 
     let title_str = if draw_frame { "  Conversation" } else { "" };
     let subtitle = if draw_frame {
@@ -765,58 +630,6 @@ pub fn draw_overlays(
         draw_mode_menu(f, input_area, agent_modes, selected_agent_mode_idx, "Run Mode");
     }
     draw_settings_modal(f, screen, settings);
-}
-
-fn conversation_entry_styles(entry: &str) -> (Style, Style) {
-    if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-        (
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xb0, 0xe0, 0xff)),
-        )
-    } else if entry.starts_with("Agent: ") || entry.starts_with("Agent (partial): ") {
-        (
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0)),
-        )
-    } else if entry.contains("ERROR") || entry.starts_with("⚠") {
-        (
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xff, 0xa0, 0xa0)),
-        )
-    } else if entry.starts_with("✅")
-        || entry.starts_with("⛔")
-        || entry.starts_with("⏹")
-        || entry.starts_with("🔒")
-    {
-        (
-            Style::default().fg(Color::Yellow),
-            Style::default().fg(Color::Yellow),
-        )
-    } else if entry.starts_with("Raven Hotel - Loaded session")
-        || entry.starts_with("Use ↑/↓")
-    {
-        // Subtle instructions and initial session banners — keep them visually
-        // separate from actual conversation turns.
-        (
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::DarkGray),
-        )
-    } else if entry.contains("enter plan mode") || entry.contains("Do you want to enter plan mode") || entry.contains("Would you like to enter plan mode") {
-        // Plan mode entry confirmation question — highlighted in orange (same as plan pane) to get attention.
-        (
-            Style::default().fg(PLAN_ORANGE).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xff, 0xd0, 0x80)),
-        )
-    } else {
-        (
-            Style::default().fg(Color::Rgb(0x88, 0x88, 0xaa)),
-            Style::default().fg(Color::Rgb(0x88, 0x88, 0xaa)),
-        )
-    }
 }
 
 fn trace_line_style(line: &str) -> Style {
@@ -1536,27 +1349,17 @@ pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: 
 }
 
 fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], selected: usize, focused: bool) {
-    let nav_border = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let nav_border = list_focus_border_style(focused);
     let mut nav_text = Text::default();
     nav_text.lines.push(Line::from(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
     let sel = selected;
     let nitems = items.len();
     let nav_vis = (area.height as usize).saturating_sub(2).max(1);
-    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
-        0
-    } else if sel + nav_vis / 2 >= nitems {
-        nitems.saturating_sub(nav_vis)
-    } else {
-        sel.saturating_sub(nav_vis / 2)
-    };
+    let nav_off = list_visible_offset(sel, nav_vis, nitems);
     for (i, item) in items.iter().enumerate().skip(nav_off).take(nav_vis) {
         let is_sel = i == sel;
         let style = if is_sel {
-            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
+            list_selection_style()
         } else {
             match item.kind {
                 NavItemKind::Back => Style::default().fg(Color::Yellow),
@@ -1690,22 +1493,16 @@ fn draw_picker_tree(
             };
             let indent = "  ".repeat(item.depth);
             let style = if is_sel {
-                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-            } else if focused {
-                Style::default().fg(Color::White)
+                list_selection_style()
             } else {
-                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+                list_unselected_style(focused)
             };
             let label = format!("{}{}{}", prefix, indent, item.label);
             text.lines.push(Line::from(Span::styled(truncate_str(&label, maxw), style)));
         }
     }
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let border_style = list_focus_border_style(focused);
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -1747,11 +1544,9 @@ fn draw_workspace_column(
             let is_sel = i == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-            } else if focused {
-                Style::default().fg(Color::White)
+                list_selection_style()
             } else {
-                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+                list_unselected_style(focused)
             };
             let label = format!(
                 "{}{} ({} sess)",
@@ -1763,11 +1558,7 @@ fn draw_workspace_column(
         }
     }
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let border_style = list_focus_border_style(focused);
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -1807,11 +1598,9 @@ fn draw_sessions_column(
             let is_sel = i == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-            } else if focused {
-                Style::default().fg(Color::White)
+                list_selection_style()
             } else {
-                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+                list_unselected_style(focused)
             };
             let short_id = &s.session_id[..s.session_id.len().min(28)];
             let label = format!("{}{}  {}", prefix, short_id, &s.updated_at[..s.updated_at.len().min(16)]);
@@ -1819,11 +1608,7 @@ fn draw_sessions_column(
         }
     }
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let border_style = list_focus_border_style(focused);
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -2228,126 +2013,7 @@ fn build_left_text(
     current_response: &str,
     highlight_line: Option<usize>,
 ) -> Text<'static> {
-    let mut left_text = Text::default();
-    let mut line_idx = 0usize;
-    let mut consecutive_blanks = 0usize;
-
-    for (i, entry) in left_committed.iter().enumerate() {
-        if is_plan_entry_confirm(entry) {
-            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
-        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-            let (prefix_style, body_style) = conversation_entry_styles(entry);
-            let lines_iter: Vec<&str> = entry.lines().collect();
-            for (li, line) in lines_iter.iter().enumerate() {
-                let is_blank = line.trim().is_empty();
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 {
-                        continue;
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                }
-                let style = if Some(line_idx) == highlight_line {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD)
-                } else if li == 0 {
-                    prefix_style
-                } else {
-                    body_style
-                };
-                left_text
-                    .lines
-                    .push(Line::from(Span::styled(line.to_string(), style)));
-                line_idx += 1;
-            }
-        } else {
-            let md = render_markdown(entry);
-            for mut line in md.lines {
-                if Some(line_idx) == highlight_line {
-                    for sp in &mut line.spans {
-                        sp.style = sp.style
-                            .fg(Color::Black)
-                            .bg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD);
-                    }
-                }
-                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks <= 2 {
-                        left_text.lines.push(line);
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                    left_text.lines.push(line);
-                }
-                line_idx += 1;
-            }
-        }
-        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
-            left_text.lines.push(Line::from(""));
-            line_idx += 1;
-            consecutive_blanks += 1;
-        }
-    }
-
-    if !current_response.is_empty() {
-        left_text.lines.push(Line::from(Span::styled(
-            "Agent (streaming):",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        )));
-        line_idx += 1;
-
-        let lines: Vec<&str> = current_response.lines().collect();
-        let has_partial = !current_response.ends_with('\n');
-        let complete_count = if has_partial {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len()
-        };
-
-        for line in &lines[..complete_count] {
-            let is_blank = line.trim().is_empty();
-            if is_blank {
-                consecutive_blanks += 1;
-                if consecutive_blanks > 2 {
-                    continue;
-                }
-            } else {
-                consecutive_blanks = 0;
-            }
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
-        }
-
-        if has_partial {
-            if let Some(partial) = lines.last() {
-                left_text.lines.push(Line::from(Span::styled(
-                    partial.to_string(),
-                    Style::default()
-                        .fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
-        }
-    }
-
-    left_text
+    build_conversation_text(left_committed, current_response, highlight_line)
 }
 
 fn build_right_text(

@@ -46,6 +46,72 @@ use walkdir::WalkDir;
 const RAVEN_HOME: &str = ".raven-hotel";
 const SESSIONS_SUBDIR: &str = "sessions";
 
+/// `~/.raven-hotel`
+pub fn raven_home() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(RAVEN_HOME)
+}
+
+/// `~/.raven-hotel/sessions`
+pub fn sessions_root() -> PathBuf {
+    raven_home().join(SESSIONS_SUBDIR)
+}
+
+/// `~/.raven-hotel/sessions/<session_id>`
+pub fn session_dir(session_id: &str) -> PathBuf {
+    sessions_root().join(session_id)
+}
+
+/// `~/.raven-hotel/sessions/<session_id>/wiki`
+pub fn session_wiki_dir(session_id: &str) -> PathBuf {
+    session_dir(session_id).join("wiki")
+}
+
+/// Read a wiki markdown file for a session by relative path (e.g. `index.md`, `research/notes.md`).
+pub fn read_session_wiki_file(session_id: &str, rel: &str) -> Option<String> {
+    let r = Session::strip_wiki_prefix(rel);
+    let clean_rel = if r.is_empty() || r == "." || r == "/" {
+        "index.md".to_string()
+    } else {
+        r
+    };
+    fs::read_to_string(session_wiki_dir(session_id).join(&clean_rel)).ok()
+}
+
+/// Recursively list `.md` files under a session wiki dir, relative to `wiki/`.
+/// Ensures at least `index.md` is returned when the dir is empty.
+pub fn collect_session_wiki_md_files(session_id: &str) -> Vec<String> {
+    let wiki_dir = session_wiki_dir(session_id);
+    let mut files = Vec::new();
+    collect_wiki_md_recursive(&wiki_dir, &wiki_dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        files.push("index.md".to_string());
+    } else if let Some(pos) = files
+        .iter()
+        .position(|f| f == "index.md" || f.ends_with("/index.md"))
+    {
+        let f = files.remove(pos);
+        files.insert(0, f);
+    }
+    files
+}
+
+fn collect_wiki_md_recursive(dir: &Path, base: &Path, out: &mut Vec<String>) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_wiki_md_recursive(&p, base, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Ok(rel) = p.strip_prefix(base) {
+                    out.push(rel.display().to_string());
+                }
+            }
+        }
+    }
+}
+
 /// Limits for safe discovery (tunable).
 const MAX_FILE_SIZE_FOR_INDEX: u64 = 1024 * 1024; // 1 MiB
 const MAX_DIR_ENTRIES: usize = 350; // if a dir has more immediate children, don't descend
@@ -184,9 +250,7 @@ impl Session {
     /// specific session (including named ones) rather than the workspace's
     /// default id.
     pub fn open(session_id: &str) -> Result<Self> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
-        let dir = base.join(session_id);
+        let dir = session_dir(session_id);
         if !dir.is_dir() {
             anyhow::bail!("session not found: {}", session_id);
         }
@@ -1303,14 +1367,7 @@ pub fn list_sessions_for(workspace: &Path) -> Result<Vec<SessionMeta>> {
 /// Small preview of the session's wiki/index.md (first few lines) for the picker summary pane.
 /// Returns None if the file does not exist or cannot be read.
 pub fn wiki_preview_for_session(session_id: &str, max_lines: usize) -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let base = PathBuf::from(home)
-        .join(RAVEN_HOME)
-        .join(SESSIONS_SUBDIR)
-        .join(session_id)
-        .join("wiki")
-        .join("index.md");
-    let content = fs::read_to_string(&base).ok()?;
+    let content = read_session_wiki_file(session_id, "index.md")?;
     let lines: Vec<&str> = content.lines().take(max_lines).collect();
     if lines.is_empty() {
         return None;

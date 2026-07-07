@@ -322,17 +322,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 if !s.id.is_empty() {
                     let recent = s.load_recent_conversation(25);
                     if !recent.is_empty() {
-                        app.left_committed.clear();
-                        for (role, content) in recent {
-                            let disp = if role == "user" {
-                                format!("> {}", content)
-                            } else {
-                                raven_tui::llm::strip_xml_tool_call_blocks(&content)
-                            };
-                            if !disp.trim().is_empty() {
-                                app.left_committed.push(disp);
-                            }
-                        }
+                        app.left_committed =
+                            crate::conversation_display::format_conversation_lines(&recent);
                     }
                 }
             }

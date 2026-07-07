@@ -967,17 +967,8 @@ impl App {
             // Populate conversation for display when Coding Harness selected in Screen 2
             if let Ok(sess) = raven_tui::session::Session::open(&id) {
                 let recent = sess.load_recent_conversation(18);
-                self.left_committed.clear();
-                for (role, content) in recent {
-                    let disp = if role == "user" {
-                        format!("> {}", content)
-                    } else {
-                        raven_tui::llm::strip_xml_tool_call_blocks(&content)
-                    };
-                    if !disp.trim().is_empty() {
-                        self.left_committed.push(disp);
-                    }
-                }
+                self.left_committed =
+                    crate::conversation_display::format_conversation_lines(&recent);
                 if let Ok(mut ag) = agent.try_lock() {
                     if let Ok(loaded_sess) = raven_tui::session::Session::open(&id) {
                         *ag.session_mut() = Some(loaded_sess);
@@ -988,14 +979,8 @@ impl App {
     }
 
     pub(crate) fn rebuild_browser_nav_for_session(&mut self, session_id: &str) {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let wiki_dir = std::path::PathBuf::from(&home)
-            .join(".raven-hotel")
-            .join("sessions")
-            .join(session_id)
-            .join("wiki");
-
-        let index_content = std::fs::read_to_string(wiki_dir.join("index.md")).unwrap_or_default();
+        let index_content =
+            raven_tui::session::read_session_wiki_file(session_id, "index.md").unwrap_or_default();
 
         self.browser_nav_items = crate::wiki_doc::build_browser_overview_nav(&index_content);
         self.browser_selected_nav = 0;
@@ -1011,15 +996,11 @@ impl App {
                 let sess_id = self.picker.sessions.get(self.picker.selected_session)
                     .map(|m| m.session_id.clone())
                     .unwrap_or_default();
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                let path = std::path::PathBuf::from(&home)
-                    .join(".raven-hotel")
-                    .join("sessions")
-                    .join(sess_id)
-                    .join("wiki")
-                    .join(&item.target_file);
-                self.browser_wiki_content = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|_| format!("(could not read {})", item.target_file));
+                self.browser_wiki_content = raven_tui::session::read_session_wiki_file(
+                    &sess_id,
+                    &item.target_file,
+                )
+                .unwrap_or_else(|| format!("(could not read {})", item.target_file));
             }
         }
         self.browser_wiki_scroll = 0;
@@ -1036,37 +1017,7 @@ impl App {
             self.wiki_viewer.scroll = 0;
             self.wiki_viewer.selected_nav = 0;
 
-            // Load list of wiki files (best effort) -- recursive to support subdirs the agent may create (e.g. research/)
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let wiki_dir = std::path::PathBuf::from(home)
-                .join(".raven-hotel").join("sessions").join(&id).join("wiki");
-            fn collect_md(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
-                if let Ok(rd) = std::fs::read_dir(dir) {
-                    for e in rd.flatten() {
-                        let p = e.path();
-                        if p.is_dir() {
-                            collect_md(&p, base, out);
-                        } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
-                            if let Ok(rel) = p.strip_prefix(base) {
-                                out.push(rel.display().to_string());
-                            }
-                        }
-                    }
-                }
-            }
-            let mut files = vec![];
-            collect_md(&wiki_dir, &wiki_dir, &mut files);
-            files.sort();
-            if files.is_empty() {
-                files.push("index.md".to_string());
-            } else {
-                // Put the entrypoint index.md first in nav for easier "up" access
-                if let Some(pos) = files.iter().position(|f| f == "index.md" || f.ends_with("/index.md") || f.ends_with("index.md")) {
-                    let f = files.remove(pos);
-                    files.insert(0, f);
-                }
-            }
-            self.wiki_viewer.files = files;
+            self.wiki_viewer.files = raven_tui::session::collect_session_wiki_md_files(&id);
 
             // Load initial content and build nav elements (links + headings)
             self.load_wiki_viewer_content();
@@ -1085,16 +1036,12 @@ impl App {
         if self.wiki_viewer.session_id.is_empty() {
             return;
         }
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
         let clean = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
-        let path = std::path::PathBuf::from(home)
-            .join(".raven-hotel")
-            .join("sessions")
-            .join(&self.wiki_viewer.session_id)
-            .join("wiki")
-            .join(&clean);
-        self.wiki_viewer.content = std::fs::read_to_string(&path)
-            .unwrap_or_else(|_| format!("(could not read {})", clean));
+        self.wiki_viewer.content = raven_tui::session::read_session_wiki_file(
+            &self.wiki_viewer.session_id,
+            &clean,
+        )
+        .unwrap_or_else(|| format!("(could not read {})", clean));
         self.wiki_viewer.current_file = clean;
         // nav rebuilt by caller after content change in most paths; safe to call here too
         self.rebuild_wiki_viewer_nav();
@@ -1450,12 +1397,8 @@ impl App {
 
             let summary_text = if self.picker.show_wiki_in_summary {
                 // When Wiki button active, show ONLY the wiki markdown, no session meta
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                let path = std::path::PathBuf::from(&home)
-                    .join(".raven-hotel").join("sessions").join(&session_id)
-                    .join("wiki").join(&wiki_file);
-                match std::fs::read_to_string(&path) {
-                    Ok(c) => {
+                match raven_tui::session::read_session_wiki_file(&session_id, &wiki_file) {
+                    Some(c) => {
                         self.picker.current_wiki_content = c.clone();
                         self.picker.wiki_links = crate::wiki_doc::extract_links(&c);
                         self.picker.wiki_content_start = 0;
@@ -1468,7 +1411,7 @@ impl App {
                         };
                         head  // pure content for clean wiki display (no meta, no header line)
                     }
-                    Err(_) => {
+                    None => {
                         self.picker.current_wiki_content.clear();
                         self.picker.wiki_links.clear();
                         self.picker.active_link_idx = 0;
@@ -1563,14 +1506,7 @@ impl App {
         // (the embedded preview in .summary is truncated)
         let _content = String::new();
         if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-            let path = std::path::PathBuf::from(&home)
-                .join(".raven-hotel")
-                .join("sessions")
-                .join(&meta.session_id)
-                .join("wiki")
-                .join(&wiki_file);
-            let _ = std::fs::read_to_string(&path);
+            let _ = raven_tui::session::read_session_wiki_file(&meta.session_id, &wiki_file);
         }
 
         // Use the active link (first visible one) instead of rescanning
@@ -2100,12 +2036,8 @@ impl App {
                             } else {
                                 self.picker.current_wiki_file.clone()
                             };
-                            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                            let wiki_path = std::path::PathBuf::from(home)
-                                .join(".raven-hotel").join("sessions").join(sid)
-                                .join("wiki").join(&wiki_file);
-                            let content = std::fs::read_to_string(&wiki_path)
-                                .unwrap_or_else(|_| format!("(no {wiki_file} yet — agent can create one with write_wiki)"));
+                            let content = raven_tui::session::read_session_wiki_file(sid, &wiki_file)
+                                .unwrap_or_else(|| format!("(no {wiki_file} yet — agent can create one with write_wiki)"));
                             self.left_committed.push(format!("=== Wiki: {} ===\n{}", wiki_file, content));
                             self.left_follow_output = true;
                             self.left_scroll = 10_000;
@@ -2182,18 +2114,8 @@ impl App {
         };
 
         // Load recent conv history from log for UI display (prevents blank on re-select/reopen)
-        self.left_committed.clear();
         let recent = loaded_sess.load_recent_conversation(25);
-        for (role, content) in recent {
-            let disp = if role == "user" {
-                format!("> {}", content)
-            } else {
-                raven_tui::llm::strip_xml_tool_call_blocks(&content)
-            };
-            if !disp.trim().is_empty() {
-                self.left_committed.push(disp);
-            }
-        }
+        self.left_committed = crate::conversation_display::format_conversation_lines(&recent);
 
         if let Ok(mut ag) = agent.try_lock() {
             *ag.session_mut() = Some(loaded_sess);
@@ -2223,11 +2145,7 @@ impl App {
 }
 
 fn remove_session_dir(session_id: &str) -> std::io::Result<()> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let dir = std::path::PathBuf::from(home)
-        .join(".raven-hotel")
-        .join("sessions")
-        .join(session_id);
+    let dir = raven_tui::session::session_dir(session_id);
     if dir.exists() {
         std::fs::remove_dir_all(dir)
     } else {
