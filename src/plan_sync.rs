@@ -34,7 +34,10 @@ fn apply_data_to_plan_step(step: &mut PlanStep, data: &PlanStepData) {
 
 pub fn plan_state_to_execution(plan: &PlanState, workspace: &Path) -> PlanExecutionState {
     let steps: Vec<PlanStepData> = plan.steps.iter().map(plan_step_to_data).collect();
-    let project_workdir = plan_execution::detect_project_workdir(workspace, &steps);
+    let project_workdir = plan
+        .project_workdir
+        .clone()
+        .or_else(|| plan_execution::detect_project_workdir(workspace, &steps));
     PlanExecutionState {
         active: plan.active && !plan.steps.is_empty(),
         steps,

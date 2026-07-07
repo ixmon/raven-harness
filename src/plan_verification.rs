@@ -2,7 +2,7 @@
 
 use crate::plan_execution::infer_project_workdir_from_steps;
 use crate::plan_md::PlanStepData;
-use crate::plan_protocol::{PlanProposal, PlanProposalStep};
+use crate::plan_protocol::{PlanProposal, PlanProposalStep, PlanQaEntry};
 
 /// Result of harness-side proposal improvement (before user sees the recap).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -14,6 +14,117 @@ pub struct ProposalImprovementReport {
 }
 
 const VERIFICATION_RETRY_NUDGE_HEADER: &str = "\n\nYour proposal had invalid step verifications. Resubmit ONLY the corrected proposal JSON.\n";
+
+fn is_plausible_dir_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !matches!(
+            name,
+            "src" | "include" | "build" | "the" | "here" | "a" | "an" | "this" | "that"
+        )
+}
+
+/// Extract `./dirname` from free text (e.g. user said "everything in ./galaga/").
+pub fn extract_project_workdir_from_text(text: &str) -> Option<String> {
+    let mut search = 0usize;
+    while let Some(rel) = text[search..].find("./") {
+        let start = search + rel + 2;
+        let rest = &text[start..];
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if is_plausible_dir_name(&name) {
+            return Some(name);
+        }
+        search = start;
+    }
+
+    let lower = text.to_lowercase();
+    for marker in [
+        "subdirectory here ",
+        "subdirectory ",
+        "project directory ",
+        "project root ",
+        "directory ",
+    ] {
+        if let Some(idx) = lower.find(marker) {
+            let rest = &text[idx + marker.len()..];
+            if let Some(wd) = extract_project_workdir_from_text(rest) {
+                return Some(wd);
+            }
+            let name: String = rest
+                .trim()
+                .trim_matches(|c: char| matches!(c, '.' | '/' | '`' | '"'))
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if is_plausible_dir_name(&name) {
+                return Some(name);
+            }
+        }
+    }
+
+    None
+}
+
+/// Prefer explicit user directory choices from clarify Q&A, then the initial request.
+pub fn resolve_project_workdir_from_context(
+    initial_request: &str,
+    history: &[PlanQaEntry],
+) -> Option<String> {
+    for entry in history.iter().rev() {
+        if let Some(wd) = extract_project_workdir_from_text(&entry.user_input) {
+            return Some(wd);
+        }
+        if let Some(wd) = extract_project_workdir_from_text(&entry.resolution) {
+            return Some(wd);
+        }
+    }
+    extract_project_workdir_from_text(initial_request)
+}
+
+/// Resolve deliverable subdirectory: user context first, then step-path inference.
+pub fn resolve_project_workdir(
+    initial_request: &str,
+    history: &[PlanQaEntry],
+    steps: &[PlanProposalStep],
+) -> Option<String> {
+    resolve_project_workdir_from_context(initial_request, history).or_else(|| {
+        infer_project_workdir_from_steps(&proposal_steps_as_data(steps))
+    })
+}
+
+/// Prompt section injected when the user named a project subdirectory.
+pub fn format_project_workdir_prompt_section(workdir: &str) -> String {
+    format!(
+        "\n\n**User-specified project directory:** `{workdir}/`\n\
+         - ALL source files, build files, and assets MUST live under `{workdir}/`.\n\
+         - Step verifications use paths relative to `{workdir}/` (e.g. `src/main.cpp`, not `{workdir}/src/main.cpp`).\n\
+         - Put this in `constraints` (e.g. \"All deliverables under `{workdir}/`\").\n\
+         - First step should create `{workdir}/` if it does not exist yet.\n"
+    )
+}
+
+fn ensure_constraints_mention_workdir(proposal: &mut PlanProposal, workdir: &str) {
+    let note = format!("All deliverables live under `{workdir}/` (project root for this plan).");
+    match proposal.constraints.as_mut() {
+        Some(c) if c.contains(workdir) => {}
+        Some(c) => {
+            if !c.trim().is_empty() {
+                c.push('\n');
+            }
+            c.push_str(&note);
+        }
+        None => {
+            proposal.constraints = Some(note);
+        }
+    }
+}
 
 /// True when verification replays file/directory creation instead of proving an outcome.
 pub fn is_creation_verification(verification: &str) -> bool {
@@ -245,9 +356,18 @@ pub fn format_validation_retry_nudge(errors: &[String]) -> String {
 }
 
 /// Auto-upgrade weak verifications and normalize paths. Mutates `proposal` in place.
-pub fn improve_proposal(proposal: &mut PlanProposal) -> ProposalImprovementReport {
+pub fn improve_proposal(
+    proposal: &mut PlanProposal,
+    context_workdir: Option<&str>,
+) -> ProposalImprovementReport {
     let mut report = ProposalImprovementReport::default();
-    let workdir = infer_project_workdir_from_steps(&proposal_steps_as_data(&proposal.steps));
+    let workdir = context_workdir
+        .map(str::to_string)
+        .or_else(|| infer_project_workdir_from_steps(&proposal_steps_as_data(&proposal.steps)));
+
+    if let Some(wd) = workdir.as_deref() {
+        ensure_constraints_mention_workdir(proposal, wd);
+    }
 
     for (i, step) in proposal.steps.iter_mut().enumerate() {
         let n = i + 1;
@@ -318,6 +438,31 @@ mod tests {
     }
 
     #[test]
+    fn extracts_galaga_from_dot_slash() {
+        assert_eq!(
+            extract_project_workdir_from_text("how about a subdirectory here ./galaga"),
+            Some("galaga".into())
+        );
+        assert_eq!(
+            extract_project_workdir_from_text("Build game in ./galaga/ directory"),
+            Some("galaga".into())
+        );
+        assert!(extract_project_workdir_from_text("similar to the galaga video game").is_none());
+    }
+
+    #[test]
+    fn context_workdir_wins_over_step_inference() {
+        let history = vec![crate::plan_protocol::PlanQaEntry {
+            question_id: "loc".into(),
+            question_prompt: "Where?".into(),
+            user_input: "use ./galaga".into(),
+            resolution: "Free text: use ./galaga".into(),
+        }];
+        let wd = resolve_project_workdir_from_context("build a galaga clone", &history);
+        assert_eq!(wd.as_deref(), Some("galaga"));
+    }
+
+    #[test]
     fn upgrades_cat_redirect_to_file_exists() {
         let mut p = sample_proposal(vec![PlanProposalStep {
             description: "Create CMakeLists".into(),
@@ -326,7 +471,7 @@ mod tests {
             prompt: None,
             note: None,
         }]);
-        let r = improve_proposal(&mut p);
+        let r = improve_proposal(&mut p, Some("galaga"));
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(p.steps[0].tier.as_deref(), Some("check"));
         assert_eq!(
@@ -345,12 +490,23 @@ mod tests {
             prompt: None,
             note: None,
         }]);
-        let r = improve_proposal(&mut p);
+        let r = improve_proposal(&mut p, Some("galaga"));
         assert!(r.errors.is_empty());
         assert_eq!(p.steps[0].tier.as_deref(), Some("exec"));
         assert_eq!(
             p.steps[0].verification.as_deref(),
             Some("test -d src && test -d include")
+        );
+    }
+
+    #[test]
+    fn ensure_constraints_mentions_workdir() {
+        let mut p = sample_proposal(vec![]);
+        improve_proposal(&mut p, Some("galaga"));
+        assert!(
+            p.constraints
+                .as_deref()
+                .is_some_and(|c| c.contains("galaga/"))
         );
     }
 
@@ -363,7 +519,7 @@ mod tests {
             prompt: None,
             note: None,
         }]);
-        let r = improve_proposal(&mut p);
+        let r = improve_proposal(&mut p, None);
         assert_eq!(r.errors.len(), 1);
         assert!(r.errors[0].contains("requires a verification"));
     }

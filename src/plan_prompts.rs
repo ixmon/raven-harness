@@ -24,7 +24,10 @@ pub fn format_plan_execution_user_prompt(plan: &PlanState, workspace: &Path) -> 
         .iter()
         .map(crate::plan_sync::plan_step_to_data)
         .collect();
-    let workdir = plan_execution::detect_project_workdir(workspace, &steps_data);
+    let workdir = plan
+        .project_workdir
+        .clone()
+        .or_else(|| plan_execution::detect_project_workdir(workspace, &steps_data));
     lines.push(String::new());
     lines.push(plan_execution::format_deliverable_location_section(
         workspace,

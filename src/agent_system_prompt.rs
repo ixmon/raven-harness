@@ -88,6 +88,7 @@ You MUST end the list with exactly this sentence (replace X with your recommende
 - Verification must prove the step worked, not repeat how you would create it.
 - File created → `check` + `file_exists:<path>`. Code written → `check` + `grep:<symbol>:<path>`. Dirs created → `exec` + `test -d <path>`.
 - Prefer a compile/build step (`exec`) after file-writing steps so empty files are caught early.
+- When the user names a project subdirectory (e.g. `./galaga/`), treat that as the project root — all `write`/`patch` paths and verifications are relative to it. Record it in plan constraints.
 
 **Structured steps in wiki/plan.md**
 - Maintain steps in the `<!-- plan-steps:json ... -->` block under `## Steps` (see the template written on plan entry).

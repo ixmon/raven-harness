@@ -8,7 +8,7 @@ use raven_tui::plan_intent::{
     is_explicit_proceed_approval, PlanAnswerResolution, PlanEntryIntent, PlanProceedIntent,
 };
 use raven_tui::plan_loop::{fetch_clarification, fetch_proposal};
-use raven_tui::plan_verification::improve_proposal;
+use raven_tui::plan_verification::{improve_proposal, resolve_project_workdir};
 use raven_tui::plan_protocol::{
     format_proposal_for_user, format_question_for_user, PlanModelPayload, PlanProposal,
     PlanProposalStep, PlanQaEntry,
@@ -167,6 +167,7 @@ pub fn reset_plan_for_new_request(plan: &mut PlanState) {
     plan.verification_steps.clear();
     plan.rollback.clear();
     plan.constraints.clear();
+    plan.project_workdir = None;
     plan.steps.clear();
     plan.current_step = 0;
     plan.recap_offered = false;
@@ -578,12 +579,21 @@ pub fn handle_plan_loop_model_payload(
 }
 
 fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal: PlanProposal) {
-    let report = improve_proposal(&mut proposal);
+    let workdir = resolve_project_workdir(
+        &app.plan.initial_request,
+        &app.plan.qa_history,
+        &proposal.steps,
+    );
+    app.plan.project_workdir = workdir.clone();
+    let report = improve_proposal(&mut proposal, workdir.as_deref());
     apply_proposal_to_plan(&mut app.plan, &proposal);
     app.plan.pending_proposal = Some(proposal.clone());
     app.plan.recap_offered = true;
     app.plan.loop_phase = PlanLoopPhase::AwaitingProceedConsent;
     let mut recap = format_proposal_for_user(&proposal);
+    if let Some(wd) = &app.plan.project_workdir {
+        recap.push_str(&format!("\n\n📁 **Project directory:** `{wd}/` (all deliverables here)\n"));
+    }
     if !report.fixes.is_empty() {
         recap.push_str("\n\n⚙ Harness adjusted verifications:\n");
         for fix in &report.fixes {

@@ -8,7 +8,10 @@ use crate::plan_protocol::{
     text_for_plan_json_parse, PlanModelPayload, PlanQaEntry, PlanQuestion,
     PlanQuestionOption,
 };
-use crate::plan_verification::{format_validation_retry_nudge, improve_proposal};
+use crate::plan_verification::{
+    format_project_workdir_prompt_section, format_validation_retry_nudge, improve_proposal,
+    resolve_project_workdir, resolve_project_workdir_from_context,
+};
 use crate::runtime::RuntimeFlags;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -172,19 +175,36 @@ Example steps for a C++ game in subdirectory `galaga/`:
 
 Other rules:
 - Keep JSON compact: short strings, max 10 steps, omit optional fields when empty
-- Paths in verifications are relative to the project root (e.g. `src/foo.cpp`), not `galaga/src/...` when the project lives in `galaga/`
+- When the user names a project subdirectory (e.g. `./galaga/`), that directory IS the project root — all files and verifications are relative to it (`src/foo.cpp`, not workspace-root paths)
+- If a **User-specified project directory** block appears below, follow it exactly and record it in `constraints`
 - Every step needs tier + verification (or `prompt` for observe)
 - Include package-install steps if user chose agent install"#;
 
-fn clarify_user_prompt(initial_request: &str, history_text: &str, workspace: &str) -> String {
+fn clarify_user_prompt(
+    initial_request: &str,
+    history_text: &str,
+    workspace: &str,
+    project_workdir: Option<&str>,
+) -> String {
+    let workdir_section = project_workdir
+        .map(format_project_workdir_prompt_section)
+        .unwrap_or_default();
     format!(
-        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nPrior clarifications:\n{history_text}\n\nEmit the next JSON response."
+        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nPrior clarifications:\n{history_text}{workdir_section}\n\nEmit the next JSON response."
     )
 }
 
-fn proposal_user_prompt(initial_request: &str, history_text: &str, workspace: &str) -> String {
+fn proposal_user_prompt(
+    initial_request: &str,
+    history_text: &str,
+    workspace: &str,
+    project_workdir: Option<&str>,
+) -> String {
+    let workdir_section = project_workdir
+        .map(format_project_workdir_prompt_section)
+        .unwrap_or_default();
     format!(
-        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nClarifications resolved:\n{history_text}\n\nEmit the full proposal JSON."
+        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nClarifications resolved:\n{history_text}{workdir_section}\n\nEmit the full proposal JSON."
     )
 }
 
@@ -203,7 +223,13 @@ pub async fn fetch_clarification(
         }
     }
     let history_text = format_qa_history_for_prompt(history);
-    let user = clarify_user_prompt(initial_request, &history_text, workspace);
+    let workdir_hint = resolve_project_workdir_from_context(initial_request, history);
+    let user = clarify_user_prompt(
+        initial_request,
+        &history_text,
+        workspace,
+        workdir_hint.as_deref(),
+    );
     match fetch_plan_payload(
         backend,
         CLARIFY_SYSTEM,
@@ -250,13 +276,20 @@ pub async fn fetch_proposal(
         }
     }
     let history_text = format_qa_history_for_prompt(history);
-    let user = proposal_user_prompt(initial_request, &history_text, workspace);
+    let workdir_hint = resolve_project_workdir_from_context(initial_request, history);
+    let user = proposal_user_prompt(
+        initial_request,
+        &history_text,
+        workspace,
+        workdir_hint.as_deref(),
+    );
     let payload = fetch_proposal_payload(backend, &user).await?;
     let PlanModelPayload::Proposal(mut proposal) = payload else {
         return Ok(payload);
     };
 
-    let first_report = improve_proposal(&mut proposal);
+    let workdir = resolve_project_workdir(initial_request, history, &proposal.steps);
+    let first_report = improve_proposal(&mut proposal, workdir.as_deref());
     if first_report.errors.is_empty() {
         return Ok(PlanModelPayload::Proposal(proposal));
     }
@@ -265,7 +298,9 @@ pub async fn fetch_proposal(
     let retry_user = format!("{user}{nudge}");
     match fetch_proposal_payload(backend, &retry_user).await {
         Ok(PlanModelPayload::Proposal(mut retry)) => {
-            let retry_report = improve_proposal(&mut retry);
+            let retry_workdir =
+                resolve_project_workdir(initial_request, history, &retry.steps);
+            let retry_report = improve_proposal(&mut retry, retry_workdir.as_deref());
             if retry_report.errors.len() <= first_report.errors.len() {
                 Ok(PlanModelPayload::Proposal(retry))
             } else {

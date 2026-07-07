@@ -84,6 +84,8 @@ pub struct PlanState {
     pub verification_steps: Vec<String>,
     pub rollback: String,
     pub constraints: String,
+    /// User-chosen or inferred deliverable subdirectory (e.g. `galaga`).
+    pub project_workdir: Option<String>,
     pub steps: Vec<PlanStep>,
     pub current_step: usize,
     pub spinner_tick: usize,
