@@ -455,7 +455,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
                 UiUpdate::PlanSync(exec) => {
                     if app.plan.active && !app.plan.steps.is_empty() {
-                        crate::plan_flow::apply_execution_to_plan(&mut app.plan, &exec);
+                        crate::plan_sync::apply_execution_to_plan(&mut app.plan, &exec);
                         app.needs_redraw = true;
                     }
                 }
@@ -531,7 +531,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                     if app.plan.active && !app.plan.steps.is_empty() {
                         if let Ok(ag) = agent.try_lock() {
-                            crate::plan_flow::sync_plan_from_agent(&mut app.plan, &ag);
+                            crate::plan_sync::sync_plan_from_agent(&mut app.plan, &ag);
                         }
                         if final_text.contains("WORK_COMPLETE") {
                             app.plan.complete_on_work_complete_signal(&final_text);
@@ -753,7 +753,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     .session()
                     .as_ref()
                     .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
-                crate::plan_flow::reconcile_plan_execution(
+                crate::plan_sync::reconcile_plan_execution(
                     &mut app.plan,
                     &ag,
                     wiki.as_deref(),

@@ -21,8 +21,7 @@ use tokio::sync::Mutex as TokioMutex;
 use crate::plan_flow::{
     dispatch_plan_slash, format_plan_execution_user_prompt,
     plan_loop_active, route_plan_entry_intent, spawn_plan_answer_submit,
-    reconcile_plan_execution, spawn_proceed_feedback_work, submit_plan_loop_input,
-    sync_plan_from_agent, sync_plan_to_agent,
+    spawn_proceed_feedback_work, submit_plan_loop_input,
     PlanInputRouting, PlanLoopUserOutcome,
 };
 
@@ -567,7 +566,7 @@ async fn handle_input_key(
                 if app.plan.pending_observe_prompt.is_some() {
                     if let Ok(mut ag) = agent.try_lock() {
                         if let Some(msg) = ag.apply_user_observation(&prompt) {
-                            sync_plan_from_agent(&mut app.plan, &ag);
+                            crate::plan_sync::sync_plan_from_agent(&mut app.plan, &ag);
                             app.left_committed.push(format!("> {}", prompt));
                             app.left_committed.push(msg.clone());
                             ag.push_message(
@@ -823,8 +822,8 @@ pub fn spawn_agent_turn(
             .session()
             .as_ref()
             .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
-        reconcile_plan_execution(&mut app.plan, &ag, wiki.as_deref());
-        sync_plan_to_agent(&mut ag, &app.plan, &workspace);
+        crate::plan_sync::reconcile_plan_execution(&mut app.plan, &ag, wiki.as_deref());
+        crate::plan_sync::sync_plan_to_agent(&mut ag, &app.plan, &workspace);
     }
 
     tokio::spawn(async move {
