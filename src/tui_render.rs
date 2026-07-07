@@ -3,8 +3,11 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::desktop::{ActiveDesktop, DesktopState, SlideDirection};
+use crate::markdown_pane::{highlight_markdown_viewport, markdown_viewport, nav_highlight_search};
+use crate::md_render::render_markdown;
 use crate::plan_pane_render::draw_plan_pane;
 use crate::plan_state::PlanState;
+use crate::wiki_doc::{NavItemKind, WikiLink, WikiNavItem};
 use crate::input_dispatch::SlashCommand;
 use crate::settings_modal::{draw_settings_modal, SettingsModal};
 use ratatui::{
@@ -47,378 +50,7 @@ fn push_attention_entry(
     }
 }
 
-// ── Raven markdown renderer ──────────────────────────────────────────────────
-// Replaces tui_markdown with a purpose-built renderer that directly produces
-// ratatui types. Handles: headings, bold/italic/code, links, lists, code
-// blocks, blockquotes, tables (box-drawn), and horizontal rules.
-
-/// Styles for our dark TUI theme (#1a1a22 background).
-mod md_style {
-    use ratatui::style::{Color, Modifier, Style};
-    pub fn h1() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) }
-    pub fn h2() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) }
-    pub fn h3() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC) }
-    pub fn h_other() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::ITALIC) }
-    pub fn bold() -> Style { Style::default().add_modifier(Modifier::BOLD) }
-    pub fn italic() -> Style { Style::default().add_modifier(Modifier::ITALIC) }
-    pub fn bold_italic() -> Style { Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC) }
-    pub fn code() -> Style { Style::default().fg(Color::Rgb(0xc0, 0xc0, 0xd0)).bg(Color::Rgb(0x28, 0x28, 0x35)) }
-    pub fn link() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED) }
-    pub fn blockquote() -> Style { Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80)).add_modifier(Modifier::ITALIC) }
-    pub fn table_border() -> Style { Style::default().fg(Color::DarkGray) }
-    pub fn table_header() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD) }
-    pub fn rule() -> Style { Style::default().fg(Color::DarkGray) }
-    pub fn list_marker() -> Style { Style::default().fg(Color::DarkGray) }
-}
-
-fn wiki_render_markdown(md: &str) -> Text<'static> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let src_lines: Vec<&str> = md.lines().collect();
-    let n = src_lines.len();
-    let mut i = 0;
-    let mut in_code_block = false;
-
-    while i < n {
-        let raw = src_lines[i];
-
-        // ── Code blocks ──
-        if raw.trim_start().starts_with("```") {
-            if in_code_block {
-                // End code block
-                in_code_block = false;
-                i += 1;
-                continue;
-            } else {
-                // Start code block — show language label if present
-                let lang = raw.trim_start().trim_start_matches('`').trim();
-                if !lang.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("  {}", lang), md_style::code())));
-                }
-                in_code_block = true;
-                i += 1;
-                continue;
-            }
-        }
-        if in_code_block {
-            lines.push(Line::from(Span::styled(format!("  {}", raw), md_style::code())));
-            i += 1;
-            continue;
-        }
-
-        let trimmed = raw.trim();
-
-        // ── Empty line ──
-        if trimmed.is_empty() {
-            lines.push(Line::default());
-            i += 1;
-            continue;
-        }
-
-        // ── Horizontal rule ──
-        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
-            && trimmed.len() >= 3
-        {
-            lines.push(Line::from(Span::styled("────────────────────────────────", md_style::rule())));
-            i += 1;
-            continue;
-        }
-
-        // ── Tables ──
-        if is_table_row(raw) && i + 1 < n && is_separator_row(src_lines[i + 1]) {
-            let table_lines = render_table_lines(&src_lines, &mut i);
-            lines.extend(table_lines);
-            continue;
-        }
-
-        // ── Headings ──
-        if trimmed.starts_with('#') {
-            let level = trimmed.chars().take_while(|c| *c == '#').count();
-            let text = trimmed[level..].trim();
-            let style = match level {
-                1 => md_style::h1(),
-                2 => md_style::h2(),
-                3 => md_style::h3(),
-                _ => md_style::h_other(),
-            };
-            if !lines.is_empty() {
-                lines.push(Line::default()); // spacing before heading
-            }
-            lines.push(Line::from(Span::styled(text.to_string(), style)));
-            i += 1;
-            continue;
-        }
-
-        // ── Blockquotes ──
-        if let Some(stripped) = trimmed.strip_prefix('>') {
-            let content = stripped.trim_start();
-            let mut spans = vec![Span::styled("▎ ", md_style::blockquote())];
-            spans.extend(parse_inline(content, md_style::blockquote()));
-            lines.push(Line::from(spans));
-            i += 1;
-            continue;
-        }
-
-        // ── Unordered lists ──
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
-            let indent = raw.len() - raw.trim_start().len();
-            let content = &trimmed[2..];
-            let prefix = " ".repeat(indent) + "• ";
-            let mut spans = vec![Span::styled(prefix, md_style::list_marker())];
-            spans.extend(parse_inline(content, Style::default()));
-            lines.push(Line::from(spans));
-            i += 1;
-            continue;
-        }
-
-        // ── Ordered lists ──
-        if let Some(rest) = try_ordered_list(trimmed) {
-            let indent = raw.len() - raw.trim_start().len();
-            // Find the number prefix
-            let num_end = trimmed.find('.').unwrap_or(0);
-            let num = &trimmed[..num_end + 1];
-            let prefix = " ".repeat(indent) + num + " ";
-            let mut spans = vec![Span::styled(prefix, md_style::list_marker())];
-            spans.extend(parse_inline(rest, Style::default()));
-            lines.push(Line::from(spans));
-            i += 1;
-            continue;
-        }
-
-        // ── Normal paragraph text ──
-        let spans = parse_inline(trimmed, Style::default());
-        lines.push(Line::from(spans));
-        i += 1;
-    }
-
-    Text::from(lines)
-}
-
-/// Parse inline markdown formatting: **bold**, *italic*, ***both***, `code`, [links](url)
-fn parse_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut pos = 0;
-    let mut buf = String::new();
-
-    while pos < len {
-        // ── Inline code: `...` ──
-        if chars[pos] == '`' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 1;
-            let mut code = String::new();
-            while pos < len && chars[pos] != '`' {
-                code.push(chars[pos]);
-                pos += 1;
-            }
-            if pos < len { pos += 1; } // skip closing `
-            spans.push(Span::styled(code, md_style::code()));
-            continue;
-        }
-
-        // ── Links: [text](url) ──
-        if chars[pos] == '[' {
-            // Look ahead for ](url)
-            if let Some((link_text, url, end_pos)) = try_parse_link(&chars, pos) {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-                }
-                spans.push(Span::styled(link_text, md_style::link()));
-                pos = end_pos;
-                // Store url in a dimmed span for reference
-                let _ = url; // We display link text styled, url is implicit for TUI
-                continue;
-            }
-        }
-
-        // ── Bold+italic: ***...*** ──
-        if pos + 2 < len && chars[pos] == '*' && chars[pos+1] == '*' && chars[pos+2] == '*' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 3;
-            let mut inner = String::new();
-            while pos + 2 < len && !(chars[pos] == '*' && chars[pos+1] == '*' && chars[pos+2] == '*') {
-                inner.push(chars[pos]);
-                pos += 1;
-            }
-            if pos + 2 < len { pos += 3; }
-            spans.push(Span::styled(inner, md_style::bold_italic()));
-            continue;
-        }
-
-        // ── Bold: **...** ──
-        if pos + 1 < len && chars[pos] == '*' && chars[pos+1] == '*' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 2;
-            let mut inner = String::new();
-            while pos + 1 < len && !(chars[pos] == '*' && chars[pos+1] == '*') {
-                inner.push(chars[pos]);
-                pos += 1;
-            }
-            if pos + 1 < len { pos += 2; }
-            spans.push(Span::styled(inner, md_style::bold()));
-            continue;
-        }
-
-        // ── Italic: *...* (single) ──
-        if chars[pos] == '*' && (pos + 1 < len && chars[pos+1] != '*') {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 1;
-            let mut inner = String::new();
-            while pos < len && chars[pos] != '*' {
-                inner.push(chars[pos]);
-                pos += 1;
-            }
-            if pos < len { pos += 1; }
-            spans.push(Span::styled(inner, md_style::italic()));
-            continue;
-        }
-
-        buf.push(chars[pos]);
-        pos += 1;
-    }
-
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, base_style));
-    }
-    spans
-}
-
-/// Try to parse a markdown link at position `start` (which should be '[').
-/// Returns (link_text, url, end_position) if successful.
-fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    let len = chars.len();
-    if start >= len || chars[start] != '[' { return None; }
-    let mut pos = start + 1;
-    let mut text = String::new();
-    // Find closing ]
-    while pos < len && chars[pos] != ']' {
-        text.push(chars[pos]);
-        pos += 1;
-    }
-    if pos >= len { return None; }
-    pos += 1; // skip ]
-    // Expect (
-    if pos >= len || chars[pos] != '(' { return None; }
-    pos += 1;
-    let mut url = String::new();
-    while pos < len && chars[pos] != ')' {
-        url.push(chars[pos]);
-        pos += 1;
-    }
-    if pos >= len { return None; }
-    pos += 1; // skip )
-    Some((text, url, pos))
-}
-
-/// Try to match an ordered list item: "1. text", "2. text", etc.
-fn try_ordered_list(trimmed: &str) -> Option<&str> {
-    let dot_pos = trimmed.find('.')?;
-    let num_part = &trimmed[..dot_pos];
-    if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
-        let rest = &trimmed[dot_pos + 1..];
-        if rest.starts_with(' ') {
-            return Some(rest.trim_start());
-        }
-    }
-    None
-}
-
-// ── Table rendering ──────────────────────────────────────────────────────────
-
-fn is_table_row(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.ends_with('|') && t.len() > 2
-}
-
-fn is_separator_row(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.contains("---")
-}
-
-fn parse_table_row(line: &str) -> Vec<String> {
-    let t = line.trim().trim_matches('|');
-    t.split('|').map(|cell| cell.trim().to_string()).collect()
-}
-
-/// Render a markdown table starting at `src_lines[*i]` into styled Lines.
-/// Advances `*i` past the table.
-fn render_table_lines(src_lines: &[&str], i: &mut usize) -> Vec<Line<'static>> {
-    let mut rows: Vec<Vec<String>> = vec![];
-    rows.push(parse_table_row(src_lines[*i]));
-    *i += 1; // skip header
-    *i += 1; // skip separator
-    while *i < src_lines.len() && is_table_row(src_lines[*i]) && !is_separator_row(src_lines[*i]) {
-        rows.push(parse_table_row(src_lines[*i]));
-        *i += 1;
-    }
-
-    if rows.is_empty() { return vec![]; }
-    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let mut widths = vec![0usize; ncols];
-    for row in &rows {
-        for (j, cell) in row.iter().enumerate() {
-            if j < ncols { widths[j] = widths[j].max(cell.len()); }
-        }
-    }
-    for w in &mut widths { *w = (*w).max(3); }
-
-    let border = md_style::table_border();
-    let header_style = md_style::table_header();
-    let mut out: Vec<Line<'static>> = Vec::new();
-
-    // Top border: ┌───┬───┐
-    let mut top = String::from("┌");
-    for (j, w) in widths.iter().enumerate() {
-        top.push_str(&"─".repeat(*w + 2));
-        if j + 1 < ncols { top.push('┬'); }
-    }
-    top.push('┐');
-    out.push(Line::from(Span::styled(top, border)));
-
-    for (ri, row) in rows.iter().enumerate() {
-        let cell_style = if ri == 0 { header_style } else { Style::default() };
-        let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
-        for (j, w) in widths.iter().enumerate() {
-            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            spans.push(Span::styled(format!(" {:<width$} ", cell, width = w), cell_style));
-            spans.push(Span::styled("│", border));
-        }
-        out.push(Line::from(spans));
-
-        // Header separator
-        if ri == 0 && rows.len() > 1 {
-            let mut sep = String::from("├");
-            for (j, w) in widths.iter().enumerate() {
-                sep.push_str(&"─".repeat(*w + 2));
-                if j + 1 < ncols { sep.push('┼'); }
-            }
-            sep.push('┤');
-            out.push(Line::from(Span::styled(sep, border)));
-        }
-    }
-
-    // Bottom border: └───┴───┘
-    let mut bot = String::from("└");
-    for (j, w) in widths.iter().enumerate() {
-        bot.push_str(&"─".repeat(*w + 2));
-        if j + 1 < ncols { bot.push('┴'); }
-    }
-    bot.push('┘');
-    out.push(Line::from(Span::styled(bot, border)));
-
-    out
-}
-
-
+// markdown rendering: see md_render.rs
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pane {
@@ -932,7 +564,7 @@ pub fn draw_left_pane(
             // Rich markdown rendering for assistant and system-ish messages.
             // This preserves structure/newlines for plans, lists, code, headings, etc.
             // (User messages stay plain for chat flow.)
-            let md = wiki_render_markdown(entry);
+            let md = render_markdown(entry);
             for mut line in md.lines {
                 if Some(line_idx) == highlight_line {
                     for sp in &mut line.spans {
@@ -1587,13 +1219,15 @@ pub struct PickerDrawData<'a> {
     pub focus: crate::app_state::PickerFocus,
     pub summary: &'a str,
     pub summary_scroll: usize,
-    pub wiki_links: &'a [crate::app_state::WikiLink],
+    pub wiki_links: &'a [WikiLink],
     pub active_link_idx: usize,
     pub summary_action: crate::app_state::SummaryAction,
+    /// When true, `summary` is wiki markdown (render richly); otherwise plain session meta.
+    pub summary_is_markdown: bool,
     /// When in the 3-pane overview (picker | nav | content), which column has focus.
     pub view_focus: crate::app_state::ViewFocus,
     // Browser nav for Screen 2 (stable Harness + Wiki tree)
-    pub browser_nav_items: &'a [crate::app_state::WikiNavItem],
+    pub browser_nav_items: &'a [WikiNavItem],
     pub browser_selected_nav: usize,
     pub browser_wiki_content: &'a str,
     pub browser_wiki_scroll: usize,
@@ -1803,7 +1437,7 @@ pub fn draw_content_desktop(
                 } else {
                     picker.browser_wiki_content.to_string()
                 };
-                let md_text = wiki_render_markdown(&txt);
+                let md_text = render_markdown(&txt);
                 let preview = Paragraph::new(md_text)
                     .wrap(Wrap { trim: true })
                     .scroll((picker.browser_wiki_scroll as u16, 0))
@@ -1897,11 +1531,11 @@ pub fn draw_wiki_nav_pane(f: &mut Frame, area: Rect, viewer: &crate::app_state::
     draw_nav_list(f, area, &format!(" {} ", viewer.current_file), &viewer.nav_items, viewer.selected_nav, focused || viewer.focus == crate::app_state::WikiFocus::Nav);
 }
 
-pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
+pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], selected: usize, focused: bool) {
     draw_nav_list(f, area, title, items, selected, focused);
 }
 
-fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
+fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], selected: usize, focused: bool) {
     let nav_border = if focused {
         Style::default().fg(Color::Cyan)
     } else {
@@ -1925,10 +1559,10 @@ fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_sta
             Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
         } else {
             match item.kind {
-                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
-                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
-                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
-                crate::app_state::NavItemKind::Harness => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                NavItemKind::Back => Style::default().fg(Color::Yellow),
+                NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
+                NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
+                NavItemKind::Harness => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             }
         };
         let prefix = if is_sel { "▶ " } else { "  " };
@@ -1974,48 +1608,15 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     } else {
         viewer.content.clone()
     };
-    let mut md_text = wiki_render_markdown(&md);
-
-    // Extract search text from active nav item for content highlighting
     let active_item = viewer.nav_items.get(sel);
-    let search = match active_item.map(|it| &it.kind) {
-        Some(crate::app_state::NavItemKind::Header) => {
-            // Strip leading indent + # markers to get bare heading text
-            active_item.map(|it| it.label.trim().trim_start_matches('#').trim().to_string()).unwrap_or_default()
-        }
-        Some(crate::app_state::NavItemKind::Link) => {
-            // Strip "→ " prefix
-            active_item.map(|it| it.label.trim_start_matches("→ ").trim().to_string()).unwrap_or_default()
-        }
-        _ => String::new(),
-    };
-
-    // Post-style: highlight matching text or the line near scroll start for the selected nav target
+    let search = active_item
+        .map(|it| nav_highlight_search(it.kind, &it.label))
+        .unwrap_or_default();
     let start = viewer.scroll;
     let max = (content_area.height as usize).saturating_sub(4);
-    for (src_idx, line) in md_text.lines.iter_mut().enumerate().skip(start).take(max) {
-        let is_active_region = if !search.is_empty() {
-            line.spans.iter().any(|s| s.content.contains(&search))
-        } else {
-            // fallback: highlight around current scroll position
-            src_idx == start || src_idx == start.saturating_add(1)
-        };
-        for span in &mut line.spans {
-            let matches = !search.is_empty() && span.content.contains(&search);
-            if matches || is_active_region {
-                // Subtle highlight for active nav target (heading or link) in wiki content,
-                // matching the style used for selected items in nav/tree panes.
-                let mut st = span.style;
-                st = st
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x20, 0x50, 0x80))
-                    .add_modifier(Modifier::BOLD);
-                span.style = st;
-            }
-        }
-    }
-
-    for line in md_text.lines.into_iter().skip(start).take(max) {
+    let mut md_text = markdown_viewport(&md, start, max);
+    highlight_markdown_viewport(&mut md_text, &search, 0, max);
+    for line in md_text.lines {
         content_text.lines.push(line);
     }
 
@@ -2035,7 +1636,17 @@ pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
         .split(area);
 
     draw_picker_tree(f, cols[0], data.picker_items, data.selected_item, data.focus == crate::app_state::PickerFocus::Tree);
-    draw_session_summary(f, cols[1], data.summary, data.summary_scroll, data.focus == crate::app_state::PickerFocus::Summary, data.wiki_links, data.active_link_idx, data.summary_action);
+    draw_session_summary(
+        f,
+        cols[1],
+        data.summary,
+        data.summary_scroll,
+        data.focus == crate::app_state::PickerFocus::Summary,
+        data.wiki_links,
+        data.active_link_idx,
+        data.summary_action,
+        data.summary_is_markdown,
+    );
 
     // subtle hint line at bottom of area if space
     if area.height > 4 {
@@ -2255,28 +1866,31 @@ fn draw_session_summary(
     summary: &str,
     scroll: usize,
     focused: bool,
-    _wiki_links: &[crate::app_state::WikiLink],
+    _wiki_links: &[WikiLink],
     _active_link_idx: usize,
     _summary_action: crate::app_state::SummaryAction,
+    summary_is_markdown: bool,
 ) {
-    // Summary-only pane (full wiki is on the dedicated wiki viewer screen)
     let content_area = area;
-
-    let mut text = Text::default();
-
-    let start = scroll;
     let max_lines = (content_area.height as usize).saturating_sub(4);
 
-    let all_lines: Vec<String> = if summary.is_empty() {
-        vec!["  (no session)".to_string()]
+    let text = if summary.is_empty() {
+        Text::from(Line::from(Span::styled(
+            "  (no session)",
+            Style::default().fg(Color::DarkGray),
+        )))
+    } else if summary_is_markdown {
+        markdown_viewport(summary, scroll, max_lines)
     } else {
-        summary.lines().map(|l| l.to_string()).collect()
+        let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
+        let mut plain = Text::default();
+        for line in summary.lines().skip(scroll).take(max_lines) {
+            plain
+                .lines
+                .push(Line::from(Span::styled(line.to_string(), base_style)));
+        }
+        plain
     };
-
-    let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
-    for line in all_lines.iter().skip(start).take(max_lines) {
-        text.lines.push(Line::from(Span::styled(line.to_string(), base_style)));
-    }
 
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -2650,7 +2264,7 @@ fn build_left_text(
                 line_idx += 1;
             }
         } else {
-            let md = wiki_render_markdown(entry);
+            let md = render_markdown(entry);
             for mut line in md.lines {
                 if Some(line_idx) == highlight_line {
                     for sp in &mut line.spans {

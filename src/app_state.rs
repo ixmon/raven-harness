@@ -13,6 +13,9 @@ use raven_tui::agent::Agent;
 use raven_tui::session::{SessionMeta, WorkspaceEntry};
 
 pub use crate::plan_state::PlanState;
+pub use crate::wiki_doc::{
+    nav_is_harness as browser_nav_is_harness, NavItemKind, WikiLink, WikiNavItem,
+};
 
 #[cfg(feature = "clipboard")]
 #[allow(dead_code)]
@@ -107,39 +110,10 @@ pub struct WikiViewerState {
     pub selected_nav: usize,
 }
 
-pub(crate) fn browser_nav_is_harness(items: &[WikiNavItem], selected: usize) -> bool {
-    items.get(selected).is_some_and(|it| it.kind == NavItemKind::Harness)
-}
-
 impl WikiViewerState {
     pub fn selected_is_harness(&self) -> bool {
-        browser_nav_is_harness(&self.nav_items, self.selected_nav)
+        crate::wiki_doc::nav_is_harness(&self.nav_items, self.selected_nav)
     }
-}
-
-#[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
-pub struct WikiLink {
-    pub text: String,
-    pub target: String,
-    pub line: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum NavItemKind {
-    #[default]
-    Header,
-    Link,
-    Back,
-    Harness, // "Coding Harness" - special top entry to show conv + status + input to the right of nav
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct WikiNavItem {
-    pub label: String,
-    pub target_file: String,
-    pub scroll_to: usize,
-    pub kind: NavItemKind,
 }
 
 #[derive(Debug, Default)]
@@ -1023,80 +997,7 @@ impl App {
 
         let index_content = std::fs::read_to_string(wiki_dir.join("index.md")).unwrap_or_default();
 
-        let mut items: Vec<WikiNavItem> = vec![
-            WikiNavItem {
-                label: "Coding Harness".to_string(),
-                target_file: String::new(),
-                scroll_to: 0,
-                kind: NavItemKind::Harness,
-            },
-            WikiNavItem {
-                label: "Wiki".to_string(),
-                target_file: "index.md".to_string(),
-                scroll_to: 0,
-                kind: NavItemKind::Header,
-            },
-        ];
-
-        let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)").ok();
-        let wikilink_re = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]").ok();
-        let mut current_heading_indent = 2usize;
-
-        for (i, line) in index_content.lines().enumerate() {
-            let heading = line.strip_prefix("# ")
-                .map(|h| (h.trim().to_string(), 2))
-                .or_else(|| line.strip_prefix("## ").map(|h| (format!("  {}", h.trim()), 4)))
-                .or_else(|| line.strip_prefix("### ").map(|h| (format!("    {}", h.trim()), 6)));
-
-            if let Some((label, indent)) = heading {
-                current_heading_indent = indent;
-                items.push(WikiNavItem {
-                    label,
-                    target_file: "index.md".to_string(),
-                    scroll_to: i,
-                    kind: NavItemKind::Header,
-                });
-            }
-
-            let link_indent = " ".repeat(current_heading_indent + 2);
-            if let Some(ref re) = link_re {
-                for cap in re.captures_iter(line) {
-                    let text = cap.get(1).map_or("", |m| m.as_str()).to_string();
-                    let mut tgt = cap.get(2).map_or("", |m| m.as_str()).to_string();
-                    if let Some(hpos) = tgt.find('#') { tgt = tgt[..hpos].to_string(); }
-                    let clean_tgt = Self::normalize_wiki_path(&tgt);
-                    items.push(WikiNavItem {
-                        label: format!("{}→ {}", link_indent, text),
-                        target_file: clean_tgt,
-                        scroll_to: i,
-                        kind: NavItemKind::Link,
-                    });
-                }
-            }
-            if let Some(ref re) = wikilink_re {
-                for cap in re.captures_iter(line) {
-                    let tgt = cap.get(1).map_or("", |m| m.as_str()).to_string();
-                    let clean_tgt = Self::normalize_wiki_path(&tgt);
-                    items.push(WikiNavItem {
-                        label: format!("{}→ {}", link_indent, clean_tgt.trim_end_matches(".md")),
-                        target_file: clean_tgt,
-                        scroll_to: i,
-                        kind: NavItemKind::Link,
-                    });
-                }
-            }
-        }
-
-        if items.len() == 2 {
-            items.push(WikiNavItem {
-                label: "  (no wiki files)".into(),
-                target_file: "index.md".to_string(),
-                scroll_to: 0,
-                kind: NavItemKind::Header,
-            });
-        }
-
-        self.browser_nav_items = items;
+        self.browser_nav_items = crate::wiki_doc::build_browser_overview_nav(&index_content);
         self.browser_selected_nav = 0;
         self.browser_wiki_content = index_content;
         self.browser_wiki_scroll = 0;
@@ -1185,7 +1086,7 @@ impl App {
             return;
         }
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let clean = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+        let clean = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
         let path = std::path::PathBuf::from(home)
             .join(".raven-hotel")
             .join("sessions")
@@ -1199,118 +1100,11 @@ impl App {
         self.rebuild_wiki_viewer_nav();
     }
 
-    fn normalize_wiki_path(p: &str) -> String {
-        let mut s = p.trim().to_string();
-        // strip common relative junk the model or links may introduce
-        while s.starts_with("./") {
-            s = s[2..].to_string();
-        }
-        s = s.trim_start_matches(['/', '\\']).to_string();
-        if s.is_empty() {
-            return "index.md".to_string();
-        }
-        if !s.ends_with(".md") && (!s.contains('.') || s.ends_with('/')) {
-            s.push_str(".md");
-        }
-        s
-    }
-
     fn rebuild_wiki_viewer_nav(&mut self) {
-        let mut items: Vec<WikiNavItem> = vec![
-            // Always offer "Coding Harness" at the top of the Nav to surface the main coding UI (conv + status + input) to the right of nav.
-            WikiNavItem {
-                label: "Coding Harness".to_string(),
-                target_file: String::new(),
-                scroll_to: 0,
-                kind: NavItemKind::Harness,
-            },
-        ];
-        let cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
-
-        // Back entry (unless we're on index.md)
-        if cur != "index.md" {
-            items.push(WikiNavItem {
-                label: "⬆ Back (index.md)".into(),
-                target_file: "index.md".to_string(),
-                scroll_to: 0,
-                kind: NavItemKind::Back,
-            });
-        }
-
-        let content = &self.wiki_viewer.content;
-
-        // Build nav in document order — headings with links interleaved underneath.
-        // Track the current heading's indent depth so links get one level deeper.
-        let link_re = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)").ok();
-        let wikilink_re = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]").ok();
-        let mut current_heading_indent = 0usize; // indent of most recent heading (0/2/4)
-
-        for (i, line) in content.lines().enumerate() {
-            // Check for heading
-            let heading = line.strip_prefix("# ")
-                .map(|h| (h.trim().to_string(), 0))
-                .or_else(|| line.strip_prefix("## ").map(|h| (format!("  {}", h.trim()), 2)))
-                .or_else(|| line.strip_prefix("### ").map(|h| (format!("    {}", h.trim()), 4)));
-
-            if let Some((label, indent)) = heading {
-                current_heading_indent = indent;
-                items.push(WikiNavItem {
-                    label,
-                    target_file: cur.clone(),
-                    scroll_to: i,
-                    kind: NavItemKind::Header,
-                });
-            }
-
-            // Collect links from this line, indented one level deeper than parent heading
-            let link_indent = " ".repeat(current_heading_indent + 4);
-            if let Some(ref re) = link_re {
-                for cap in re.captures_iter(line) {
-                    let text = cap.get(1).map_or("", |m| m.as_str()).to_string();
-                    let mut tgt = cap.get(2).map_or("", |m| m.as_str()).to_string();
-                    if let Some(hpos) = tgt.find('#') { tgt = tgt[..hpos].to_string(); }
-                    let clean_tgt = Self::normalize_wiki_path(&tgt);
-                    items.push(WikiNavItem {
-                        label: format!("{}→ {}", link_indent, text),
-                        target_file: clean_tgt,
-                        scroll_to: i,
-                        kind: NavItemKind::Link,
-                    });
-                }
-            }
-            if let Some(ref re) = wikilink_re {
-                for cap in re.captures_iter(line) {
-                    let tgt = cap.get(1).map_or("", |m| m.as_str()).to_string();
-                    let clean_tgt = Self::normalize_wiki_path(&tgt);
-                    items.push(WikiNavItem {
-                        label: format!("{}→ {}", link_indent, clean_tgt.trim_end_matches(".md")),
-                        target_file: clean_tgt,
-                        scroll_to: i,
-                        kind: NavItemKind::Link,
-                    });
-                }
-            }
-        }
-
-        if items.is_empty() {
-            items.push(WikiNavItem {
-                label: "(empty document)".into(),
-                target_file: cur.clone(),
-                scroll_to: 0,
-                kind: NavItemKind::Header,
-            });
-        }
-
-        // de-dup preserving order
-        let mut seen = std::collections::HashSet::new();
-        let mut deduped = vec![];
-        for it in items {
-            let key = (it.label.clone(), it.target_file.clone());
-            if seen.insert(key) {
-                deduped.push(it);
-            }
-        }
-        self.wiki_viewer.nav_items = deduped;
+        self.wiki_viewer.nav_items = crate::wiki_doc::build_viewer_nav(
+            &self.wiki_viewer.content,
+            &self.wiki_viewer.current_file,
+        );
         if self.wiki_viewer.selected_nav >= self.wiki_viewer.nav_items.len() {
             self.wiki_viewer.selected_nav = 0;
         }
@@ -1326,8 +1120,8 @@ impl App {
             // Special: no file load, the caller/draw will show harness UI (conv+status+input) to right of nav
             return;
         }
-        let clean_target = Self::normalize_wiki_path(&item.target_file);
-        let clean_cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+        let clean_target = crate::wiki_doc::normalize_wiki_path(&item.target_file);
+        let clean_cur = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
 
         // Back or Link targeting a different file → load that file
         let is_cross_file = clean_target != clean_cur
@@ -1354,8 +1148,8 @@ impl App {
     /// Does NOT load files or rebuild nav — safe for Up/Down browsing.
     fn scroll_to_nav_if_current_file(&mut self) {
         if let Some(item) = self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav) {
-            let clean_target = Self::normalize_wiki_path(&item.target_file);
-            let clean_cur = Self::normalize_wiki_path(&self.wiki_viewer.current_file);
+            let clean_target = crate::wiki_doc::normalize_wiki_path(&item.target_file);
+            let clean_cur = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
             if clean_target == clean_cur {
                 self.wiki_viewer.scroll = item.scroll_to;
             }
@@ -1663,7 +1457,7 @@ impl App {
                 match std::fs::read_to_string(&path) {
                     Ok(c) => {
                         self.picker.current_wiki_content = c.clone();
-                        self.picker.wiki_links = Self::parse_wiki_links(&c);
+                        self.picker.wiki_links = crate::wiki_doc::extract_links(&c);
                         self.picker.wiki_content_start = 0;
                         self.recompute_active_link();
 
@@ -1732,43 +1526,6 @@ impl App {
             self.picker.active_link_idx = 0;
             self.recompute_active_link();
         }
-    }
-
-    fn parse_wiki_links(content: &str) -> Vec<WikiLink> {
-        let mut links = vec![];
-        // Standard markdown: [text](target.md)
-        if let Ok(re) = regex::Regex::new(r"\[([^\]]+)\]\(([^)]+?\.md[^)]*)\)") {
-            for (line_idx, line) in content.lines().enumerate() {
-                for cap in re.captures_iter(line) {
-                    let text = cap.get(1).map_or("", |m| m.as_str()).to_string();
-                    let mut target = cap.get(2).map_or("", |m| m.as_str()).to_string();
-                    if let Some(h) = target.find('#') {
-                        target = target[..h].to_string();
-                    }
-                    if !target.ends_with(".md") {
-                        target.push_str(".md");
-                    }
-                    links.push(WikiLink { text, target, line: line_idx });
-                }
-            }
-        }
-        // Wiki style: [[target]] or [[target.md]]
-        if let Ok(re) = regex::Regex::new(r"\[\[([^\]]+?)(?:\.md)?\]\]") {
-            for (line_idx, line) in content.lines().enumerate() {
-                for cap in re.captures_iter(line) {
-                    let mut target = cap.get(1).map_or("", |m| m.as_str()).to_string();
-                    if !target.ends_with(".md") {
-                        target.push_str(".md");
-                    }
-                    links.push(WikiLink {
-                        text: target.clone(),
-                        target,
-                        line: line_idx,
-                    });
-                }
-            }
-        }
-        links
     }
 
     fn recompute_active_link(&mut self) {

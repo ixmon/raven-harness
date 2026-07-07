@@ -906,6 +906,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         browser_selected_nav: app.browser_selected_nav,
                         browser_wiki_content: &app.browser_wiki_content,
                         browser_wiki_scroll: app.browser_wiki_scroll,
+                        summary_is_markdown: app.picker.show_wiki_in_summary,
                     },
                     &app.wiki_viewer,
                     &mut app.last_left_area, &mut app.last_right_area,
