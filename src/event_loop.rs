@@ -937,6 +937,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                         spinner_tick: app.spinner_tick, search_mode: app.search_mode,
                         focused: input_focused,
                     });
+                    tui_render::draw_overlays(
+                        f, size, irect, &app.settings, app.pending_confirmation.as_ref(),
+                        &app.slash_commands, &app.input, app.slash_selected,
+                        app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
+                        app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
+                    );
                     if input_focused {
                         app.clamp_cursor();
                         let text_before = &app.input[..app.cursor_pos];

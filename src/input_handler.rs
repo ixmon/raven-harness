@@ -483,7 +483,11 @@ async fn handle_input_key(
             if app.is_processing {
                 let prompt = app.input.trim().to_string();
                 if !prompt.is_empty()
-                    && crate::input_dispatch::slash_ok_while_processing(&prompt)
+                    && crate::input_dispatch::slash_ok_while_processing_resolved(
+                        &app.slash_commands,
+                        &prompt,
+                        app.slash_selected,
+                    )
                 {
                     match dispatch_slash_input(
                         app,
@@ -511,16 +515,18 @@ async fn handle_input_key(
                         crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {}
                     }
                 }
-                // Submit queued interject or instant interject
-                if is_ctrl {
-                    app.submit_instant_interject(
-                        app.input.clone(),
-                        queued_interject,
-                        instant_interject,
-                        stop,
-                    );
-                } else {
-                    app.submit_queued_interject(app.input.clone(), queued_interject);
+                // Submit queued interject or instant interject (not slash menu attempts)
+                if !prompt.starts_with('/') {
+                    if is_ctrl {
+                        app.submit_instant_interject(
+                            app.input.clone(),
+                            queued_interject,
+                            instant_interject,
+                            stop,
+                        );
+                    } else {
+                        app.submit_queued_interject(app.input.clone(), queued_interject);
+                    }
                 }
             } else {
                 // Picker add workspace: Enter accepts the path and starts trust confirm
@@ -676,6 +682,20 @@ async fn handle_input_key(
             Ok(true)
         }
         KeyCode::Esc => {
+            if app.mode_menu_active {
+                app.mode_menu_active = false;
+                app.clear_input();
+                app.selected_mode_idx = 0;
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            if app.agent_mode_menu_active {
+                app.agent_mode_menu_active = false;
+                app.clear_input();
+                app.selected_agent_mode_idx = 0;
+                app.needs_redraw = true;
+                return Ok(true);
+            }
             if app.is_processing {
                 // Signal the running drive_turn (via TuiObserver) to stop at the next
                 // safe point. We intentionally do NOT clear is_processing here: the
