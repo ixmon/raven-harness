@@ -163,7 +163,7 @@ pub fn build_conversation_text(
     }
 
     if !current_response.is_empty() {
-        let stream_gutter = Color::Rgb(0x40, 0xb0, 0x40);
+        let stream_gutter = Color::Rgb(0x2a, 0x7a, 0x2a); // match darkened agent gutter
         left_text.lines.push(Line::from(Span::styled(
             "Agent (streaming):",
             Style::default()
@@ -220,28 +220,28 @@ pub fn build_conversation_text(
 /// Determine gutter bar color from the entry content.
 pub fn gutter_color_for(entry: &str) -> Color {
     if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-        Color::Cyan
+        Color::Rgb(0x00, 0x88, 0x88) // muted teal (was Cyan)
     } else if entry.starts_with("Agent: ") || entry.starts_with("Agent (partial): ") {
-        Color::Rgb(0x40, 0xb0, 0x40)
+        Color::Rgb(0x2a, 0x7a, 0x2a) // dark green (was 0x40b040)
     } else if entry.contains("ERROR") || entry.starts_with("⚠") {
-        Color::Rgb(0xff, 0x60, 0x60)
+        Color::Rgb(0xb0, 0x40, 0x40) // dark red (was 0xff6060)
     } else if entry.starts_with("✅")
         || entry.starts_with("⛔")
         || entry.starts_with("⏹")
         || entry.starts_with("🔒")
     {
-        Color::Rgb(0xc0, 0xa0, 0x30)
+        Color::Rgb(0x80, 0x68, 0x20) // dark amber (was 0xc0a030)
     } else if entry.starts_with("Raven Hotel - Loaded session")
         || entry.starts_with("Use ↑/↓")
     {
-        Color::Rgb(0x33, 0x33, 0x40)
+        Color::Rgb(0x28, 0x28, 0x38) // deeper (was 0x333340)
     } else if entry.contains("enter plan mode")
         || entry.contains("Do you want to enter plan mode")
         || entry.contains("Would you like to enter plan mode")
         || is_plan_entry_confirm(entry)
     {
-        PLAN_ORANGE
+        Color::Rgb(0x90, 0x60, 0x10) // dark orange (was PLAN_ORANGE)
     } else {
-        Color::Rgb(0x44, 0x44, 0x55)
+        Color::Rgb(0x33, 0x33, 0x44) // darker default (was 0x444455)
     }
 }

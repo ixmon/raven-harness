@@ -543,7 +543,7 @@ pub fn draw_right_pane(
 ) {
     *last_right_area = right_area;
 
-    let cursor_bg = Color::Rgb(0x1e, 0x3a, 0x5f); // navy blue — visible on dark terminals
+    let cursor_bg = Color::Rgb(0x14, 0x28, 0x40); // deep navy — high contrast with white text
     let fold_indicator_style = Style::default().fg(Color::DarkGray);
 
     // Compute fold-aware visible lines
