@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::plan_flow::{
-    dispatch_plan_slash, format_plan_execution_user_prompt,
+    dispatch_plan_slash, start_plan_execution,
     plan_loop_active, route_plan_entry_intent, spawn_plan_answer_submit,
     spawn_proceed_feedback_work, submit_plan_loop_input,
     PlanInputRouting, PlanLoopUserOutcome,
@@ -618,12 +618,8 @@ async fn handle_input_key(
                             return Ok(true);
                         }
                         PlanLoopUserOutcome::StartExecution => {
-                            app.left_committed
-                                .push("▶ Plan approved — starting execution.".to_string());
-                            agent_prompt = format_plan_execution_user_prompt(
-                                &app.plan,
-                                &config.workspace,
-                            );
+                            agent_prompt =
+                                start_plan_execution(app, agent, &config.workspace);
                         }
                         PlanLoopUserOutcome::Consumed => {
                             return Ok(true);
@@ -639,10 +635,7 @@ async fn handle_input_key(
                     PlanInputRouting::Continue | PlanInputRouting::Pass => {}
                 }
 
-                if agent_prompt.starts_with("Execute the approved plan.") {
-                    app.left_committed
-                        .push("▶ Plan approved — starting execution.".to_string());
-                } else {
+                if !agent_prompt.starts_with("Execute the approved plan.") {
                     app.left_committed.push(format!("> {}", agent_prompt));
                 }
                 app.clear_input();

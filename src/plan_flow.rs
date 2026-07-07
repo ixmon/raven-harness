@@ -3,9 +3,8 @@
 use crate::app_state::{App, Pane, PlanState, PlanStep, PlanStepStatus, PlanStepTier};
 use raven_tui::chat_backend::ChatBackend;
 use raven_tui::plan_intent::{
-    classify_plan_answer, classify_plan_entry_intent, classify_plan_proceed_intent,
-    classify_proposal_consent, is_explicit_proceed_approval, PlanAnswerResolution,
-    PlanEntryIntent, PlanProceedIntent,
+    classify_plan_answer, classify_plan_entry_intent, classify_proposal_consent,
+    is_explicit_proceed_approval, PlanAnswerResolution, PlanEntryIntent, PlanProceedIntent,
 };
 use raven_tui::plan_loop::{fetch_clarification, fetch_proposal};
 use raven_tui::plan_protocol::{
@@ -14,8 +13,7 @@ use raven_tui::plan_protocol::{
 };
 use raven_tui::runtime::RuntimeFlags;
 use raven_tui::agent::Agent;
-use raven_tui::plan_execution;
-use raven_tui::plan_md::{self, ParsedPlanStep, PlanStepData, PLAN_STEPS_JSON_MARKER};
+use raven_tui::plan_md::{self, ParsedPlanStep, PLAN_STEPS_JSON_MARKER};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
@@ -233,65 +231,7 @@ pub fn parse_plan_steps_json(json: &str) -> Option<Vec<ParsedPlanStep>> {
     plan_md::parse_plan_steps_json(json)
 }
 
-pub fn format_plan_steps_json_block(steps: &[PlanStep]) -> String {
-    let data: Vec<PlanStepData> = steps.iter().map(crate::plan_sync::plan_step_to_data).collect();
-    plan_md::format_plan_steps_json_block(&data)
-}
-
-/// User message when starting work mode after plan approval (includes step list).
-pub fn format_plan_execution_user_prompt(plan: &PlanState, workspace: &std::path::Path) -> String {
-    let mut lines = vec![
-        "Execute the approved plan.".to_string(),
-        format!("Goal: {}", plan.goal),
-    ];
-    if !plan.success_criteria.is_empty() {
-        lines.push(format!("Success criteria: {}", plan.success_criteria));
-    }
-    let steps_data: Vec<PlanStepData> = plan
-        .steps
-        .iter()
-        .map(crate::plan_sync::plan_step_to_data)
-        .collect();
-    let workdir = plan_execution::detect_project_workdir(workspace, &steps_data);
-    lines.push(String::new());
-    lines.push(plan_execution::format_deliverable_location_section(
-        workspace,
-        workdir.as_deref(),
-    ));
-    if !plan.steps.is_empty() {
-        lines.push(String::new());
-        lines.push(
-            "Approved steps (one at a time; call complete_plan_step when each is done):".to_string(),
-        );
-        for (i, step) in plan.steps.iter().enumerate() {
-            let n = i + 1;
-            let tier = step.tier.map(|t| t.as_str()).unwrap_or("exec");
-            let verify = step
-                .verification
-                .as_deref()
-                .or(step.observe_prompt.as_deref())
-                .unwrap_or("—");
-            let cur = if i == plan.current_step {
-                " ← CURRENT"
-            } else {
-                ""
-            };
-            lines.push(format!(
-                "  {n}. {} [{tier}: {verify}]{cur}",
-                step.description
-            ));
-        }
-    }
-    lines.push(String::new());
-    lines.push(
-        "Canonical plan: session wiki plan.md (read with wiki=true). \
-         Follow the approved steps — they define which paths to use."
-            .to_string(),
-    );
-    let step_num = plan.current_step.saturating_add(1);
-    lines.push(format!("Begin with step {step_num}."));
-    lines.join("\n")
-}
+use crate::plan_prompts::{format_plan_execution_user_prompt, format_plan_status};
 
 fn parsed_step_to_plan_step(step: ParsedPlanStep) -> PlanStep {
     let tier = step.tier.as_deref().and_then(PlanStepTier::parse);
@@ -496,82 +436,6 @@ pub fn derive_fallback_steps(goal: &str, verif: &[String]) -> Vec<PlanStep> {
     ]
 }
 
-fn format_verification_list(verification: &[String]) -> String {
-    verification
-        .iter()
-        .map(|v| format!("- {}", v))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn plan_steps_section_skeleton() -> String {
-    format!(
-        "## Steps\n{}\n",
-        format_plan_steps_json_block(&[PlanStep {
-            description: "(Agent will fill during clarification)".to_string(),
-            verification: Some("(propose runnable command per step)".to_string()),
-            tier: Some(PlanStepTier::Exec),
-            note: None,
-            observe_prompt: None,
-            status: PlanStepStatus::Pending,
-        }])
-    )
-}
-
-fn wiki_template_on_entry(plan: &PlanState) -> String {
-    format!(
-        "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n## Verification\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n{}\n## Notes\n\n(Agent will refine this during clarification. Final approved version written on 'proceed'.)\n",
-        plan.goal,
-        plan.success_criteria,
-        format_verification_list(&plan.verification_steps),
-        plan.rollback,
-        plan.constraints,
-        plan_steps_section_skeleton()
-    )
-}
-
-fn wiki_template_on_trigger(goal: &str) -> String {
-    format!(
-        "# Plan\n\n**Goal:** {}\n\n*Template will be expanded on confirmation.*",
-        goal
-    )
-}
-
-fn format_step_human_summary(st: &PlanStep, index: usize) -> String {
-    let tier = st
-        .tier
-        .map(|t| t.as_str())
-        .unwrap_or("exec");
-    let verify = st
-        .verification
-        .as_deref()
-        .or(st.observe_prompt.as_deref())
-        .unwrap_or("");
-    format!("{}. {} [{}: {}]", index + 1, st.description, tier, verify)
-}
-
-fn wiki_template_approved(plan: &PlanState) -> String {
-    let verif = format_verification_list(&plan.verification_steps);
-    let steps_human = plan
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(i, st)| format_step_human_summary(st, i))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let steps_json = format_plan_steps_json_block(&plan.steps);
-    format!(
-        "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n## Verification\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n## Steps\n{}\n{}\n## Execution Log\n\n(Added as work proceeds after 'proceed'.)\n",
-        plan.goal,
-        plan.success_criteria,
-        verif,
-        plan.rollback,
-        plan.constraints,
-        steps_human,
-        steps_json
-    )
-}
-
 /// Handle y/n response for pending plan mode entry. Returns input to re-submit if confirmed.
 pub fn handle_plan_entry_confirmation(
     app: &mut App,
@@ -612,7 +476,7 @@ pub fn handle_plan_entry_confirmation(
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
-            let _ = s.write_wiki_file("plan.md", &wiki_template_on_entry(&app.plan));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_on_entry(&app.plan));
             app.left_committed.push(
                 "Plan written to session wiki/plan.md (you can edit externally too)".to_string(),
             );
@@ -721,7 +585,7 @@ fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, proposal: Pla
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
-            let _ = s.write_wiki_file("plan.md", &wiki_template_approved(&app.plan));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_approved(&app.plan));
             let _ = s.update_goal(
                 &app.plan.goal,
                 Some(app.plan.verification_steps.clone()),
@@ -920,7 +784,7 @@ fn spawn_plan_answer_work(
 /// Synchronous plan-loop submit: updates UI immediately and returns whether to spawn background work.
 pub fn submit_plan_loop_input(
     app: &mut App,
-    agent: &Arc<TokioMutex<Agent>>,
+    _agent: &Arc<TokioMutex<Agent>>,
     user_input: &str,
 ) -> PlanLoopUserOutcome {
     match app.plan.loop_phase {
@@ -939,10 +803,6 @@ pub fn submit_plan_loop_input(
         crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
             app.left_committed.push(format!("> {}", user_input));
             if is_explicit_proceed_approval(user_input) {
-                confirm_plan_proceed(app, agent);
-                app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
-                app.plan.pending_proposal = None;
-                app.plan.recap_offered = false;
                 app.needs_redraw = true;
                 return PlanLoopUserOutcome::StartExecution;
             }
@@ -1039,7 +899,7 @@ pub fn open_plan_entry_dialog(
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = &mut ag.session_mut() {
             s.meta.current_goal = goal_text.clone();
-            let _ = s.write_wiki_file("plan.md", &wiki_template_on_trigger(&goal_text));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_on_trigger(&goal_text));
             let _ = s.save_meta();
         }
     }
@@ -1071,44 +931,6 @@ pub fn apply_plan_entry_modal_response(
         return PlanSubmitOutcome::Stop;
     }
     handle_plan_entry_confirmation(app, agent, "y", Some(goal))
-}
-
-/// Format plan pane state for `/plan status`.
-pub fn format_plan_status(plan: &PlanState, agent_mode: &str) -> String {
-    let mut lines = vec![format!("Plan status (run mode: {})", agent_mode)];
-    if !plan.goal.is_empty() {
-        lines.push(format!("  Goal: {}", plan.goal));
-    }
-    if !plan.success_criteria.is_empty() {
-        lines.push(format!("  Success criteria: {}", plan.success_criteria));
-    }
-    if !plan.verification_steps.is_empty() {
-        lines.push("  Verification:".to_string());
-        for v in plan.verification_steps.iter().take(5) {
-            lines.push(format!("    • {}", v));
-        }
-    }
-    if plan.steps.is_empty() {
-        lines.push("  Steps: (not approved yet)".to_string());
-    } else {
-        lines.push(format!(
-            "  Steps: {}/{} complete (current: {})",
-            plan.steps.iter().filter(|s| s.status == PlanStepStatus::Done).count(),
-            plan.steps.len(),
-            plan.current_step + 1
-        ));
-        for (i, st) in plan.steps.iter().enumerate().take(5) {
-            let tier = st
-                .tier
-                .map(|t| t.as_str())
-                .unwrap_or("exec");
-            lines.push(format!("    {}. {} [{}]", i + 1, st.description, tier));
-        }
-    }
-    if let Some(p) = &plan.pending_observe_prompt {
-        lines.push(format!("  Awaiting observation: {}", p));
-    }
-    lines.join("\n")
 }
 
 /// Exit plan mode / clear pending entry ( `/plan cancel` ).
@@ -1182,22 +1004,6 @@ pub fn dispatch_plan_slash(
     }
 }
 
-/// Detect natural-language plan intent and open the confirmation dialog (sync heuristic only).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn try_open_plan_entry_dialog(
-    app: &mut App,
-    agent: &Arc<TokioMutex<Agent>>,
-    prompt: &str,
-) -> bool {
-    if app.plan.active || app.plan_entry_dialog_open() {
-        return false;
-    }
-    if !is_plan_trigger_phrase(prompt) {
-        return false;
-    }
-    open_plan_entry_dialog(app, agent, Some(prompt.to_string()))
-}
-
 /// After heuristic plan-trigger match, optionally disambiguate with a cheap LLM call.
 pub async fn route_plan_entry_intent(
     app: &mut App,
@@ -1226,60 +1032,22 @@ pub async fn route_plan_entry_intent(
     }
 }
 
-/// While in plan mode, classify proceed vs clarify vs cancel before agent submit.
-#[allow(dead_code)]
-pub async fn route_plan_proceed_intent(
+/// User approved the plan — switch to work mode, populate steps, return execution prompt.
+pub fn start_plan_execution(
     app: &mut App,
     agent: &Arc<TokioMutex<Agent>>,
-    backend: &Arc<Mutex<ChatBackend>>,
-    flags: &RuntimeFlags,
-    prompt: &str,
-) -> PlanInputRouting {
-    let current_mode = agent
-        .try_lock()
-        .map(|ag| ag.current_agent_mode())
-        .unwrap_or_default();
-    if current_mode != "plan" {
-        return PlanInputRouting::Pass;
-    }
-
-    // Planning requests and clarification answers are not proceed approvals.
-    if is_plan_trigger_phrase(prompt) || raven_tui::plan_intent::is_clarification_response(prompt) {
-        return PlanInputRouting::Continue;
-    }
-
-    if !app.plan.recap_offered {
-        return PlanInputRouting::Continue;
-    }
-
-    let goal = app.plan.goal.clone();
-    let intent = if raven_tui::plan_intent::is_explicit_proceed_approval(prompt) {
-        PlanProceedIntent::Proceed
-    } else if raven_tui::plan_intent::is_soft_proceed_candidate(prompt) {
-        classify_plan_proceed_intent(backend, flags, prompt, &goal).await
-    } else {
-        PlanProceedIntent::ContinuePlanning
-    };
-
-    match intent {
-        PlanProceedIntent::Proceed => {
-            confirm_plan_proceed(app, agent);
-            app.plan.recap_offered = false;
-            PlanInputRouting::Continue
-        }
-        PlanProceedIntent::Cancel => {
-            app.left_committed.push(format!("> {}", prompt));
-            cancel_plan_mode(app, agent);
-            app.clear_input();
-            app.needs_redraw = true;
-            PlanInputRouting::Stop
-        }
-        PlanProceedIntent::ContinuePlanning => PlanInputRouting::Continue,
-    }
+    workspace: &std::path::Path,
+) -> String {
+    approve_plan_for_execution(app, agent);
+    app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+    app.plan.pending_proposal = None;
+    app.plan.recap_offered = false;
+    app.left_committed
+        .push("▶ Plan approved — starting execution.".to_string());
+    format_plan_execution_user_prompt(&app.plan, workspace)
 }
 
-/// User approved the plan — switch to work mode and populate steps from plan.md.
-pub fn confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
+fn approve_plan_for_execution(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
     if let Ok(mut ag) = agent.try_lock() {
         ag.set_agent_mode("work");
         if let Some(s) = &mut ag.session_mut() {
@@ -1292,10 +1060,6 @@ pub fn confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
         populate_steps_on_proceed(app, agent);
     }
 
-    app.left_committed.push(
-        "Plan confirmed by user. Switching to work mode. Executing...".to_string(),
-    );
-
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = &mut ag.session_mut() {
             let _ = s.update_goal(
@@ -1305,20 +1069,6 @@ pub fn confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
             );
         }
     }
-}
-
-/// Sync heuristic proceed gate (tests / callers without LLM routing).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn try_confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>, prompt: &str) -> bool {
-    let current_mode = agent
-        .try_lock()
-        .map(|ag| ag.current_agent_mode())
-        .unwrap_or_default();
-    if current_mode != "plan" || !is_proceed_confirmation(prompt) {
-        return false;
-    }
-    confirm_plan_proceed(app, agent);
-    true
 }
 
 fn populate_steps_on_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
@@ -1375,7 +1125,7 @@ fn populate_steps_on_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
-            let _ = s.write_wiki_file("plan.md", &wiki_template_approved(&app.plan));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_approved(&app.plan));
         }
     }
 }
@@ -1383,29 +1133,6 @@ fn populate_steps_on_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn execution_user_prompt_lists_steps_and_wiki_hint() {
-        let mut plan = PlanState::default();
-        plan.goal = "Build game".into();
-        plan.success_criteria = "Runs".into();
-        plan.current_step = 0;
-        plan.steps = vec![PlanStep {
-            description: "mkdir galaga".into(),
-            verification: Some("mkdir -p galaga".into()),
-            tier: Some(PlanStepTier::Exec),
-            status: PlanStepStatus::InProgress,
-            ..Default::default()
-        }];
-        let ws = std::env::temp_dir();
-        let prompt = format_plan_execution_user_prompt(&plan, &ws);
-        assert!(prompt.contains("mkdir galaga"));
-        assert!(prompt.contains("wiki plan.md"));
-        assert!(prompt.contains("← CURRENT"));
-        assert!(prompt.contains("Begin with step 1"));
-        assert!(prompt.contains("Deliverable location"));
-        assert!(prompt.contains("galaga/"));
-    }
 
     #[test]
     fn detects_various_plan_triggers() {
@@ -1540,51 +1267,10 @@ mod tests {
     }
 
     #[test]
-    fn format_plan_steps_json_block_roundtrip() {
-        let steps = vec![PlanStep {
-            description: "Ship it".to_string(),
-            verification: Some("cargo test".to_string()),
-            tier: Some(PlanStepTier::Exec),
-            note: None,
-            observe_prompt: None,
-            status: PlanStepStatus::Pending,
-        }];
-        let block = format_plan_steps_json_block(&steps);
-        assert!(block.contains(PLAN_STEPS_JSON_MARKER));
-        let json = extract_plan_steps_json(&block).expect("extract");
-        let parsed = parse_plan_steps_json(&json).expect("parse");
-        assert_eq!(parsed[0].description, "Ship it");
-        assert_eq!(parsed[0].tier.as_deref(), Some("exec"));
-    }
-
-    #[test]
     fn derive_fallback_steps_three_phases() {
         let steps = derive_fallback_steps("fix the bug", &["cargo test".to_string()]);
         assert_eq!(steps.len(), 3);
         assert!(steps[0].description.contains("Implement"));
-    }
-
-    #[test]
-    fn format_plan_status_shows_goal_and_steps() {
-        let mut plan = PlanState {
-            goal: "Ship feature".to_string(),
-            steps: vec![PlanStep {
-                description: "Implement".to_string(),
-                tier: Some(PlanStepTier::Exec),
-                status: PlanStepStatus::InProgress,
-                ..Default::default()
-            }],
-            current_step: 0,
-            ..Default::default()
-        };
-        let text = format_plan_status(&plan, "work");
-        assert!(text.contains("Ship feature"));
-        assert!(text.contains("Implement"));
-        assert!(text.contains("exec"));
-        plan.steps[0].status = PlanStepStatus::Done;
-        plan.current_step = 1;
-        let done = format_plan_status(&plan, "work");
-        assert!(done.contains("1/1 complete"));
     }
 
     #[test]

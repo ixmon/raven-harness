@@ -18,6 +18,7 @@ mod input_dispatch;
 mod input_handler;
 mod plan_flow;
 mod plan_sync;
+mod plan_prompts;
 mod key_edit;
 mod event_loop;
 mod keystore;

@@ -604,15 +604,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                 UiUpdate::PlanLoopProceedClassified(intent) => {
                     match intent {
                         raven_tui::plan_intent::PlanProceedIntent::Proceed => {
-                            crate::plan_flow::confirm_plan_proceed(&mut app, &agent);
-                            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
-                            app.plan.pending_proposal = None;
-                            app.plan.recap_offered = false;
-                            app.left_committed
-                                .push("▶ Plan approved — starting execution.".to_string());
                             app.deferred_agent_prompt = Some(
-                                crate::plan_flow::format_plan_execution_user_prompt(
-                                    &app.plan,
+                                crate::plan_flow::start_plan_execution(
+                                    &mut app,
+                                    &agent,
                                     &config.workspace,
                                 ),
                             );
