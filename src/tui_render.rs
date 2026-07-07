@@ -543,7 +543,7 @@ pub fn draw_right_pane(
 ) {
     *last_right_area = right_area;
 
-    let cursor_bg = Color::Rgb(0x1a, 0x22, 0x38); // subtle dark blue tint
+    let cursor_bg = Color::Rgb(0x1e, 0x3a, 0x5f); // navy blue — visible on dark terminals
     let fold_indicator_style = Style::default().fg(Color::DarkGray);
 
     // Compute fold-aware visible lines
@@ -563,9 +563,14 @@ pub fn draw_right_pane(
                         .fg(Color::Black)
                         .bg(Color::Magenta)
                         .add_modifier(Modifier::BOLD)
+                } else if is_cursor_line {
+                    // Cursor line: bright text on navy blue bg
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(cursor_bg)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    let base = trace_line_style(line);
-                    if is_cursor_line { base.bg(cursor_bg) } else { base }
+                    trace_line_style(line)
                 };
 
                 // Check if this is the first body line of an expanded block — add ▾
@@ -574,10 +579,21 @@ pub fn draw_right_pane(
                 });
 
                 if is_expanded_body_start {
-                    right_text.lines.push(Line::from(vec![
-                        Span::styled(line.clone(), style),
-                        Span::styled("  ▾", fold_indicator_style),
-                    ]));
+                    if is_cursor_line {
+                        right_text.lines.push(Line::from(vec![
+                            Span::styled(format!("▶{}", line), style),
+                            Span::styled("  ▾", fold_indicator_style),
+                        ]));
+                    } else {
+                        right_text.lines.push(Line::from(vec![
+                            Span::styled(line.clone(), style),
+                            Span::styled("  ▾", fold_indicator_style),
+                        ]));
+                    }
+                } else if is_cursor_line {
+                    right_text
+                        .lines
+                        .push(Line::from(Span::styled(format!("▶{}", line), style)));
                 } else {
                     right_text
                         .lines
