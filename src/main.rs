@@ -39,6 +39,7 @@ mod search;
 mod settings_modal;
 mod tui_app;
 mod tui_render;
+mod trace_fold;
 
 #[derive(Parser, Debug)]
 #[command(

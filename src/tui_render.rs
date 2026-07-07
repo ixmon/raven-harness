@@ -57,7 +57,7 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
         ),
         Span::styled("  ", Style::default()),
         Span::styled(data.balance_label, balance_label_style(data.balance_label)),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x60, 0x60, 0x70))),
         Span::styled("ctx:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             {
@@ -76,25 +76,25 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
                 }
             },
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x55, 0x55, 0x64))),
         Span::styled("tps:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{:.1}", data.tps),
             Style::default().fg(Color::Rgb(0x80, 0xd0, 0x80)),
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x4a, 0x4a, 0x58))),
         Span::styled("Approval:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             data.mode_label.split(" - ").next().unwrap_or("?"),
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x40, 0x40, 0x4e))),
         Span::styled("Run Mode:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             data.agent_mode,
             Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff)),
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x38, 0x38, 0x44))),
         Span::styled("goal:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             truncate_str(data.goal_text, 40),
@@ -499,7 +499,7 @@ pub fn draw_left_pane(
 ) {
     *last_left_area = left_area;
 
-    let mut left_text =
+    let (mut left_text, gutter_colors) =
         build_conversation_text(left_committed, current_response, highlight_line);
 
     let title_str = if draw_frame { "  Conversation" } else { "" };
@@ -520,6 +520,8 @@ pub fn draw_left_pane(
         title_str,
         Color::Cyan,
         subtitle,
+        3, // border + space + gutter column, then content
+        Some(&gutter_colors),
     );
 }
 
@@ -535,36 +537,93 @@ pub fn draw_right_pane(
     focused_pane: Pane,
     scroll_flash_timer: u8,
     highlight_line: Option<usize>,
+    trace_cursor: usize,
+    trace_cursor_active: bool,
+    trace_expanded: &std::collections::HashSet<usize>,
 ) {
     *last_right_area = right_area;
+
+    let cursor_bg = Color::Rgb(0x1a, 0x22, 0x38); // subtle dark blue tint
+    let fold_indicator_style = Style::default().fg(Color::DarkGray);
+
+    // Compute fold-aware visible lines
+    let blocks = crate::trace_fold::detect_tool_blocks(trace_lines);
+    let visible = crate::trace_fold::compute_visible_lines(trace_lines, &blocks, trace_expanded);
 
     let mut right_text = Text::default();
     let mut line_idx = 0usize;
 
-    for line in trace_lines {
-        let style = if Some(line_idx) == highlight_line {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            trace_line_style(line)
-        };
-        right_text
-            .lines
-            .push(Line::from(Span::styled(line.clone(), style)));
+    for vline in &visible {
+        match vline {
+            crate::trace_fold::VisibleLine::Original(orig_idx) => {
+                let line = &trace_lines[*orig_idx];
+                let is_cursor_line = trace_cursor_active && *orig_idx == trace_cursor;
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    let base = trace_line_style(line);
+                    if is_cursor_line { base.bg(cursor_bg) } else { base }
+                };
+
+                // Check if this is the first body line of an expanded block — add ▾
+                let is_expanded_body_start = blocks.iter().any(|b| {
+                    trace_expanded.contains(&b.header_idx) && *orig_idx == b.body_start && b.body_len() > 0
+                });
+
+                if is_expanded_body_start {
+                    right_text.lines.push(Line::from(vec![
+                        Span::styled(line.clone(), style),
+                        Span::styled("  ▾", fold_indicator_style),
+                    ]));
+                } else {
+                    right_text
+                        .lines
+                        .push(Line::from(Span::styled(line.clone(), style)));
+                }
+            }
+            crate::trace_fold::VisibleLine::FoldSummary {
+                header_idx,
+                line_count,
+                is_error,
+                summary,
+                ..
+            } => {
+                let is_cursor_line = trace_cursor_active
+                    && blocks.iter().any(|b| {
+                        b.header_idx == *header_idx && trace_cursor >= b.header_idx && trace_cursor < b.end_idx
+                    });
+                let icon = if *is_error { "❌" } else { "✅" };
+                let summary_short = if summary.len() > 60 {
+                    format!("{}…", &summary[..57])
+                } else {
+                    summary.clone()
+                };
+                let fold_text = format!("   {} {} ({} lines) ▸", icon, summary_short, line_count);
+                let style = if is_cursor_line {
+                    Style::default().fg(Color::DarkGray).bg(cursor_bg)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                right_text
+                    .lines
+                    .push(Line::from(Span::styled(fold_text, style)));
+            }
+        }
         line_idx += 1;
     }
 
     if !current_thinking.is_empty() {
-        if !trace_lines.is_empty() {
+        if !visible.is_empty() {
             right_text.lines.push(Line::from(""));
             line_idx += 1;
         }
         right_text.lines.push(Line::from(Span::styled(
             "Thinking (live):",
             Style::default()
-                .fg(Color::LightCyan) // ANSI16: LightCyan, 256-color: 14, TrueColor: #00e5e5
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         )));
         line_idx += 1;
@@ -597,6 +656,8 @@ pub fn draw_right_pane(
         scroll_flash_timer,
         "  Trace",
         Color::Rgb(0xd0, 0xa0, 0xff),
+        None,
+        1,
         None,
     );
 }
@@ -660,8 +721,9 @@ fn trace_line_style(line: &str) -> Style {
     }
 }
 
-/// Horizontal space reserved inside a scrollable pane: scrollbar(1) + borders(2) + padding(2).
-const PANE_INNER_WIDTH_RESERVE: u16 = 5;
+/// Horizontal space reserved inside a scrollable pane (excluding left_pad):
+/// scrollbar(1) + borders(2) + right_pad(1) = 4; add left_pad at call site.
+const PANE_WIDTH_RESERVE_BASE: u16 = 4;
 const PANE_BORDER_HEIGHT: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -676,10 +738,10 @@ struct PaneScrollMetrics {
 /// The Paragraph widget uses `Wrap { trim: false }`, so logical lines wider than
 /// the inner width occupy multiple visual rows. `max_scroll` is derived from the
 /// visible content height (inside borders, minus an optional title row).
-fn pane_scroll_metrics(area: Rect, text: &Text, has_title: bool) -> PaneScrollMetrics {
+fn pane_scroll_metrics(area: Rect, text: &Text, has_title: bool, left_pad: u16) -> PaneScrollMetrics {
     let title_height = u16::from(has_title);
     let content_height = area.height.saturating_sub(PANE_BORDER_HEIGHT + title_height);
-    let inner_width = area.width.saturating_sub(PANE_INNER_WIDTH_RESERVE).max(1) as usize;
+    let inner_width = area.width.saturating_sub(PANE_WIDTH_RESERVE_BASE + left_pad).max(1) as usize;
     let line_count = count_visual_lines(text, inner_width);
     let max_scroll = line_count.saturating_sub(content_height);
     PaneScrollMetrics {
@@ -715,13 +777,15 @@ fn render_scrollable_pane(
     title: &str,
     title_color: Color,
     subtitle: Option<String>,
+    left_pad: u16,
+    gutter_colors: Option<&[Color]>,
 ) {
     let has_title = !title.trim().is_empty();
     let PaneScrollMetrics {
         line_count,
         content_height,
         max_scroll,
-    } = pane_scroll_metrics(area, text, has_title);
+    } = pane_scroll_metrics(area, text, has_title, left_pad);
     *last_line_count = line_count;
     if follow_output {
         *scroll = max_scroll;
@@ -741,6 +805,8 @@ fn render_scrollable_pane(
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
 
+    let inner_width = area.width.saturating_sub(PANE_WIDTH_RESERVE_BASE + left_pad).max(1) as usize;
+
     let block = if title.trim().is_empty() {
         Paragraph::new(text.clone())
             .block(
@@ -748,18 +814,19 @@ fn render_scrollable_pane(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(focus_style)
-                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .padding(ratatui::widgets::Padding::new(left_pad, 1, 0, 0))
                     .style(Style::default().bg(Color::Black)),
             )
             .wrap(Wrap { trim: false })
             .scroll((*scroll, 0))
     } else {
+        let active_title_color = if focused { title_color } else { Color::Rgb(0x55, 0x55, 0x66) };
         let title_line = if let Some(sub) = subtitle {
             Line::from(vec![
                 Span::styled(
                     title,
                     Style::default()
-                        .fg(title_color)
+                        .fg(active_title_color)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(sub, Style::default().fg(Color::DarkGray)),
@@ -768,7 +835,7 @@ fn render_scrollable_pane(
             Line::from(Span::styled(
                 title,
                 Style::default()
-                    .fg(title_color)
+                    .fg(active_title_color)
                     .add_modifier(Modifier::BOLD),
             ))
         };
@@ -779,7 +846,7 @@ fn render_scrollable_pane(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(focus_style)
-                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .padding(ratatui::widgets::Padding::new(left_pad, 1, 0, 0))
                     .style(Style::default().bg(Color::Black)),
             )
             .wrap(Wrap { trim: false })
@@ -788,12 +855,64 @@ fn render_scrollable_pane(
 
     f.render_widget(block, area);
 
+    // Paint gutter overlay in the padding column.
+    if let Some(colors) = gutter_colors {
+        // Gutter column: 2 chars after the left border (1 char breathing room)
+        let gutter_x = area.x + 2;
+        // Content rows start right after the top border (title is ON the border)
+        let content_y = area.y + 1;
+        let visible_rows = content_height as usize;
+
+        // Walk logical lines, accumulating visual rows to find which logical
+        // line maps to each visible row (accounting for scroll offset).
+        let mut visual_row: usize = 0; // absolute visual row (before scroll)
+        let scroll_offset = *scroll as usize;
+
+        for (logical_idx, line) in text.lines.iter().enumerate() {
+            let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            let rows_for_line = if line_width == 0 {
+                1
+            } else {
+                line_width.div_ceil(inner_width)
+            };
+
+            let color = colors.get(logical_idx).copied().unwrap_or(Color::Reset);
+
+            for r in 0..rows_for_line {
+                let abs_row = visual_row + r;
+                if abs_row >= scroll_offset {
+                    let screen_row = abs_row - scroll_offset;
+                    if screen_row >= visible_rows {
+                        break;
+                    }
+                    if color != Color::Reset {
+                        let y = content_y + screen_row as u16;
+                        let buf = f.buffer_mut();
+                        if gutter_x < area.x + area.width && y < area.y + area.height {
+                            buf[(gutter_x, y)]
+                                .set_char('▎')
+                                .set_style(Style::default().fg(color));
+                        }
+                    }
+                }
+            }
+            visual_row += rows_for_line;
+            if visual_row >= scroll_offset + visible_rows {
+                break; // past the visible area, stop
+            }
+        }
+    }
+
     if line_count > content_height {
         use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
         let mut sb_state = ScrollbarState::new(line_count as usize).position((*scroll) as usize);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
-            .end_symbol(None);
+            .end_symbol(None)
+            .track_symbol(Some("░"))
+            .track_style(Style::default().fg(Color::Rgb(0x28, 0x28, 0x35)))
+            .thumb_symbol("█")
+            .thumb_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x66)));
         f.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
 }
@@ -937,8 +1056,8 @@ mod scroll_metrics_tests {
     fn titled_pane_reduces_content_height() {
         let area = Rect::new(0, 0, 30, 12);
         let text = text_from_lines(&["line"]);
-        let untitled = pane_scroll_metrics(area, &text, false);
-        let titled = pane_scroll_metrics(area, &text, true);
+        let untitled = pane_scroll_metrics(area, &text, false, 1);
+        let titled = pane_scroll_metrics(area, &text, true, 1);
         assert_eq!(untitled.content_height, 10);
         assert_eq!(titled.content_height, 9);
     }
@@ -949,7 +1068,7 @@ mod scroll_metrics_tests {
         // inner width = 20 - 5 = 15
         let text = text_from_lines(&["x".repeat(30).as_str()]);
         assert_eq!(count_visual_lines(&text, 15), 2);
-        let metrics = pane_scroll_metrics(area, &text, false);
+        let metrics = pane_scroll_metrics(area, &text, false, 1);
         assert_eq!(metrics.line_count, 2);
         assert_eq!(metrics.content_height, 8);
         assert_eq!(metrics.max_scroll, 0);
@@ -965,7 +1084,7 @@ mod scroll_metrics_tests {
                 .map(|s| Line::from(s.as_str()))
                 .collect::<Vec<_>>(),
         );
-        let metrics = pane_scroll_metrics(area, &text, true);
+        let metrics = pane_scroll_metrics(area, &text, true, 1);
         // height 8 - borders 2 - title 1 = 5 visible rows; 20 lines -> max_scroll 15
         assert_eq!(metrics.content_height, 5);
         assert_eq!(metrics.line_count, 20);
@@ -976,8 +1095,8 @@ mod scroll_metrics_tests {
     fn metrics_are_stable_across_calls() {
         let area = Rect::new(0, 0, 25, 10);
         let text = text_from_lines(&["alpha", "beta beta beta beta"]);
-        let first = pane_scroll_metrics(area, &text, true);
-        let second = pane_scroll_metrics(area, &text, true);
+        let first = pane_scroll_metrics(area, &text, true, 1);
+        let second = pane_scroll_metrics(area, &text, true, 1);
         assert_eq!(first, second);
         assert!(first.max_scroll <= first.line_count);
     }
@@ -1056,6 +1175,10 @@ pub struct WorkspaceDrawData<'a> {
     pub right_highlight: Option<usize>,
     // Plan mode overlay pane (shown when run mode == "plan" or plan.active)
     pub plan: Option<&'a PlanState>,
+    // Trace pane cursor
+    pub trace_cursor: usize,
+    pub trace_cursor_active: bool,
+    pub trace_expanded: &'a std::collections::HashSet<usize>,
 }
 
 pub fn draw_content_desktop(
@@ -1334,6 +1457,9 @@ pub fn draw_content_desktop(
                 right_focus,
                 workspace.scroll_flash_timer,
                 workspace.right_highlight,
+                workspace.trace_cursor,
+                workspace.trace_cursor_active,
+                workspace.trace_expanded,
             );
         }
     }
@@ -1373,7 +1499,8 @@ fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], 
         nav_text.lines.push(Line::from(Span::styled(shown, style)));
     }
     if items.is_empty() {
-        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
+        nav_text.lines.push(Line::from(Span::styled("  ···", Style::default().fg(Color::Rgb(0x44, 0x44, 0x55)))));
+        nav_text.lines.push(Line::from(Span::styled("  No headings yet", Style::default().fg(Color::DarkGray))));
     }
     let nav_para = Paragraph::new(nav_text)
         .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
@@ -1407,7 +1534,7 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     content_text.lines.push(Line::from(""));
 
     let md = if viewer.content.is_empty() {
-        "(empty wiki file)".to_string()
+        "🪶 Empty page — the agent will populate this as it works".to_string()
     } else {
         viewer.content.clone()
     };
@@ -1474,7 +1601,9 @@ fn draw_picker_tree(
     let mut text = Text::default();
 
     if items.is_empty() {
-        text.lines.push(Line::from(Span::styled("  (no workspaces)", Style::default().fg(Color::DarkGray))));
+        text.lines.push(Line::from(Span::styled("  🪶", Style::default().fg(Color::Rgb(0x55, 0x55, 0x66)))));
+        text.lines.push(Line::from(Span::styled("  No workspaces yet", Style::default().fg(Color::DarkGray))));
+        text.lines.push(Line::from(Span::styled("  Start a conversation below", Style::default().fg(Color::Rgb(0x44, 0x44, 0x55)))));
     } else {
         // Compute usable width from the rendered pane area (borders on each side).
         // We subtract a small margin so text doesn't butt against the right border.
@@ -1592,7 +1721,7 @@ fn draw_sessions_column(
     text.lines.push(Line::from(""));
 
     if sessions.is_empty() {
-        text.lines.push(Line::from(Span::styled("  (no sessions)", Style::default().fg(Color::DarkGray))));
+        text.lines.push(Line::from(Span::styled("  🪶 No sessions yet", Style::default().fg(Color::DarkGray))));
     } else {
         for (i, s) in sessions.iter().enumerate().take(12) {
             let is_sel = i == selected;
@@ -1660,10 +1789,10 @@ fn draw_session_summary(
     let max_lines = (content_area.height as usize).saturating_sub(4);
 
     let text = if summary.is_empty() {
-        Text::from(Line::from(Span::styled(
-            "  (no session)",
-            Style::default().fg(Color::DarkGray),
-        )))
+        Text::from(vec![
+            Line::from(Span::styled("  🪶", Style::default().fg(Color::Rgb(0x55, 0x55, 0x66)))),
+            Line::from(Span::styled("  Select a session to preview", Style::default().fg(Color::DarkGray))),
+        ])
     } else if summary_is_markdown {
         markdown_viewport(summary, scroll, max_lines)
     } else {
@@ -2013,7 +2142,8 @@ fn build_left_text(
     current_response: &str,
     highlight_line: Option<usize>,
 ) -> Text<'static> {
-    build_conversation_text(left_committed, current_response, highlight_line)
+    let (text, _gutter_colors) = build_conversation_text(left_committed, current_response, highlight_line);
+    text
 }
 
 fn build_right_text(
@@ -2089,7 +2219,7 @@ fn render_scrollable_pane_buf(
         line_count,
         max_scroll,
         ..
-    } = pane_scroll_metrics(area, text, has_title);
+    } = pane_scroll_metrics(area, text, has_title, 1);
     *last_line_count = line_count;
     *scroll = (*scroll).min(max_scroll);
 

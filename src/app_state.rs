@@ -143,6 +143,11 @@ pub struct App {
     pub focused_pane: Pane,
     pub scroll_flash_timer: u8,
 
+    // Trace pane cursor (interactive navigation + fold/unfold)
+    pub trace_cursor: usize,       // highlighted line index in trace_lines
+    pub trace_cursor_active: bool, // true once user explicitly moves cursor
+    pub trace_expanded: std::collections::HashSet<usize>, // header indices of expanded blocks
+
     // Agent turn queued from async plan-loop proceed classification.
     pub deferred_agent_prompt: Option<String>,
 
@@ -241,6 +246,9 @@ pub struct App {
 
     // Plan Mode state (new pane + run mode "plan")
     pub plan: PlanState,
+
+    // Session ID for trace persistence (set at startup, avoids needing agent lock for appends)
+    pub session_id: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -271,6 +279,9 @@ impl App {
             right_follow_output: true,
             focused_pane: Pane::Left,
             scroll_flash_timer: 0,
+            trace_cursor: 0,
+            trace_cursor_active: false,
+            trace_expanded: std::collections::HashSet::new(),
             deferred_agent_prompt: None,
             is_processing: false,
             spinner_tick: 0,
@@ -342,6 +353,16 @@ impl App {
             },
             wiki_viewer: WikiBrowser::default(),
             plan: PlanState::default(),
+            session_id: config.prebuilt_session.as_ref().map(|s| s.id.clone()),
+        }
+    }
+
+    /// Persist a trace event to trace_log.jsonl (best-effort, never fails loudly).
+    pub fn persist_trace_event(&self, event: &raven_tui::session::TraceEvent) {
+        if let Some(ref sid) = self.session_id {
+            if let Ok(sess) = raven_tui::session::Session::open(sid) {
+                let _ = sess.append_trace(event);
+            }
         }
     }
 
@@ -602,7 +623,86 @@ impl App {
         if !matches!(pane, Pane::Left | Pane::Right) {
             return;
         }
-        self.scroll_pane_line(pane, delta);
+        if pane == Pane::Right {
+            self.move_trace_cursor(delta);
+        } else {
+            self.scroll_pane_line(pane, delta);
+        }
+    }
+
+    /// Move the trace cursor up/down and auto-scroll the viewport to follow.
+    fn move_trace_cursor(&mut self, delta: i16) {
+        if self.trace_lines.is_empty() {
+            return;
+        }
+        let max_idx = self.trace_lines.len().saturating_sub(1);
+        if !self.trace_cursor_active {
+            // First activation: place cursor at the center of the visible viewport
+            self.trace_cursor_active = true;
+            // Approximate: visible height is unknown here, so place at scroll position
+            self.trace_cursor = (self.right_scroll as usize).min(max_idx);
+        }
+        let old = self.trace_cursor;
+        if delta < 0 {
+            self.right_follow_output = false;
+            self.trace_cursor = self.trace_cursor.saturating_sub((-delta) as usize);
+        } else {
+            self.right_follow_output = false;
+            self.trace_cursor = (self.trace_cursor + delta as usize).min(max_idx);
+        }
+        if old == self.trace_cursor {
+            self.scroll_flash_timer = 10;
+        }
+        // Auto-scroll to keep cursor visible (2-line margin from edges).
+        // The actual content height is computed during render, but we can use
+        // a reasonable estimate from the last known right pane height.
+        // The render loop will clamp scroll as needed.
+        let cursor = self.trace_cursor as u16;
+        let margin: u16 = 2;
+        if cursor < self.right_scroll + margin {
+            self.right_scroll = cursor.saturating_sub(margin);
+        }
+        // Use a reasonable default visible height (will be clamped in render).
+        // We don't have the exact pane height here, but 30 is a safe estimate;
+        // the render pass will clamp scroll to max_scroll anyway.
+        let visible_approx: u16 = 30;
+        if cursor >= self.right_scroll + visible_approx.saturating_sub(margin) {
+            self.right_scroll = cursor.saturating_sub(visible_approx.saturating_sub(margin + 1));
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Deactivate the trace cursor (return to scroll-only mode).
+    pub fn deactivate_trace_cursor(&mut self) {
+        self.trace_cursor_active = false;
+        self.needs_redraw = true;
+    }
+
+    /// Toggle fold on the tool block under the current trace cursor.
+    pub fn toggle_trace_fold(&mut self) {
+        let blocks = crate::trace_fold::detect_tool_blocks(&self.trace_lines);
+        if let Some(header_idx) = crate::trace_fold::block_for_line(&blocks, self.trace_cursor) {
+            if self.trace_expanded.contains(&header_idx) {
+                self.trace_expanded.remove(&header_idx);
+            } else {
+                self.trace_expanded.insert(header_idx);
+            }
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Toggle fold all: if any blocks are expanded, collapse all; otherwise expand all.
+    pub fn toggle_trace_fold_all(&mut self) {
+        let blocks = crate::trace_fold::detect_tool_blocks(&self.trace_lines);
+        if self.trace_expanded.is_empty() {
+            // Expand all non-error blocks (error blocks are always expanded)
+            for b in &blocks {
+                self.trace_expanded.insert(b.header_idx);
+            }
+        } else {
+            self.trace_expanded.clear();
+        }
+        self.needs_redraw = true;
     }
 
     /// Scroll the focused pane by `delta` pages (PgUp/PgDn).
@@ -939,6 +1039,17 @@ impl App {
                 let recent = sess.load_recent_conversation(18);
                 self.left_committed =
                     crate::conversation_display::format_conversation_lines(&recent);
+                // Restore trace pane
+                let trace_events = sess.load_recent_trace(200);
+                if !trace_events.is_empty() {
+                    self.trace_lines = trace_events
+                        .iter()
+                        .map(|e| e.display.clone())
+                        .collect();
+                } else {
+                    self.trace_lines.clear();
+                }
+                self.session_id = Some(id.clone());
                 if let Ok(mut ag) = agent.try_lock() {
                     if let Ok(loaded_sess) = raven_tui::session::Session::open(&id) {
                         *ag.session_mut() = Some(loaded_sess);
@@ -1347,12 +1458,25 @@ impl App {
         let recent = loaded_sess.load_recent_conversation(25);
         self.left_committed = crate::conversation_display::format_conversation_lines(&recent);
 
+        // Restore trace pane from trace_log (before moving session to agent)
+        let trace_events = loaded_sess.load_recent_trace(200);
+        if !trace_events.is_empty() {
+            self.trace_lines = trace_events
+                .iter()
+                .map(|e| e.display.clone())
+                .collect();
+        } else {
+            self.trace_lines.clear();
+        }
+        self.trace_cursor = 0;
+        self.trace_cursor_active = false;
+        self.trace_expanded.clear();
+        self.session_id = Some(session_id.to_string());
+
         if let Ok(mut ag) = agent.try_lock() {
             *ag.session_mut() = Some(loaded_sess);
         }
 
-        // Reset other visible UI state (trace is runtime-only; conv is restored above)
-        self.trace_lines.clear();
         self.current_response.clear();
         self.current_thinking.clear();
         self.right_follow_output = true;

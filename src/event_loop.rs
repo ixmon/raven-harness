@@ -325,6 +325,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.left_committed =
                             crate::conversation_display::format_conversation_lines(&recent);
                     }
+                    // Restore trace pane from trace_log.jsonl
+                    let trace_events = s.load_recent_trace(200);
+                    if !trace_events.is_empty() {
+                        app.trace_lines = trace_events
+                            .iter()
+                            .map(|e| e.display.clone())
+                            .collect();
+                    }
                 }
             }
         }
@@ -438,7 +446,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                 UiUpdate::ToolStart { name, args } => {
                     // Always ensure tool debug lines start with the tool call icon at the front.
                     let tool_debug = format!("🔧 {}({})", name, truncate(&args, 90));
-                    app.trace_lines.push(tool_debug);
+                    app.trace_lines.push(tool_debug.clone());
+                    app.persist_trace_event(&raven_tui::session::TraceEvent::tool_start(
+                        &name, &args, &tool_debug,
+                    ));
                     app.tool_calls_this_turn += 1;
                     app.right_follow_output = true;
                     app.right_scroll = 10_000;
@@ -451,17 +462,26 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                 }
                 UiUpdate::ToolResult { name, summary } => {
-                    if name == "system" && summary.contains("JUDGE") {
-                        app.trace_lines.push(format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140)));
+                    let display = if name == "system" && summary.contains("JUDGE") {
+                        let d = format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140));
+                        app.trace_lines.push(d.clone());
+                        d
                     } else if name == "system" {
                         // system debug notes (nudges, stuck, denials etc.) keep a 🔧 marker
-                        app.trace_lines.push(format!("🔧 {}", truncate(&summary, 120)));
+                        let d = format!("🔧 {}", truncate(&summary, 120));
+                        app.trace_lines.push(d.clone());
+                        d
                     } else {
                         // Real tool result: use indented continuation (↳). Combined with the
                         // preceding ToolStart line, this puts a *single* 🔧 icon on the first
                         // line of the tool call block/output. No brain icons on tool lines.
-                        app.trace_lines.push(format!("   ↳ {}", truncate(&summary, 120)));
-                    }
+                        let d = format!("   ↳ {}", truncate(&summary, 120));
+                        app.trace_lines.push(d.clone());
+                        d
+                    };
+                    app.persist_trace_event(&raven_tui::session::TraceEvent::tool_result(
+                        &name, &summary, &display,
+                    ));
                     if app.plan.active && !app.plan.steps.is_empty() {
                         if name == "complete_plan_step" {
                             if let Some(observe) = &app.plan.pending_observe_prompt {
@@ -498,7 +518,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                             } else {
                                 format!("🧠 {}", first)
                             };
-                            app.trace_lines.push(first_settled);
+                            app.trace_lines.push(first_settled.clone());
+                            app.persist_trace_event(&raven_tui::session::TraceEvent::thinking(&first_settled));
 
                             for line in &lines[1..] {
                                 let l = line.trim_start();
@@ -507,7 +528,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 } else {
                                     format!("   {}", line)
                                 };
-                                app.trace_lines.push(settled);
+                                app.trace_lines.push(settled.clone());
+                                app.persist_trace_event(&raven_tui::session::TraceEvent::thinking(&settled));
                             }
                         }
                         app.current_thinking.clear();
@@ -877,6 +899,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         scroll_flash_timer: app.scroll_flash_timer,
                         left_highlight, right_highlight,
                         plan: if app.plan.active || agent_mode == "plan" { Some(&app.plan) } else { None },
+                        trace_cursor: app.trace_cursor,
+                        trace_cursor_active: app.trace_cursor_active,
+                        trace_expanded: &app.trace_expanded,
                     },
                     &tui_render::SplashData {
                         raven_art: &app.raven_art, base_url: &config.base_url,

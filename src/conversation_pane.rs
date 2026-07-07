@@ -12,28 +12,6 @@ fn is_plan_entry_confirm(entry: &str) -> bool {
     entry.trim().starts_with("Enter plan mode?")
 }
 
-fn push_attention_entry(
-    left_text: &mut Text<'static>,
-    entry: &str,
-    highlight_line: Option<usize>,
-    line_idx: &mut usize,
-    fg: Color,
-) {
-    let style = if Some(*line_idx) == highlight_line {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(fg).add_modifier(Modifier::BOLD)
-    };
-    for line in entry.lines() {
-        left_text
-            .lines
-            .push(Line::from(Span::styled(line.to_string(), style)));
-        *line_idx += 1;
-    }
-}
 
 fn conversation_entry_styles(entry: &str) -> (Style, Style) {
     if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
@@ -95,24 +73,36 @@ fn highlight_style() -> Style {
 }
 
 /// Build styled conversation text from committed lines and an optional streaming tail.
+///
+/// Returns `(text, gutter_colors)` where `gutter_colors[i]` is the color for the
+/// gutter bar on logical line `i`. The gutter is NOT embedded in the text — it is
+/// painted as an overlay by the render function so that wrapped lines stay aligned.
 pub fn build_conversation_text(
     left_committed: &[String],
     current_response: &str,
     highlight_line: Option<usize>,
-) -> Text<'static> {
+) -> (Text<'static>, Vec<Color>) {
     let mut left_text = Text::default();
+    let mut gutter_colors: Vec<Color> = Vec::new();
     let mut line_idx = 0usize;
     let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
+        let gutter_color = gutter_color_for(entry);
         if is_plan_entry_confirm(entry) {
-            push_attention_entry(
-                &mut left_text,
-                entry,
-                highlight_line,
-                &mut line_idx,
-                PLAN_ORANGE,
-            );
+            let style = if Some(line_idx) == highlight_line {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(PLAN_ORANGE).add_modifier(Modifier::BOLD)
+            };
+            for line in entry.lines() {
+                left_text.lines.push(Line::from(Span::styled(line.to_string(), style)));
+                gutter_colors.push(gutter_color);
+                line_idx += 1;
+            }
         } else if entry.starts_with("You: ")
             || entry.starts_with("> ")
             || entry.starts_with("You (interject")
@@ -136,9 +126,8 @@ pub fn build_conversation_text(
                 } else {
                     body_style
                 };
-                left_text
-                    .lines
-                    .push(Line::from(Span::styled(line.to_string(), style)));
+                left_text.lines.push(Line::from(Span::styled(line.to_string(), style)));
+                gutter_colors.push(gutter_color);
                 line_idx += 1;
             }
         } else {
@@ -155,28 +144,33 @@ pub fn build_conversation_text(
                     consecutive_blanks += 1;
                     if consecutive_blanks <= 2 {
                         left_text.lines.push(line);
+                        gutter_colors.push(gutter_color);
                     }
                 } else {
                     consecutive_blanks = 0;
                     left_text.lines.push(line);
+                    gutter_colors.push(gutter_color);
                 }
                 line_idx += 1;
             }
         }
         if i < left_committed.len() - 1 && consecutive_blanks < 2 {
             left_text.lines.push(Line::from(""));
+            gutter_colors.push(Color::Reset); // no gutter on separator lines
             line_idx += 1;
             consecutive_blanks += 1;
         }
     }
 
     if !current_response.is_empty() {
+        let stream_gutter = Color::Rgb(0x40, 0xb0, 0x40);
         left_text.lines.push(Line::from(Span::styled(
             "Agent (streaming):",
             Style::default()
                 .fg(Color::Green)
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         )));
+        gutter_colors.push(stream_gutter);
         line_idx += 1;
 
         let lines: Vec<&str> = current_response.lines().collect();
@@ -202,9 +196,8 @@ pub fn build_conversation_text(
             } else {
                 Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0))
             };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
+            left_text.lines.push(Line::from(Span::styled(line.to_string(), style)));
+            gutter_colors.push(stream_gutter);
             line_idx += 1;
         }
 
@@ -216,9 +209,39 @@ pub fn build_conversation_text(
                         .fg(Color::Rgb(0xd0, 0xf0, 0xd0))
                         .add_modifier(Modifier::ITALIC),
                 )));
+                gutter_colors.push(stream_gutter);
             }
         }
     }
 
-    left_text
+    (left_text, gutter_colors)
+}
+
+/// Determine gutter bar color from the entry content.
+pub fn gutter_color_for(entry: &str) -> Color {
+    if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
+        Color::Cyan
+    } else if entry.starts_with("Agent: ") || entry.starts_with("Agent (partial): ") {
+        Color::Rgb(0x40, 0xb0, 0x40)
+    } else if entry.contains("ERROR") || entry.starts_with("⚠") {
+        Color::Rgb(0xff, 0x60, 0x60)
+    } else if entry.starts_with("✅")
+        || entry.starts_with("⛔")
+        || entry.starts_with("⏹")
+        || entry.starts_with("🔒")
+    {
+        Color::Rgb(0xc0, 0xa0, 0x30)
+    } else if entry.starts_with("Raven Hotel - Loaded session")
+        || entry.starts_with("Use ↑/↓")
+    {
+        Color::Rgb(0x33, 0x33, 0x40)
+    } else if entry.contains("enter plan mode")
+        || entry.contains("Do you want to enter plan mode")
+        || entry.contains("Would you like to enter plan mode")
+        || is_plan_entry_confirm(entry)
+    {
+        PLAN_ORANGE
+    } else {
+        Color::Rgb(0x44, 0x44, 0x55)
+    }
 }

@@ -13,10 +13,10 @@ use ratatui::{
 /// Styles for our dark TUI theme (#1a1a22 background).
 pub mod md_style {
     use ratatui::style::{Color, Modifier, Style};
-    pub fn h1() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) }
-    pub fn h2() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) }
-    pub fn h3() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC) }
-    pub fn h_other() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::ITALIC) }
+    pub fn h1() -> Style { Style::default().fg(Color::Rgb(0xff, 0xd0, 0x60)).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) }
+    pub fn h2() -> Style { Style::default().fg(Color::Rgb(0xe0, 0xb0, 0x50)).add_modifier(Modifier::BOLD) }
+    pub fn h3() -> Style { Style::default().fg(Color::Rgb(0xc0, 0xa0, 0x60)).add_modifier(Modifier::ITALIC) }
+    pub fn h_other() -> Style { Style::default().fg(Color::Rgb(0xa0, 0x90, 0x60)).add_modifier(Modifier::ITALIC) }
     pub fn bold() -> Style { Style::default().add_modifier(Modifier::BOLD) }
     pub fn italic() -> Style { Style::default().add_modifier(Modifier::ITALIC) }
     pub fn bold_italic() -> Style { Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC) }
@@ -24,7 +24,7 @@ pub mod md_style {
     pub fn link() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED) }
     pub fn blockquote() -> Style { Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80)).add_modifier(Modifier::ITALIC) }
     pub fn table_border() -> Style { Style::default().fg(Color::DarkGray) }
-    pub fn table_header() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD) }
+    pub fn table_header() -> Style { Style::default().fg(Color::Rgb(0xff, 0xd0, 0x60)).add_modifier(Modifier::BOLD) }
     pub fn rule() -> Style { Style::default().fg(Color::DarkGray) }
     pub fn list_marker() -> Style { Style::default().fg(Color::DarkGray) }
 }

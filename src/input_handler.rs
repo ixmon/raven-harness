@@ -413,6 +413,21 @@ async fn handle_input_key(
         }
     }
 
+    // Trace pane fold/unfold: Enter toggles current block, z toggles all
+    if app.focused_pane == crate::app_state::Pane::Right && app.trace_cursor_active {
+        match key.code {
+            KeyCode::Enter => {
+                app.toggle_trace_fold();
+                return Ok(true);
+            }
+            KeyCode::Char('z') => {
+                app.toggle_trace_fold_all();
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
     // Slash menu navigation with arrows (or vim keys) when the / command menu is active.
     // This takes precedence over other input when typing a slash command.
     if app.input.starts_with('/') {
@@ -721,6 +736,8 @@ async fn handle_input_key(
             } else if app.desktop.showing_picker() && app.picker.adding_workspace {
                 app.picker.adding_workspace = false;
                 app.clear_input();
+            } else if app.trace_cursor_active {
+                app.deactivate_trace_cursor();
             } else if !app.input.is_empty() {
                 app.clear_input();
             }
