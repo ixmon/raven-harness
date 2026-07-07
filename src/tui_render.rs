@@ -1039,11 +1039,7 @@ pub struct PickerDrawData<'a> {
     pub summary_is_markdown: bool,
     /// When in the 3-pane overview (picker | nav | content), which column has focus.
     pub view_focus: crate::app_state::ViewFocus,
-    // Browser nav for Screen 2 (stable Harness + Wiki tree)
-    pub browser_nav_items: &'a [WikiNavItem],
-    pub browser_selected_nav: usize,
-    pub browser_wiki_content: &'a str,
-    pub browser_wiki_scroll: usize,
+    pub overview_browser: &'a crate::wiki_browser::WikiBrowser,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1198,10 +1194,7 @@ pub fn draw_content_desktop(
             let nav_area = cols[1];
             let content_area = cols[2];
 
-            let is_harness = crate::app_state::browser_nav_is_harness(
-                picker.browser_nav_items,
-                picker.browser_selected_nav,
-            );
+            let is_harness = picker.overview_browser.selected_is_harness();
             let picker_focused = picker.view_focus == crate::app_state::ViewFocus::Picker;
             let nav_focused = picker.view_focus == crate::app_state::ViewFocus::Nav;
             let content_focused = picker.view_focus == crate::app_state::ViewFocus::Content;
@@ -1210,7 +1203,14 @@ pub fn draw_content_desktop(
             draw_picker_tree(f, picker_area, picker.picker_items, picker.selected_item, picker_focused);
 
             // Nav column (Coding Harness at top, Wiki subtree under it; stable, no index.md)
-            draw_nav_pane_for_browser(f, nav_area, " Nav ", picker.browser_nav_items, picker.browser_selected_nav, nav_focused);
+            draw_nav_pane_for_browser(
+                f,
+                nav_area,
+                " Nav ",
+                &picker.overview_browser.nav_items,
+                picker.overview_browser.selected_nav,
+                nav_focused,
+            );
 
             // Content column: either wiki content or harness (status + conv + input)
             if is_harness {
@@ -1245,15 +1245,15 @@ pub fn draw_content_desktop(
             } else {
                 // Wiki content pane -- use browser content + custom markdown like full wiki
                 let wiki_border = if content_focused { Color::Cyan } else { Color::Rgb(0x55,0x55,0x66) };
-                let txt = if picker.browser_wiki_content.is_empty() {
+                let txt = if picker.overview_browser.content.is_empty() {
                     "(wiki content for selected nav item)".to_string()
                 } else {
-                    picker.browser_wiki_content.to_string()
+                    picker.overview_browser.content.clone()
                 };
                 let md_text = render_markdown(&txt);
                 let preview = Paragraph::new(md_text)
                     .wrap(Wrap { trim: true })
-                    .scroll((picker.browser_wiki_scroll as u16, 0))
+                    .scroll((picker.overview_browser.scroll as u16, 0))
                     .block(
                         Block::default()
                             .title(Span::styled(" Wiki ", Style::default().fg(if content_focused { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)))

@@ -366,10 +366,10 @@ async fn handle_input_key(
                         if !app.picker.loaded {
                             app.refresh_picker();
                         }
-                        if app.browser_nav_items.is_empty() {
+                        if app.overview_browser.nav_items.is_empty() {
                             let sid = app.picker.sessions.get(app.picker.selected_session).map(|m| m.session_id.clone());
                             if let Some(sid) = sid {
-                                app.rebuild_browser_nav_for_session(&sid);
+                                app.overview_browser.open_overview_session(&sid);
                             }
                         }
                         app.needs_redraw = true;

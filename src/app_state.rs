@@ -13,9 +13,11 @@ use raven_tui::agent::Agent;
 use raven_tui::session::{SessionMeta, WorkspaceEntry};
 
 pub use crate::plan_state::PlanState;
-pub use crate::wiki_doc::{
-    nav_is_harness as browser_nav_is_harness, NavItemKind, WikiLink, WikiNavItem,
-};
+pub use crate::wiki_browser::{WikiBrowser, WikiFocus};
+pub use crate::wiki_doc::{NavItemKind, WikiLink};
+
+/// Back-compat alias for render code.
+pub type WikiViewerState = WikiBrowser;
 
 #[cfg(feature = "clipboard")]
 #[allow(dead_code)]
@@ -78,13 +80,6 @@ pub enum SummaryAction {
     Launch,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum WikiFocus {
-    #[default]
-    Nav,
-    Content,
-}
-
 #[derive(Clone, Debug)]
 pub struct PickerItem {
     pub depth: usize,
@@ -95,25 +90,6 @@ pub struct PickerItem {
     // Stable keys for reliable re-selection after refresh (new 'n', deletes, etc.)
     pub workspace_path: std::path::PathBuf,
     pub session_id: Option<String>,
-}
-
-#[derive(Debug, Default)]
-pub struct WikiViewerState {
-    pub session_id: String,
-    pub current_file: String,
-    pub scroll: usize,
-    pub files: Vec<String>,
-    pub focus: WikiFocus,
-    pub content: String,
-    // Navigational elements (files + parsed links/headings from current wiki md)
-    pub nav_items: Vec<WikiNavItem>,
-    pub selected_nav: usize,
-}
-
-impl WikiViewerState {
-    pub fn selected_is_harness(&self) -> bool {
-        crate::wiki_doc::nav_is_harness(&self.nav_items, self.selected_nav)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -254,17 +230,14 @@ pub struct App {
     /// Focus for the picker+nav+content view (Screen 2 after sliding from splash).
     pub view_focus: ViewFocus,
 
-    // For Screen 2 browser nav (separate from wiki_viewer to keep stable tree)
-    pub browser_nav_items: Vec<WikiNavItem>,
-    pub browser_selected_nav: usize,
-    pub browser_wiki_content: String,
-    pub browser_wiki_scroll: usize,
+    /// Screen 2 middle/right wiki preview (stable Harness + Wiki tree).
+    pub overview_browser: WikiBrowser,
 
     // Session / workspace picker (new screen to the right of splash)
     pub picker: PickerState,
 
-    // Full wiki viewer screen
-    pub wiki_viewer: WikiViewerState,
+    // Full wiki viewer screen (Screen 3)
+    pub wiki_viewer: WikiBrowser,
 
     // Plan Mode state (new pane + run mode "plan")
     pub plan: PlanState,
@@ -355,10 +328,7 @@ impl App {
             raven_art: crate::desktop::load_raven_art(),
             splash_focus: SplashFocus::Magenta,
             view_focus: ViewFocus::Picker,
-            browser_nav_items: vec![],
-            browser_selected_nav: 0,
-            browser_wiki_content: String::new(),
-            browser_wiki_scroll: 0,
+            overview_browser: WikiBrowser::default(),
             picker: PickerState {
                 current_wiki_file: "index.md".to_string(),
                 current_wiki_content: String::new(),
@@ -370,7 +340,7 @@ impl App {
                 summary_action: SummaryAction::ViewWiki,
                 ..Default::default()
             },
-            wiki_viewer: WikiViewerState::default(),
+            wiki_viewer: WikiBrowser::default(),
             plan: PlanState::default(),
         }
     }
@@ -962,7 +932,7 @@ impl App {
             let id = meta.session_id.clone();
 
             // Build stable browser nav for Screen 2: Coding Harness top level, Wiki top level enclosing the wiki items (no index.md mention)
-            self.rebuild_browser_nav_for_session(&id);
+            self.overview_browser.open_overview_session(&id);
 
             // Populate conversation for display when Coding Harness selected in Screen 2
             if let Ok(sess) = raven_tui::session::Session::open(&id) {
@@ -978,129 +948,31 @@ impl App {
         }
     }
 
-    pub(crate) fn rebuild_browser_nav_for_session(&mut self, session_id: &str) {
-        let index_content =
-            raven_tui::session::read_session_wiki_file(session_id, "index.md").unwrap_or_default();
-
-        self.browser_nav_items = crate::wiki_doc::build_browser_overview_nav(&index_content);
-        self.browser_selected_nav = 0;
-        self.browser_wiki_content = index_content;
-        self.browser_wiki_scroll = 0;
-    }
-
-    fn update_browser_preview_from_nav(&mut self) {
-        if let Some(item) = self.browser_nav_items.get(self.browser_selected_nav) {
-            if item.kind == NavItemKind::Harness {
-                self.browser_wiki_content.clear();
-            } else {
-                let sess_id = self.picker.sessions.get(self.picker.selected_session)
-                    .map(|m| m.session_id.clone())
-                    .unwrap_or_default();
-                self.browser_wiki_content = raven_tui::session::read_session_wiki_file(
-                    &sess_id,
-                    &item.target_file,
-                )
-                .unwrap_or_else(|| format!("(could not read {})", item.target_file));
-            }
-        }
-        self.browser_wiki_scroll = 0;
-        self.needs_redraw = true;
-    }
-
     /// Enter the full wiki viewer for the currently selected session in the picker.
     pub fn enter_wiki_viewer(&mut self) {
+        self.enter_wiki_viewer_at(None);
+    }
+
+    pub(crate) fn enter_wiki_viewer_at(&mut self, file: Option<&str>) {
         if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
-            let id = meta.session_id.clone();
-            self.wiki_viewer.session_id = id.clone();
-            self.wiki_viewer.current_file = "index.md".to_string();
-            self.wiki_viewer.focus = WikiFocus::Nav;
-            self.wiki_viewer.scroll = 0;
-            self.wiki_viewer.selected_nav = 0;
-
-            self.wiki_viewer.files = raven_tui::session::collect_session_wiki_md_files(&id);
-
-            // Load initial content and build nav elements (links + headings)
-            self.load_wiki_viewer_content();
-            self.rebuild_wiki_viewer_nav();
-            // Prefer nav selection on an entry for the starting file
-            if let Some(pos) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == self.wiki_viewer.current_file) {
-                self.wiki_viewer.selected_nav = pos;
+            if let Some(f) = file {
+                self.wiki_viewer.seed_viewer_file(&meta.session_id, f);
+                self.wiki_viewer.files =
+                    raven_tui::session::collect_session_wiki_md_files(&meta.session_id);
+                self.wiki_viewer.focus = WikiFocus::Nav;
+                if let Some(pos) = self
+                    .wiki_viewer
+                    .nav_items
+                    .iter()
+                    .position(|it| it.target_file == self.wiki_viewer.current_file)
+                {
+                    self.wiki_viewer.selected_nav = pos;
+                }
+            } else {
+                self.wiki_viewer.open_viewer_session(&meta.session_id);
             }
-
             self.desktop.set_wiki_viewer();
             self.needs_redraw = true;
-        }
-    }
-
-    fn load_wiki_viewer_content(&mut self) {
-        if self.wiki_viewer.session_id.is_empty() {
-            return;
-        }
-        let clean = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
-        self.wiki_viewer.content = raven_tui::session::read_session_wiki_file(
-            &self.wiki_viewer.session_id,
-            &clean,
-        )
-        .unwrap_or_else(|| format!("(could not read {})", clean));
-        self.wiki_viewer.current_file = clean;
-        // nav rebuilt by caller after content change in most paths; safe to call here too
-        self.rebuild_wiki_viewer_nav();
-    }
-
-    fn rebuild_wiki_viewer_nav(&mut self) {
-        self.wiki_viewer.nav_items = crate::wiki_doc::build_viewer_nav(
-            &self.wiki_viewer.content,
-            &self.wiki_viewer.current_file,
-        );
-        if self.wiki_viewer.selected_nav >= self.wiki_viewer.nav_items.len() {
-            self.wiki_viewer.selected_nav = 0;
-        }
-    }
-
-    fn apply_wiki_nav_selection(&mut self, idx: usize) {
-        if idx >= self.wiki_viewer.nav_items.len() {
-            return;
-        }
-        let item = self.wiki_viewer.nav_items[idx].clone();
-        self.wiki_viewer.selected_nav = idx;
-        if item.kind == NavItemKind::Harness {
-            // Special: no file load, the caller/draw will show harness UI (conv+status+input) to right of nav
-            return;
-        }
-        let clean_target = crate::wiki_doc::normalize_wiki_path(&item.target_file);
-        let clean_cur = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
-
-        // Back or Link targeting a different file → load that file
-        let is_cross_file = clean_target != clean_cur
-            && matches!(item.kind, NavItemKind::Back | NavItemKind::Link);
-
-        if is_cross_file {
-            self.wiki_viewer.current_file = clean_target;
-            self.load_wiki_viewer_content();
-            // After rebuild, select first header if available
-            if let Some(first) = self.wiki_viewer.nav_items.iter().position(|it| it.kind == NavItemKind::Header) {
-                self.wiki_viewer.selected_nav = first;
-            } else {
-                self.wiki_viewer.selected_nav = 0;
-            }
-            self.wiki_viewer.scroll = 0;
-        } else {
-            // Same-file heading or link — just scroll to position
-            self.wiki_viewer.scroll = item.scroll_to;
-        }
-    }
-
-    /// Light scroll: if the currently selected nav item is in the current file
-    /// (a heading or same-file link), scroll content to its position.
-    /// Does NOT load files or rebuild nav — safe for Up/Down browsing.
-    fn scroll_to_nav_if_current_file(&mut self) {
-        if let Some(item) = self.wiki_viewer.nav_items.get(self.wiki_viewer.selected_nav) {
-            let clean_target = crate::wiki_doc::normalize_wiki_path(&item.target_file);
-            let clean_cur = crate::wiki_doc::normalize_wiki_path(&self.wiki_viewer.current_file);
-            if clean_target == clean_cur {
-                self.wiki_viewer.scroll = item.scroll_to;
-            }
-            // If it's a different file, don't scroll — user must Enter to load it
         }
     }
 
@@ -1120,142 +992,12 @@ impl App {
         }
     }
 
-    /// Handle keys when in the full wiki viewer screen.
-    /// Returns true if handled.
-    pub fn handle_wiki_viewer_key(&mut self, key: KeyCode, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) -> bool {
-        if !self.desktop.showing_wiki_viewer() {
-            return false;
-        }
-
-        match key {
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.wiki_viewer.focus == WikiFocus::Nav {
-                    // left from nav in Screen 3 back to Screen 2 (nav focused)
-                    self.desktop.set_overview();
-                    self.view_focus = ViewFocus::Nav;
-                    if self.browser_nav_items.is_empty() {
-                        let sid = self.picker.sessions.get(self.picker.selected_session).map(|m| m.session_id.clone());
-                        if let Some(sid) = sid {
-                            self.rebuild_browser_nav_for_session(&sid);
-                        }
-                    }
-                    self.needs_redraw = true;
-                    true
-                } else {
-                    // move to nav
-                    self.wiki_viewer.focus = WikiFocus::Nav;
-                    self.needs_redraw = true;
-                    true
-                }
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                if self.wiki_viewer.focus == WikiFocus::Content || self.wiki_viewer.selected_is_harness() {
-                    // Rightmost or on Coding Harness — move to full workspace screen with trace.
-                    let sid = self.wiki_viewer.session_id.clone();
-                    self.desktop.exit_wiki_viewer_to_workspace();
-                    if !sid.is_empty() {
-                        self.activate_session_by_id(&sid, agent);
-                    }
-                    self.needs_redraw = true;
-                    true
-                } else {
-                    self.wiki_viewer.focus = WikiFocus::Content;
-                    self.needs_redraw = true;
-                    true
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if self.wiki_viewer.focus == WikiFocus::Nav {
-                    if !self.wiki_viewer.nav_items.is_empty() {
-                        let n = self.wiki_viewer.nav_items.len();
-                        self.wiki_viewer.selected_nav =
-                            if self.wiki_viewer.selected_nav == 0 { n - 1 }
-                            else { self.wiki_viewer.selected_nav - 1 };
-                        // Scroll content if the item is in the current file (heading/link)
-                        self.scroll_to_nav_if_current_file();
-                        self.needs_redraw = true;
-                    }
-                } else {
-                    self.wiki_viewer.scroll = self.wiki_viewer.scroll.saturating_sub(1);
-                    self.needs_redraw = true;
-                }
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.wiki_viewer.focus == WikiFocus::Nav {
-                    if !self.wiki_viewer.nav_items.is_empty() {
-                        let n = self.wiki_viewer.nav_items.len();
-                        self.wiki_viewer.selected_nav = (self.wiki_viewer.selected_nav + 1) % n;
-                        // Scroll content if the item is in the current file (heading/link)
-                        self.scroll_to_nav_if_current_file();
-                        self.needs_redraw = true;
-                    }
-                } else {
-                    self.wiki_viewer.scroll = self.wiki_viewer.scroll.saturating_add(1);
-                    self.needs_redraw = true;
-                }
-                true
-            }
-            KeyCode::Tab => {
-                if self.wiki_viewer.focus == WikiFocus::Nav && !self.wiki_viewer.nav_items.is_empty() {
-                    let n = self.wiki_viewer.nav_items.len();
-                    let next = (self.wiki_viewer.selected_nav + 1) % n;
-                    if next == 0 {
-                        // Wrapped around — switch to Content pane
-                        self.wiki_viewer.focus = WikiFocus::Content;
-                    } else {
-                        self.wiki_viewer.selected_nav = next;
-                        self.scroll_to_nav_if_current_file();
-                    }
-                    self.needs_redraw = true;
-                } else {
-                    // From Content pane, Tab goes back to Nav
-                    self.wiki_viewer.focus = WikiFocus::Nav;
-                    self.needs_redraw = true;
-                }
-                true
-            }
-            KeyCode::Enter => {
-                if self.wiki_viewer.focus == WikiFocus::Nav {
-                    if self.wiki_viewer.selected_is_harness() {
-                        let sid = self.wiki_viewer.session_id.clone();
-                        self.desktop.exit_wiki_viewer_to_workspace();
-                        if !sid.is_empty() {
-                            self.activate_session_by_id(&sid, agent);
-                        }
-                        self.needs_redraw = true;
-                    } else if !self.wiki_viewer.nav_items.is_empty() {
-                        let idx = self.wiki_viewer.selected_nav;
-                        self.apply_wiki_nav_selection(idx);
-                        self.needs_redraw = true;
-                    }
-                }
-                true
-            }
-            KeyCode::Backspace => {
-                // Navigate back to index.md
-                if self.wiki_viewer.current_file != "index.md" {
-                    self.wiki_viewer.current_file = "index.md".to_string();
-                    self.wiki_viewer.scroll = 0;
-                    self.load_wiki_viewer_content();
-                    self.rebuild_wiki_viewer_nav();
-                    if let Some(pos) = self.wiki_viewer.nav_items.iter().position(|it| it.target_file == "index.md") {
-                        self.wiki_viewer.selected_nav = pos;
-                    } else {
-                        self.wiki_viewer.selected_nav = 0;
-                    }
-                    self.needs_redraw = true;
-                }
-                true
-            }
-            KeyCode::Char('r') | KeyCode::Char('R') => {
-                // reload current
-                self.load_wiki_viewer_content();
-                self.needs_redraw = true;
-                true
-            }
-            _ => true, // consume all keys — don't leak to workspace navigation
-        }
+    pub fn handle_wiki_viewer_key(
+        &mut self,
+        key: KeyCode,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        crate::wiki_handlers::handle_key(self, key, agent)
     }
 
     pub fn refresh_picker(&mut self) {
@@ -1327,7 +1069,7 @@ impl App {
         self.refresh_picker_summary();
     }
 
-    fn sync_picker_selection(&mut self) {
+    pub(crate) fn sync_picker_selection(&mut self) {
         if let Some(item) = self.picker.picker_items.get(self.picker.selected_item) {
             // Resolve workspace index by stable path when possible (handles list reorder)
             let wi = if let Some(pos) = self.picker.workspaces.iter().position(|w| w.path == item.workspace_path) {
@@ -1471,7 +1213,7 @@ impl App {
         }
     }
 
-    fn recompute_active_link(&mut self) {
+    pub(crate) fn recompute_active_link(&mut self) {
         if self.picker.wiki_links.is_empty() {
             self.picker.active_link_idx = 0;
             return;
@@ -1490,7 +1232,7 @@ impl App {
 
     /// Simple link follower for the summary/wiki pane.
     /// Follows the currently active link (first visible one).
-    fn follow_wiki_link_in_summary(&mut self) {
+    pub(crate) fn follow_wiki_link_in_summary(&mut self) {
         if self.picker.focus != PickerFocus::Summary {
             return;
         }
@@ -1527,28 +1269,23 @@ impl App {
     }
 
     pub(crate) fn browser_selected_is_harness(&self) -> bool {
-        browser_nav_is_harness(&self.browser_nav_items, self.browser_selected_nav)
+        self.overview_browser.selected_is_harness()
     }
 
-    fn reset_left_pane_for_harness(&mut self) {
+    pub(crate) fn reset_left_pane_for_harness(&mut self) {
         self.left_follow_output = false;
         self.left_scroll = 0;
     }
 
-    fn is_picker_key_active(&self) -> bool {
-        self.desktop.showing_picker()
-            || self.desktop.active == crate::desktop::ActiveDesktop::Splash
-            || self.desktop.active == crate::desktop::ActiveDesktop::Overview
-    }
 
-    fn focus_overview_to_content(&mut self) {
+    pub(crate) fn focus_overview_to_content(&mut self) {
         self.view_focus = ViewFocus::Content;
         if self.browser_selected_is_harness() {
             self.reset_left_pane_for_harness();
         }
     }
 
-    fn activate_overview_harness_session(
+    pub(crate) fn activate_overview_harness_session(
         &mut self,
         agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
     ) {
@@ -1564,534 +1301,27 @@ impl App {
         }
     }
 
-    fn enter_wiki_from_overview_content(&mut self) {
-        if let Some(item) = self.browser_nav_items.get(self.browser_selected_nav) {
-            if item.kind != NavItemKind::Harness {
-                self.wiki_viewer.session_id = self
-                    .picker
-                    .sessions
-                    .get(self.picker.selected_session)
-                    .map(|m| m.session_id.clone())
-                    .unwrap_or_default();
-                self.wiki_viewer.current_file = item.target_file.clone();
-                self.load_wiki_viewer_content();
-            }
-        }
-        self.enter_wiki_viewer();
+    pub(crate) fn enter_wiki_from_overview_content(&mut self) {
+        let file = self
+            .overview_browser
+            .nav_items
+            .get(self.overview_browser.selected_nav)
+            .filter(|it| it.kind != NavItemKind::Harness)
+            .map(|it| it.target_file.clone());
+        self.enter_wiki_viewer_at(file.as_deref());
     }
 
-    /// On splash, when magenta pane is focused, only allow focus-switch keys.
-    fn handle_splash_magenta_picker_key(&mut self, key: KeyCode) -> bool {
-        use crate::app_state::{PickerFocus, SplashFocus};
-        if self.desktop.active != crate::desktop::ActiveDesktop::Splash
-            || self.splash_focus == SplashFocus::Picker
-        {
-            return false;
-        }
-        match key {
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => {
-                self.splash_focus = SplashFocus::Picker;
-                self.picker.focus = PickerFocus::Tree;
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Esc => {
-                self.needs_redraw = true;
-                true
-            }
-            _ => true,
-        }
-    }
 
-    fn handle_picker_trust_confirm_key(
-        &mut self,
-        key: KeyCode,
-        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
-    ) -> bool {
-        let Some(p) = self.picker.confirm_trust_path.clone() else {
-            return false;
-        };
-        match key {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                self.picker.confirm_trust_path = None;
-                self.clear_input();
-                match raven_tui::session::Session::init(&p) {
-                    Ok(mut new_sess) => {
-                        new_sess.meta.trusted = true;
-                        let _ = new_sess.save_meta();
-                        let _ = raven_tui::session::ensure_repo_cache(&mut new_sess);
-                        if let Ok(mut ag) = agent.try_lock() {
-                            *ag.session_mut() = Some(new_sess);
-                        }
-                        self.refresh_picker();
-                        self.needs_redraw = true;
-                    }
-                    Err(e) => {
-                        self.left_committed.push(format!("Error: {}", e));
-                        self.needs_redraw = true;
-                    }
-                }
-                true
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                self.picker.confirm_trust_path = None;
-                self.clear_input();
-                self.needs_redraw = true;
-                true
-            }
-            _ => true,
-        }
-    }
 
-    fn handle_overview_picker_key(
-        &mut self,
-        key: KeyCode,
-        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
-    ) -> bool {
-        use crate::app_state::SplashFocus;
-        match key {
-            KeyCode::Up | KeyCode::Char('k') => {
-                match self.view_focus {
-                    ViewFocus::Picker => {
-                        if self.picker.selected_item > 0 {
-                            self.picker.selected_item -= 1;
-                            self.sync_picker_selection();
-                            self.refresh_picker_summary();
-                            self.prepare_overview_for_session(agent);
-                        }
-                    }
-                    ViewFocus::Nav => {
-                        if self.browser_selected_nav > 0 {
-                            self.browser_selected_nav -= 1;
-                        }
-                        self.update_browser_preview_from_nav();
-                    }
-                    ViewFocus::Content => {
-                        if self.browser_selected_is_harness() {
-                            self.left_scroll = self.left_scroll.saturating_sub(1);
-                        } else {
-                            self.browser_wiki_scroll = self.browser_wiki_scroll.saturating_sub(1);
-                        }
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                match self.view_focus {
-                    ViewFocus::Picker => {
-                        if self.picker.selected_item + 1 < self.picker.picker_items.len() {
-                            self.picker.selected_item += 1;
-                            self.sync_picker_selection();
-                            self.refresh_picker_summary();
-                            self.prepare_overview_for_session(agent);
-                        }
-                    }
-                    ViewFocus::Nav => {
-                        if self.browser_selected_nav + 1 < self.browser_nav_items.len() {
-                            self.browser_selected_nav += 1;
-                        }
-                        self.update_browser_preview_from_nav();
-                    }
-                    ViewFocus::Content => {
-                        if self.browser_selected_is_harness() {
-                            self.left_scroll = self.left_scroll.saturating_add(1);
-                        } else {
-                            self.browser_wiki_scroll = self.browser_wiki_scroll.saturating_add(1);
-                        }
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                match self.view_focus {
-                    ViewFocus::Picker => {
-                        self.desktop.exit_overview_to_splash();
-                        self.splash_focus = SplashFocus::Picker;
-                    }
-                    ViewFocus::Nav => {
-                        self.view_focus = ViewFocus::Picker;
-                    }
-                    ViewFocus::Content => {
-                        self.view_focus = ViewFocus::Nav;
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                match self.view_focus {
-                    ViewFocus::Picker => {
-                        self.view_focus = ViewFocus::Nav;
-                    }
-                    ViewFocus::Nav => {
-                        self.focus_overview_to_content();
-                    }
-                    ViewFocus::Content => {
-                        if self.browser_selected_is_harness() {
-                            self.activate_overview_harness_session(agent);
-                        } else {
-                            self.enter_wiki_from_overview_content();
-                        }
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Enter => {
-                if self.view_focus == ViewFocus::Content {
-                    if self.browser_selected_is_harness() {
-                        self.reset_left_pane_for_harness();
-                        self.activate_overview_harness_session(agent);
-                    } else {
-                        self.enter_wiki_viewer();
-                    }
-                } else if self.view_focus == ViewFocus::Nav {
-                    self.view_focus = ViewFocus::Content;
-                } else {
-                    let item = self.picker.picker_items.get(self.picker.selected_item).cloned();
-                    self.sync_picker_selection();
-                    if let Some(item) = item {
-                        if item.session_id.is_some() || item.depth == 1 {
-                            self.activate_selected_session(agent);
-                        }
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Tab => {
-                self.view_focus = match self.view_focus {
-                    ViewFocus::Picker => ViewFocus::Nav,
-                    ViewFocus::Nav => ViewFocus::Content,
-                    ViewFocus::Content => ViewFocus::Picker,
-                };
-                if self.view_focus == ViewFocus::Content && self.browser_selected_is_harness() {
-                    self.reset_left_pane_for_harness();
-                }
-                self.needs_redraw = true;
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn handle_picker_screen_key(
-        &mut self,
-        key: KeyCode,
-        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
-    ) -> bool {
-        use crate::app_state::{PickerFocus, SplashFocus};
-        match key {
-            KeyCode::Up | KeyCode::Char('k') => {
-                match self.picker.focus {
-                    PickerFocus::Tree => {
-                        if self.picker.selected_item > 0 {
-                            self.picker.selected_item -= 1;
-                            self.sync_picker_selection();
-                            self.refresh_picker_summary();
-                        }
-                    }
-                    PickerFocus::Summary => {
-                        self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(1);
-                        self.recompute_active_link();
-                        self.needs_redraw = true;
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                match self.picker.focus {
-                    PickerFocus::Tree => {
-                        if self.picker.selected_item + 1 < self.picker.picker_items.len() {
-                            self.picker.selected_item += 1;
-                            self.sync_picker_selection();
-                            self.refresh_picker_summary();
-                        }
-                    }
-                    PickerFocus::Summary => {
-                        self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(1);
-                        self.recompute_active_link();
-                        self.needs_redraw = true;
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Splash
-                    && self.splash_focus == SplashFocus::Picker
-                {
-                    self.splash_focus = SplashFocus::Magenta;
-                    self.needs_redraw = true;
-                    return true;
-                }
-                // on magenta, left may exit to prior (workspace) via caller, fallthrough ok
-                match self.picker.focus {
-                    PickerFocus::Summary => {
-                        self.picker.focus = PickerFocus::Tree;
-                    }
-                    _ => {
-                        self.exit_picker_to_main();
-                        self.splash_focus = SplashFocus::Magenta;
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Right | KeyCode::Char('l') => {
-                match self.picker.focus {
-                    PickerFocus::Tree => {
-                        if self.desktop.active == crate::desktop::ActiveDesktop::Splash {
-                            // Right from picker in Screen 1 -> Screen 2 (picker + nav + content)
-                            self.prepare_overview_for_session(agent);
-                            self.desktop.set_overview();
-                            self.view_focus = ViewFocus::Picker;
-                            self.wiki_viewer.session_id = self
-                                .picker
-                                .sessions
-                                .get(self.picker.selected_session)
-                                .map(|m| m.session_id.clone())
-                                .unwrap_or_default();
-                            self.wiki_viewer.focus = WikiFocus::Nav;
-                            self.needs_redraw = true;
-                            return true;
-                        }
-                        self.picker.focus = PickerFocus::Summary;
-                        self.picker.summary_scroll = 0;
-                        self.refresh_picker_summary();
-                        self.recompute_active_link();
-                    }
-                    PickerFocus::Summary => {
-                        // Right from Summary -> full wiki viewer for selected session
-                        self.enter_wiki_viewer();
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Enter => {
-                match self.picker.focus {
-                    PickerFocus::Tree => {
-                        let item = self.picker.picker_items.get(self.picker.selected_item).cloned();
-                        self.sync_picker_selection();
-                        if let Some(item) = item {
-                            if item.session_id.is_some() || item.depth == 1 {
-                                self.activate_selected_session(agent);
-                            } else {
-                                // workspace header row -> focus its (first/newest) session summary
-                                self.picker.focus = PickerFocus::Summary;
-                                self.refresh_picker_summary();
-                            }
-                        }
-                    }
-                    PickerFocus::Summary => {
-                        let n_links = self.picker.wiki_links.len();
-                        let idx = self.picker.active_link_idx;
-                        if self.picker.show_wiki_in_summary && idx < n_links && n_links > 0 {
-                            // Active item is a wiki link — follow it
-                            self.follow_wiki_link_in_summary();
-                        } else if idx == n_links {
-                            // Wiki button -> full dedicated wiki viewer screen
-                            self.enter_wiki_viewer();
-                        } else if idx == n_links + 1 {
-                            // Launch button
-                            self.activate_selected_session(agent);
-                        } else {
-                            // No links, default to wiki viewer
-                            self.enter_wiki_viewer();
-                        }
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Tab => {
-                if self.desktop.active == crate::desktop::ActiveDesktop::Splash
-                    && self.splash_focus == SplashFocus::Picker
-                {
-                    // Tab while picker highlighted on splash: slide to 3-col
-                    self.prepare_overview_for_session(agent);
-                    self.desktop.set_overview();
-                    self.wiki_viewer.focus = WikiFocus::Nav;
-                    self.needs_redraw = true;
-                    return true;
-                }
-                // Cycle through: wiki links → Wiki button → Launch button → back to links
-                if self.picker.focus == PickerFocus::Summary {
-                    let n_links = self.picker.wiki_links.len();
-                    let total = n_links + 2; // +2 for Wiki and Launch buttons
-                    self.picker.active_link_idx = (self.picker.active_link_idx + 1) % total;
-                    let idx = self.picker.active_link_idx;
-
-                    if idx < n_links {
-                        // On a link — update summary_action to ViewWiki and scroll to it
-                        self.picker.summary_action = SummaryAction::ViewWiki;
-                        if let Some(link) = self.picker.wiki_links.get(idx) {
-                            let visible_h = self.picker.last_summary_height.max(5) as usize;
-                            if link.line < self.picker.summary_scroll
-                                || link.line >= self.picker.summary_scroll + visible_h
-                            {
-                                self.picker.summary_scroll = link.line.saturating_sub(2);
-                            }
-                        }
-                    } else if idx == n_links {
-                        // Wiki button
-                        self.picker.summary_action = SummaryAction::ViewWiki;
-                    } else {
-                        // Launch button
-                        self.picker.summary_action = SummaryAction::Launch;
-                    }
-                    self.needs_redraw = true;
-                }
-                true
-            }
-            KeyCode::Backspace => {
-                // Navigate back to index.md in wiki mode
-                if self.picker.focus == PickerFocus::Summary
-                    && self.picker.show_wiki_in_summary
-                    && self.picker.current_wiki_file != "index.md"
-                {
-                    self.picker.current_wiki_file = "index.md".to_string();
-                    self.picker.summary_scroll = 0;
-                    self.refresh_picker_summary();
-                    self.recompute_active_link();
-                    self.needs_redraw = true;
-                }
-                true
-            }
-            KeyCode::Char('a') | KeyCode::Char('A') => {
-                self.picker.adding_workspace = true;
-                self.input.clear();
-                self.cursor_pos = 0;
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') => {
-                // New session for current ws — the tree now owns selection (sessions live under ws rows)
-                if let Some(ws) = self.picker.workspaces.get(self.picker.selected_workspace) {
-                    let ws_path = ws.path.clone();
-                    let name = format!("new-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
-                    if let Ok(new_sess) = raven_tui::session::Session::init_named(&ws_path, &name) {
-                        let new_id = new_sess.id.clone();
-                        self.refresh_picker();
-                        // Prefer stable session id to pick the correct tree row (newest first after sort)
-                        if let Some(pos) = self.picker.picker_items.iter().position(|it| {
-                            it.session_id.as_ref() == Some(&new_id)
-                        }) {
-                            self.picker.selected_item = pos;
-                            self.sync_picker_selection();
-                            self.refresh_picker_summary();
-                        } else if let Some(pos) = self.picker.picker_items.iter().position(|it| {
-                            it.workspace_path == ws_path && it.depth == 1
-                        }) {
-                            // Fallback: first session row under this ws (newest)
-                            self.picker.selected_item = pos;
-                            self.sync_picker_selection();
-                            self.refresh_picker_summary();
-                        }
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Char('d') | KeyCode::Char('D') => {
-                // Delete current focus item (tree now combines ws + sessions)
-                if self.picker.focus == PickerFocus::Tree {
-                    if let Some(item) = self.picker.picker_items.get(self.picker.selected_item) {
-                        if let Some(ref sid) = item.session_id {
-                            let _ = remove_session_dir(sid);
-                        } else {
-                            // ws header: delete all its sessions (use stable path)
-                            if let Ok(ses) = raven_tui::session::list_sessions_for(&item.workspace_path) {
-                                for s in ses {
-                                    let _ = remove_session_dir(&s.session_id);
-                                }
-                            }
-                        }
-                        self.refresh_picker();
-                    }
-                }
-                self.needs_redraw = true;
-                true
-            }
-            KeyCode::Char('w') | KeyCode::Char('W') => {
-                if self.picker.focus == PickerFocus::Summary {
-                    self.picker.summary_action = SummaryAction::ViewWiki;
-                    self.picker.show_wiki_in_summary = !self.picker.show_wiki_in_summary;
-                    if self.picker.show_wiki_in_summary {
-                        self.refresh_picker_summary();
-                        self.recompute_active_link();
-                    }
-                    self.needs_redraw = true;
-                    return true;
-                } else if self.picker.focus == PickerFocus::Tree {
-                    // From tree, if on a session row, dump its wiki to main left pane (like old behavior)
-                    if let Some(item) = self.picker.picker_items.get(self.picker.selected_item) {
-                        if let Some(ref sid) = item.session_id {
-                            let wiki_file = if self.picker.current_wiki_file.is_empty() {
-                                "index.md".to_string()
-                            } else {
-                                self.picker.current_wiki_file.clone()
-                            };
-                            let content = raven_tui::session::read_session_wiki_file(sid, &wiki_file)
-                                .unwrap_or_else(|| format!("(no {wiki_file} yet — agent can create one with write_wiki)"));
-                            self.left_committed.push(format!("=== Wiki: {} ===\n{}", wiki_file, content));
-                            self.left_follow_output = true;
-                            self.left_scroll = 10_000;
-                            self.needs_redraw = true;
-                            return true;
-                        }
-                    }
-                }
-                true
-            }
-            KeyCode::PageUp => {
-                if self.picker.focus == PickerFocus::Tree || self.picker.focus == PickerFocus::Summary {
-                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_sub(12);
-                    self.recompute_active_link();
-                    self.needs_redraw = true;
-                    return true;
-                }
-                false
-            }
-            KeyCode::PageDown => {
-                if self.picker.focus == PickerFocus::Tree || self.picker.focus == PickerFocus::Summary {
-                    self.picker.summary_scroll = self.picker.summary_scroll.saturating_add(12);
-                    self.recompute_active_link();
-                    self.needs_redraw = true;
-                    return true;
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// Switch focus or move selection in picker. Returns true if handled.
     pub fn handle_picker_key(
         &mut self,
         key: KeyCode,
         agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
     ) -> bool {
-        if !self.is_picker_key_active() {
-            return false;
-        }
-        if self.handle_splash_magenta_picker_key(key) {
-            return true;
-        }
-        if self.handle_picker_trust_confirm_key(key, agent) {
-            return true;
-        }
-        if self.desktop.active == crate::desktop::ActiveDesktop::Overview {
-            return self.handle_overview_picker_key(key, agent);
-        }
-        self.handle_picker_screen_key(key, agent)
+        crate::picker_handlers::handle_key(self, key, agent)
     }
 
-    fn activate_selected_session(&mut self, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) {
+    pub(crate) fn activate_selected_session(&mut self, agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>) {
         let sess_id = if let Some(meta) = self.picker.sessions.get(self.picker.selected_session) {
             meta.session_id.clone()
         } else {
@@ -2141,15 +1371,6 @@ impl App {
         // Switch to workspace view for the loaded session
         self.desktop.set_workspace();
         self.needs_redraw = true;
-    }
-}
-
-fn remove_session_dir(session_id: &str) -> std::io::Result<()> {
-    let dir = raven_tui::session::session_dir(session_id);
-    if dir.exists() {
-        std::fs::remove_dir_all(dir)
-    } else {
-        Ok(())
     }
 }
 
