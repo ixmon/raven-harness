@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::plan_flow::{
-    dispatch_plan_slash, start_plan_execution,
+    dismiss_plan_pane_if_pending, dispatch_plan_slash, start_plan_execution,
     plan_loop_active, route_plan_entry_intent, spawn_plan_answer_submit,
     spawn_proceed_feedback_work, submit_plan_loop_input,
     PlanInputRouting, PlanLoopUserOutcome,
@@ -582,6 +582,10 @@ async fn handle_input_key(
                     app.needs_redraw = true;
                     let _ = dispatch_plan_slash(&prompt, app, agent);
                     return Ok(true);
+                }
+
+                if app.plan.pending_observe_prompt.is_none() {
+                    dismiss_plan_pane_if_pending(app);
                 }
 
                 if app.plan.pending_observe_prompt.is_some() {

@@ -100,9 +100,16 @@ pub struct PlanState {
     pub qa_history: Vec<raven_tui::plan_protocol::PlanQaEntry>,
     pub pending_question: Option<raven_tui::plan_protocol::PlanQuestion>,
     pub pending_proposal: Option<raven_tui::plan_protocol::PlanProposal>,
+    /// Plan execution finished; hide the pane on the user's next message.
+    pub dismiss_pane_on_next_input: bool,
 }
 
 impl PlanState {
+    /// True when every approved step has been completed (`current_step` past the last step).
+    pub fn is_execution_complete(&self) -> bool {
+        !self.steps.is_empty() && self.current_step >= self.steps.len()
+    }
+
     /// Mark the current step Done and advance the pointer (if possible).
     #[allow(dead_code)]
     pub fn advance_one_step(&mut self) {
@@ -174,6 +181,19 @@ mod tests {
         assert_eq!(p.current_step, 1);
         assert!(matches!(p.steps[0].status, PlanStepStatus::Done));
         assert!(matches!(p.steps[1].status, PlanStepStatus::Pending));
+    }
+
+    #[test]
+    fn is_execution_complete_when_pointer_past_last_step() {
+        let mut p = PlanState {
+            active: true,
+            steps: make_steps(3),
+            current_step: 3,
+            ..Default::default()
+        };
+        assert!(p.is_execution_complete());
+        p.current_step = 2;
+        assert!(!p.is_execution_complete());
     }
 
     #[test]

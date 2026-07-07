@@ -458,6 +458,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 UiUpdate::PlanSync(exec) => {
                     if app.plan.active && !app.plan.steps.is_empty() {
                         crate::plan_sync::apply_execution_to_plan(&mut app.plan, &exec);
+                        crate::plan_flow::maybe_finalize_plan_execution(&mut app, &agent);
                         app.needs_redraw = true;
                     }
                 }
@@ -549,6 +550,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         if final_text.contains("WORK_COMPLETE") {
                             app.plan.complete_on_work_complete_signal(&final_text);
                         }
+                        crate::plan_flow::maybe_finalize_plan_execution(&mut app, &agent);
                         app.needs_redraw = true;
                     }
                     let in_plan_mode = agent
@@ -766,6 +768,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     &ag,
                     wiki.as_deref(),
                 );
+                crate::plan_flow::maybe_finalize_plan_execution(&mut app, &agent);
             }
         }
 

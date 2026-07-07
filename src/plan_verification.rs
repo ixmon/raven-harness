@@ -21,6 +21,7 @@ const VERIFICATION_RETRY_NUDGE_HEADER: &str = "\n\nYour proposal had invalid ste
 fn is_plausible_dir_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
+        && !name.starts_with('-')
         && name.len() <= 64
         && name
             .chars()
@@ -260,7 +261,7 @@ fn extract_mkdir_dirs(verification: &str) -> Vec<String> {
         .unwrap_or(v);
     rest.split_whitespace()
         .map(|s| s.trim_matches(|c| c == '"' || c == '\''))
-        .filter(|s| !s.is_empty() && *s != "-p")
+        .filter(|s| !s.is_empty() && !s.starts_with('-'))
         .map(|s| s.to_string())
         .collect()
 }

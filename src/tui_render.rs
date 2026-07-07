@@ -612,11 +612,7 @@ pub fn draw_right_pane(
                         b.header_idx == *header_idx && trace_cursor >= b.header_idx && trace_cursor < b.end_idx
                     });
                 let icon = if *is_error { "❌" } else { "✅" };
-                let summary_short = if summary.len() > 60 {
-                    format!("{}…", &summary[..57])
-                } else {
-                    summary.clone()
-                };
+                let summary_short = truncate_str(summary, 57);
                 let fold_text = format!("   {} {} ({} lines) ▸", icon, summary_short, line_count);
                 let style = if is_cursor_line {
                     Style::default().fg(Color::DarkGray).bg(cursor_bg)
@@ -939,6 +935,19 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
     let truncated: String = s.chars().take(max_chars).collect();
     format!("{}…", truncated)
+}
+
+#[cfg(test)]
+mod truncate_str_tests {
+    use super::truncate_str;
+
+    #[test]
+    fn truncates_on_char_boundary_with_multibyte_punctuation() {
+        let s = "grep:'init()':rocket.py — matched";
+        let out = truncate_str(s, 20);
+        assert!(out.ends_with('…'));
+        assert!(out.is_char_boundary(out.len()));
+    }
 }
 
 fn char_count(s: &str) -> usize {

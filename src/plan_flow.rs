@@ -1063,6 +1063,37 @@ pub async fn route_plan_entry_intent(
     }
 }
 
+/// When all steps are done: switch to talk mode and keep the pane until the next user message.
+pub fn maybe_finalize_plan_execution(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
+    if !app.plan.is_execution_complete() || app.plan.dismiss_pane_on_next_input {
+        return;
+    }
+    app.plan.dismiss_pane_on_next_input = true;
+    if let Ok(mut ag) = agent.try_lock() {
+        if ag.current_agent_mode() == "work" {
+            ag.set_agent_mode("talk");
+            if let Some(s) = ag.session_mut() {
+                let _ = s.save_meta();
+            }
+        }
+        let mut exec = ag.plan_execution().clone();
+        exec.active = false;
+        ag.set_plan_execution(exec);
+    }
+    app.left_committed
+        .push("✓ Plan complete — switched to talk mode.".to_string());
+    app.needs_redraw = true;
+}
+
+/// Hide the plan pane after the user sends their next message post-completion.
+pub fn dismiss_plan_pane_if_pending(app: &mut App) {
+    if app.plan.dismiss_pane_on_next_input {
+        app.plan.active = false;
+        app.plan.dismiss_pane_on_next_input = false;
+        app.needs_redraw = true;
+    }
+}
+
 /// User approved the plan — switch to work mode, populate steps, return execution prompt.
 pub fn start_plan_execution(
     app: &mut App,
