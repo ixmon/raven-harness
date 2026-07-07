@@ -188,6 +188,7 @@ pub fn mock_chat_backend_for(scenario: &SmokeScenario) -> MockChatBackend {
                 tool_calls,
                 finish_reason: finish,
                 usage: None,
+                reasoning_content: None,
             }
         })
         .collect();

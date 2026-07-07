@@ -121,6 +121,8 @@ impl Judge {
             temperature: 0.0,
             max_tokens: JUDGE_MAX_TOKENS,
             stream: false,
+            reasoning_enabled: None,
+            json_object_mode: None,
         };
 
         let response = match self.client.lock().await.chat(req).await {
@@ -212,6 +214,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
 
@@ -227,6 +230,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
 
@@ -242,6 +246,7 @@ mod tests {
             tool_calls: vec![],
             finish_reason: Some("stop".to_string()),
             usage: None,
+            reasoning_content: None,
         }]);
         let judge = Judge::new(Arc::new(Mutex::new(ChatBackend::Mock(mock))));
 

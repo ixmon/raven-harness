@@ -69,6 +69,10 @@ pub struct ChatRequest {
     pub max_tokens: u32,
     #[allow(dead_code)]
     pub stream: bool,
+    /// When `Some(false)`, disables provider reasoning/thinking (e.g. OpenRouter).
+    pub reasoning_enabled: Option<bool>,
+    /// When `Some(true)`, request `response_format: { type: json_object }`.
+    pub json_object_mode: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +84,8 @@ pub struct ChatResponse {
     /// Raw usage if provided by the server
     #[allow(dead_code)]
     pub usage: Option<Usage>,
+    /// Reasoning/thinking stream when the provider keeps it separate from `content`.
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -135,9 +141,14 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
+        if req.json_object_mode == Some(true) {
+            body["response_format"] = json!({ "type": "json_object" });
+        }
+
         // Enable reasoning/thinking for providers that support it (OpenRouter, etc.)
         if is_openrouter(&self.config.base_url) {
-            body["reasoning"] = json!({ "enabled": true });
+            let enabled = req.reasoning_enabled.unwrap_or(true);
+            body["reasoning"] = json!({ "enabled": enabled });
         }
 
         let mut request = self.http.post(self.config.chat_url()).json(&body);
@@ -171,6 +182,13 @@ impl LlmClient {
 
         let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
         let original_content = assistant_text_from_message(&message);
+        let reasoning_content = message
+            .get("reasoning_content")
+            .or_else(|| message.get("reasoning"))
+            .and_then(|c| c.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
         let mut tool_calls = parse_tool_calls(message.get("tool_calls"));
         if tool_calls.is_empty() {
@@ -195,6 +213,7 @@ impl LlmClient {
                 .and_then(|f| f.as_str())
                 .map(|s| s.to_string()),
             usage,
+            reasoning_content,
         })
     }
 

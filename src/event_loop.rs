@@ -35,6 +35,8 @@ pub enum UiUpdate {
     Thinking(String),
     ToolStart { name: String, args: String },
     ToolResult { name: String, summary: String },
+    /// Plan execution progress (sent while agent mutex is held — no try_lock needed).
+    PlanSync(raven_tui::plan_md::PlanExecutionState),
     RoundLimitHit {
         #[allow(dead_code)]
         continuation: u32,
@@ -55,6 +57,19 @@ pub enum UiUpdate {
         completion_tokens: Option<u32>,
         total_tokens: Option<u32>,
     },
+    /// Plan loop posted an interim status line (e.g. ready-for-proposal message).
+    PlanLoopStatusMessage(String),
+    /// Clarify fetch finished (question or error). `qa_entry` set when user just answered.
+    PlanLoopClarifyDone {
+        result: Result<raven_tui::plan_protocol::PlanModelPayload, String>,
+        qa_entry: Option<raven_tui::plan_protocol::PlanQaEntry>,
+    },
+    /// Proposal fetch finished.
+    PlanLoopProposalDone(Result<raven_tui::plan_protocol::PlanModelPayload, String>),
+    /// User chose to leave structured plan loop during answer classification.
+    PlanLoopExitDiscuss,
+    /// Proceed-gate response classified (proceed / cancel / not revision).
+    PlanLoopProceedClassified(raven_tui::plan_intent::PlanProceedIntent),
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -91,7 +106,7 @@ pub struct TuiObserver {
     pub(crate) instant: Arc<Mutex<Option<String>>>,
     pub(crate) denials_this_turn: u32,
     pub(crate) halt_tools: bool,
-    pub(crate) exec_mode: ExecApprovalMode,
+    pub(crate) exec_mode: Arc<std::sync::Mutex<ExecApprovalMode>>,
 }
 
 #[async_trait]
@@ -103,6 +118,9 @@ impl TurnObserver for TuiObserver {
     }
     fn on_tool_result(&mut self, record: &ActionRecord) {
         let _ = self.tx.try_send(UiUpdate::ToolResult { name: record.tool.clone(), summary: record.summary.clone() });
+    }
+    fn on_plan_sync(&mut self, state: &raven_tui::plan_execution::PlanExecutionState) {
+        let _ = self.tx.try_send(UiUpdate::PlanSync(state.clone()));
     }
     fn on_nudge(&mut self, count: u32, max: u32) {
         let _ = self.tx.try_send(UiUpdate::ToolResult {
@@ -180,7 +198,12 @@ impl TuiObserver {
                 .unwrap_or_default();
             cmd.contains("cd /") || cmd.contains("/etc") || cmd.contains("/root") || cmd.contains("curl ") || cmd.contains("wget ") || cmd.contains("nc ")
         } else { false };
-        match self.exec_mode {
+        let mode = self
+            .exec_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(ExecApprovalMode::Babysitter);
+        match mode {
             ExecApprovalMode::Babysitter => is_mutating,
             ExecApprovalMode::SpringBreak => false,
             ExecApprovalMode::Vegas => name == "exec" && is_outside,
@@ -203,7 +226,17 @@ impl TuiObserver {
             "exec" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
                 let cmd = v.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                format!("exec: {}", truncate(cmd, 72))
+                let lower = cmd.to_lowercase();
+                if lower.contains("sudo")
+                    && (lower.contains("apt") || lower.contains("dnf") || lower.contains("yum") || lower.contains("pacman") || lower.contains("brew"))
+                {
+                    format!(
+                        "Install system package (sudo): {} — approve for agent to install, or deny and install yourself",
+                        truncate(cmd, 56)
+                    )
+                } else {
+                    format!("exec: {}", truncate(cmd, 72))
+                }
             }
             "update_goal" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
@@ -354,8 +387,14 @@ async fn run_app<B: ratatui::backend::Backend>(
         instant: instant_interject.clone(),
         denials_this_turn: 0,
         halt_tools: false,
-        exec_mode: agent.lock().await.current_exec_mode(),
+        exec_mode: app.live_exec_mode.clone(),
     };
+
+    if let Ok(ag) = agent.try_lock() {
+        if let Ok(mut slot) = app.live_exec_mode.lock() {
+            *slot = ag.current_exec_mode();
+        }
+    }
 
     app.needs_redraw = true;
 
@@ -414,6 +453,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.right_scroll = 10_000;
                     app.needs_redraw = true;
                 }
+                UiUpdate::PlanSync(exec) => {
+                    if app.plan.active && !app.plan.steps.is_empty() {
+                        crate::plan_flow::apply_execution_to_plan(&mut app.plan, &exec);
+                        app.needs_redraw = true;
+                    }
+                }
                 UiUpdate::ToolResult { name, summary } => {
                     if name == "system" && summary.contains("JUDGE") {
                         app.trace_lines.push(format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140)));
@@ -425,6 +470,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                         // preceding ToolStart line, this puts a *single* 🔧 icon on the first
                         // line of the tool call block/output. No brain icons on tool lines.
                         app.trace_lines.push(format!("   ↳ {}", truncate(&summary, 120)));
+                    }
+                    if app.plan.active && !app.plan.steps.is_empty() {
+                        if name == "complete_plan_step" {
+                            if let Some(observe) = &app.plan.pending_observe_prompt {
+                                app.left_committed.push(format!(
+                                    "👁 Plan step requires your observation: {}",
+                                    observe
+                                ));
+                            }
+                        } else if summary.contains("WORK_COMPLETE") {
+                            app.plan.complete_on_work_complete_signal(&summary);
+                        }
+                        app.needs_redraw = true;
                     }
                     app.right_follow_output = true;
                     app.right_scroll = 10_000;
@@ -471,6 +529,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                     if stop_signal.load(Ordering::SeqCst) {
                         stop_signal.store(false, Ordering::SeqCst);
                     }
+                    if app.plan.active && !app.plan.steps.is_empty() {
+                        if let Ok(ag) = agent.try_lock() {
+                            crate::plan_flow::sync_plan_from_agent(&mut app.plan, &ag);
+                        }
+                        if final_text.contains("WORK_COMPLETE") {
+                            app.plan.complete_on_work_complete_signal(&final_text);
+                        }
+                        app.needs_redraw = true;
+                    }
+                    let in_plan_mode = agent
+                        .try_lock()
+                        .map(|ag| ag.current_agent_mode() == "plan")
+                        .unwrap_or(false);
+                    if in_plan_mode && crate::plan_flow::detect_plan_recap_invite(&final_text) {
+                        app.plan.recap_offered = true;
+                    }
                     app.needs_redraw = true;
                 }
                 UiUpdate::Error(e) => {
@@ -501,8 +575,71 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.right_scroll = 10_000;
                     app.needs_redraw = true;
                 }
+                UiUpdate::PlanLoopStatusMessage(msg) => {
+                    if !msg.trim().is_empty() {
+                        app.left_committed.push(msg);
+                    }
+                    app.current_response = "⠋ Drafting proposal…\n".to_string();
+                    app.plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingProposal;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopClarifyDone { result, qa_entry } => {
+                    crate::plan_flow::apply_plan_clarify_done(&mut app, &agent, result, qa_entry);
+                    app.current_response.clear();
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopProposalDone(result) => {
+                    crate::plan_flow::apply_plan_proposal_done(&mut app, &agent, result);
+                    app.current_response.clear();
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopExitDiscuss => {
+                    crate::plan_flow::apply_plan_exit_discuss(&mut app, &agent);
+                    app.current_response.clear();
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
+                UiUpdate::PlanLoopProceedClassified(intent) => {
+                    match intent {
+                        raven_tui::plan_intent::PlanProceedIntent::Proceed => {
+                            crate::plan_flow::confirm_plan_proceed(&mut app, &agent);
+                            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+                            app.plan.pending_proposal = None;
+                            app.plan.recap_offered = false;
+                            app.left_committed
+                                .push("▶ Plan approved — starting execution.".to_string());
+                            app.deferred_agent_prompt = Some(
+                                crate::plan_flow::format_plan_execution_user_prompt(
+                                    &app.plan,
+                                    &config.workspace,
+                                ),
+                            );
+                        }
+                        raven_tui::plan_intent::PlanProceedIntent::Cancel => {
+                            crate::plan_flow::cancel_plan_mode(&mut app, &agent);
+                        }
+                        raven_tui::plan_intent::PlanProceedIntent::ContinuePlanning => {}
+                    }
+                    app.is_processing = false;
+                    app.needs_redraw = true;
+                }
                 _ => {}
             }
+        }
+
+        if let Some(prompt) = app.deferred_agent_prompt.take() {
+            input_handler::spawn_agent_turn(
+                &mut app,
+                &agent,
+                prompt,
+                &stop_signal,
+                &tx,
+                &approval_req_tx,
+                &queued_interject,
+                &instant_interject,
+            );
         }
 
         // Balance updates
@@ -516,8 +653,10 @@ async fn run_app<B: ratatui::backend::Backend>(
         // user approval. We store them so the UI can show the popup and the key
         // handler can respond with Y/N.
         while let Ok((desc, responder)) = approval_req_rx.try_recv() {
-            app.pending_approval = Some(desc);
-            app.approval_responder = Some(responder);
+            app.pending_confirmation = Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
+                description: desc,
+                responder,
+            });
             app.needs_redraw = true;
         }
 
@@ -535,8 +674,16 @@ async fn run_app<B: ratatui::backend::Backend>(
         if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
+        if app.plan.active {
+            app.plan.spinner_tick = app.plan.spinner_tick.wrapping_add(1);
+            app.needs_redraw = true;
+        }
 
-        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && !app.picker.loaded {
+        if (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview))
+            && !app.picker.loaded
+        {
             app.refresh_picker();
         }
 
@@ -558,12 +705,71 @@ async fn run_app<B: ratatui::backend::Backend>(
         app.cached_goal_text = goal_text.clone();
         app.cached_agent_mode = agent_mode.clone();
 
+        // Sync plan pane high-level fields from session (agent uses update_goal during clarification)
+        if agent_mode == "plan" {
+            if let Ok(ag) = agent.try_lock() {
+                if let Some(s) = ag.session() {
+                    let m = &s.meta;
+                    if !m.current_goal.is_empty() {
+                        app.plan.goal = m.current_goal.clone();
+                    }
+                    if !m.achievement_tests.is_empty() {
+                        app.plan.success_criteria = m.achievement_tests.join(" | ");
+                    }
+                }
+            }
+        }
+
+        // Auto-activate plan pane when run mode is "plan" (collection phase)
+        // Do NOT pre-populate steps here -- steps appear only after user approves the plan
+        if agent_mode == "plan" {
+            if !app.plan.active {
+                app.plan.active = true;
+                if app.plan.goal.is_empty() {
+                    // Do not set any boilerplate goal here. The goal must come from the user's
+                    // actual planning request captured in the trigger (see input_handler).
+                    // Only set safe defaults for the other plan fields if needed.
+                    crate::plan_flow::apply_plan_field_defaults(
+                        &mut app.plan,
+                        crate::plan_flow::VerificationDefaultsKind::AutoActivate,
+                    );
+                    app.plan.steps.clear();
+                    app.plan.current_step = 0;
+                }
+            }
+            app.plan.spinner_tick = app.plan.spinner_tick.wrapping_add(1);
+        } else if app.plan.active && agent_mode != "plan" && app.plan.steps.is_empty() {
+            // only auto-hide the pane if we switch away *before* the plan was approved (no steps yet)
+            app.plan.active = false;
+        }
+
+        if app.plan.active
+            && !app.plan.steps.is_empty()
+            && !app.is_processing
+            && agent_mode == "work"
+        {
+            if let Ok(ag) = agent.try_lock() {
+                let wiki = ag
+                    .session()
+                    .as_ref()
+                    .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
+                crate::plan_flow::reconcile_plan_execution(
+                    &mut app.plan,
+                    &ag,
+                    wiki.as_deref(),
+                );
+            }
+        }
+
         let workspace_display = config.workspace.display().to_string();
         let show_gauge = app.is_processing && !stop_signal.load(Ordering::SeqCst);
         let gauge_h = if show_gauge { 1 } else { 0 };
+        let overview_harness = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview)
+            && app.browser_selected_is_harness();
         let show_status = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Workspace);
         let show_input = show_status
             || (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) && app.picker.adding_workspace);
+        // Overview harness shows status + input + conv to right of nav (Coding Harness selected)
         let status_h = if show_status { 1 } else { 0 };
         let input_line_count = if show_input { app.input.lines().count().max(1) as u16 } else { 0 };
         let input_h = if show_input {
@@ -572,7 +778,10 @@ async fn run_app<B: ratatui::backend::Backend>(
             0
         };
 
-        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
+        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash)
+            || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview)
+        {
             // rough estimate; updated inside draw if possible
             app.picker.last_summary_height = 25;
         }
@@ -584,6 +793,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             let search_label = match app.desktop.active {
                 crate::desktop::ActiveDesktop::Splash => "→ picker".to_string(),
                 crate::desktop::ActiveDesktop::Picker => "← splash".to_string(),
+                crate::desktop::ActiveDesktop::Overview => "← splash / nav".to_string(),
                 _ => app.search.status_label(),
             };
 
@@ -608,6 +818,12 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                 if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
                     app.picker.last_summary_height = content_area.height.saturating_sub(4).max(10);
+                } else if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash) {
+                    // lower half summary area
+                    let lower_h = (content_area.height as f32 * 0.5) as u16;
+                    app.picker.last_summary_height = lower_h.saturating_sub(4).max(5);
+                } else if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
+                    app.picker.last_summary_height = content_area.height.saturating_sub(4).max(8);
                 }
 
                 let left_focused = app.focused_pane == Pane::Left;
@@ -635,7 +851,32 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
 
                 if app.desktop.showing_wiki_viewer() {
-                    tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                    if app.wiki_viewer.selected_is_harness() {
+                        // Nav (left) + conversation (right of nav); status top + input bottom enabled outer
+                        let cols = ratatui::layout::Layout::default()
+                            .direction(ratatui::layout::Direction::Horizontal)
+                            .constraints([ratatui::layout::Constraint::Percentage(30), ratatui::layout::Constraint::Percentage(70)])
+                            .split(content_area);
+                        tui_render::draw_wiki_nav_pane(f, cols[0], &app.wiki_viewer, true);
+                        let mut dummy_rect = ratatui::layout::Rect::default();
+                        let mut dummy_cnt = 0u16;
+                        tui_render::draw_left_pane(
+                            f,
+                            &app.left_committed,
+                            &app.current_response,
+                            cols[1],
+                            &mut dummy_rect,
+                            &mut dummy_cnt,
+                            app.left_follow_output,
+                            &mut app.left_scroll,
+                            tui_render::Pane::Left,
+                            app.scroll_flash_timer,
+                            left_highlight,
+                            true,
+                        );
+                    } else {
+                        tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                    }
                 } else {
                     tui_render::draw_content_desktop(
                     f, content_area, &app.desktop,
@@ -649,10 +890,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                         left_focused, right_focused,
                         scroll_flash_timer: app.scroll_flash_timer,
                         left_highlight, right_highlight,
+                        plan: if app.plan.active || agent_mode == "plan" { Some(&app.plan) } else { None },
                     },
                     &tui_render::SplashData {
                         raven_art: &app.raven_art, base_url: &config.base_url,
                         model: &app.display_model, workspace: &workspace_display,
+                        splash_focus: app.splash_focus,
                     },
                     &tui_render::PickerDrawData {
                         picker_items: &app.picker.picker_items,
@@ -663,7 +906,13 @@ async fn run_app<B: ratatui::backend::Backend>(
                         wiki_links: &app.picker.wiki_links,
                         active_link_idx: app.picker.active_link_idx,
                         summary_action: app.picker.summary_action,
+                        view_focus: app.view_focus,
+                        browser_nav_items: &app.browser_nav_items,
+                        browser_selected_nav: app.browser_selected_nav,
+                        browser_wiki_content: &app.browser_wiki_content,
+                        browser_wiki_scroll: app.browser_wiki_scroll,
                     },
+                    &app.wiki_viewer,
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,
                     &mut app.left_scroll, &mut app.right_scroll,
@@ -671,14 +920,57 @@ async fn run_app<B: ratatui::backend::Backend>(
                 );
                 }
 
-                if show_gauge && !app.desktop.showing_wiki_viewer() {
+                if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) && overview_harness {
+                    // Draw real upper status bar and input inside the right "content" column of Screen 2
+                    // so it appears as the "upper status bar" above conversation when Coding Harness selected.
+                    let hcols = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
+                        .split(content_area);
+                    let right_col = hcols[2];
+                    let srect = ratatui::layout::Rect { x: right_col.x, y: content_area.y, width: right_col.width, height: 1 };
+                    tui_render::draw_status_bar(f, srect, &tui_render::StatusBarData {
+                        display_model: &app.display_model,
+                        balance_label: &app.balance_label,
+                        ctx_used_tokens: app.ctx_used_tokens,
+                        budget: &app.display_budget,
+                        mode_label: &approval_label,
+                        agent_mode: &agent_mode,
+                        goal_text: &goal_text,
+                        search_label: &search_label,
+                        tps: app.api_tps,
+                    });
+                    let i_h = 3u16;
+                    let irect = ratatui::layout::Rect {
+                        x: right_col.x,
+                        y: content_area.y + content_area.height.saturating_sub(i_h),
+                        width: right_col.width,
+                        height: i_h,
+                    };
+                    let input_focused = app.focused_pane == Pane::Input;
+                    tui_render::draw_input_bar(f, irect, &tui_render::InputBarData {
+                        input: &app.input, is_processing: app.is_processing,
+                        spinner_tick: app.spinner_tick, search_mode: app.search_mode,
+                        focused: input_focused,
+                    });
+                    if input_focused {
+                        app.clamp_cursor();
+                        let text_before = &app.input[..app.cursor_pos];
+                        let cursor_line = text_before.matches('\n').count() as u16;
+                        let last_nl = text_before.rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let cursor_col = app.input[last_nl..app.cursor_pos].chars().count() as u16;
+                        f.set_cursor_position((irect.x + 1 + cursor_col, irect.y + 1 + cursor_line));
+                    }
+                }
+
+                if show_gauge && !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                     tui_render::draw_context_gauge(f, gauge_area, &tui_render::ContextGaugeData {
                         turn_rounds: app.turn_rounds, max_rounds: config.max_rounds,
                         tool_calls_this_turn: app.tool_calls_this_turn,
                     });
                 }
 
-                if show_input && !app.desktop.showing_wiki_viewer() {
+                if show_input && !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                     let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, input_area, &tui_render::InputBarData {
                         input: &app.input, is_processing: app.is_processing,
@@ -686,16 +978,16 @@ async fn run_app<B: ratatui::backend::Backend>(
                         focused: input_focused,
                     });
 
-                    if !app.desktop.showing_wiki_viewer() {
+                    if !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                         tui_render::draw_overlays(
-                            f, size, input_area, &app.settings, app.pending_approval.as_deref(),
+                            f, size, input_area, &app.settings, app.pending_confirmation.as_ref(),
                             &app.slash_commands, &app.input, app.slash_selected,
                             app.mode_menu_active, &app.approval_modes, app.selected_mode_idx,
                             app.agent_mode_menu_active, &app.agent_modes, app.selected_agent_mode_idx,
                         );
                     }
 
-                    if input_focused && !app.desktop.showing_wiki_viewer() {
+                    if input_focused && !app.desktop.showing_wiki_viewer() && !matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) {
                         app.clamp_cursor();
                         let text_before = &app.input[..app.cursor_pos];
                         let cursor_line = text_before.matches('\n').count() as u16;
@@ -704,6 +996,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         f.set_cursor_position((input_area.x + 1 + cursor_col, input_area.y + 1 + cursor_line));
                     }
                 }
+
+                // For Overview (Screen 2), the status/conv/input for harness case are drawn inside the content column (see tui_render).
+                // No outer full-width bars for the diorama.
 
                 if app.scroll_flash_timer > 0 { app.scroll_flash_timer -= 1; }
                 if app.desktop.tick() { app.needs_redraw = true; }
@@ -718,10 +1013,41 @@ async fn run_app<B: ratatui::backend::Backend>(
                     stop_signal.store(true, Ordering::SeqCst);
                     break;
                 }
-                // Handle tool approval popup (Y/N) before general input
-                if app.handle_approval_key(*k) {
-                    app.needs_redraw = true;
-                    continue;
+                // Handle confirmation modals (tool approval, plan entry, …) before general input
+                match app.handle_confirmation_key(*k) {
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::NotHandled => {}
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::Handled => {
+                        app.needs_redraw = true;
+                        continue;
+                    }
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::PlanEntry {
+                        goal,
+                        confirmed,
+                    } => {
+                        let outcome = crate::plan_flow::apply_plan_entry_modal_response(
+                            &mut app, &agent, goal, confirmed,
+                        );
+                        if matches!(
+                            outcome,
+                            crate::plan_flow::PlanSubmitOutcome::StartPlanLoop
+                                | crate::plan_flow::PlanSubmitOutcome::Continue(_)
+                        ) {
+                            app.is_processing = true;
+                            let backend = {
+                                let ag = agent.lock().await;
+                                ag.llm_backend()
+                            };
+                            crate::plan_flow::spawn_fetch_clarification(
+                                &mut app,
+                                backend,
+                                config.flags.clone(),
+                                config.workspace.display().to_string(),
+                                tx.clone(),
+                            );
+                        }
+                        app.needs_redraw = true;
+                        continue;
+                    }
                 }
             }
             let _ = input_handler::handle_key_event(

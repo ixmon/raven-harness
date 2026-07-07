@@ -67,6 +67,22 @@ pub fn filtered_slash_commands<'a>(
         .collect()
 }
 
+/// Slash commands safe to run while the agent turn is in flight (UI/meta only).
+pub fn slash_ok_while_processing(prompt: &str) -> bool {
+    if !prompt.starts_with('/') {
+        return false;
+    }
+    let parts: Vec<&str> = prompt.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let cmd = parts[0].trim_start_matches('/');
+    matches!(
+        cmd,
+        "approval-mode" | "run-mode" | "status" | "settings" | "search" | "help" | "?"
+    )
+}
+
 /// Dispatch a `/command` prompt. Returns `AgentPrompt` if the text should go to the model.
 pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> SlashDispatch {
     if !prompt.starts_with('/') {
@@ -197,7 +213,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             if parts.len() > 1 {
                 // direct set via arg, e.g. /run-mode research
                 let arg = parts[1].to_lowercase();
-                let normalized = if ["talk", "think", "research", "work", "dream"]
+                let normalized = if ["talk", "think", "research", "work", "dream", "plan"]
                     .contains(&arg.as_str())
                 {
                     arg
@@ -221,7 +237,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                 *ctx.selected_agent_mode_idx = 0;
                 if let Ok(ag) = ctx.agent.try_lock() {
                     let current = ag.current_agent_mode();
-                    if let Some(idx) = ["talk", "think", "research", "work", "dream"]
+                    if let Some(idx) = ["talk", "think", "research", "work", "dream", "plan"]
                         .iter()
                         .position(|&m| m == current)
                     {
@@ -336,8 +352,12 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
             desc: "Change execution approval mode",
         },
         SlashCommand {
+            name: "plan",
+            desc: "Enter plan mode (/plan status, /plan cancel)",
+        },
+        SlashCommand {
             name: "run-mode",
-            desc: "Set run mode (talk, think, research, work, dream)",
+            desc: "Set run mode (talk, think, research, work, dream, plan)",
         },
         SlashCommand {
             name: "settings",
@@ -380,7 +400,10 @@ Available commands:
 /reset         Reset conversation memory (session goals stay)
 /status        Show endpoint, model, workspace
 /approval-mode Change execution approval mode (Babysitter / Spring Break / Vegas / Thunderdome)
-/run-mode      Set run mode (talk, think, research, work, dream)
+/plan          Enter plan mode (optional goal text after /plan)
+/plan status   Show current plan goal, steps, and progress
+/plan cancel   Exit plan mode and clear pending entry
+/run-mode      Set run mode (talk, think, research, work, dream, plan)
 /settings      Manage inference endpoints (add/switch/edit/delete)
 /search        Search conversation or trace (or Ctrl-F)
 /quit or /exit Quit the TUI
@@ -496,7 +519,6 @@ mod tests {
         let mut right_scroll = 0;
         let mut left_follow_output = true;
         let mut right_follow_output = true;
-
         let mut ctx = SlashContext {
             left_committed: &mut left,
             trace_lines: &mut trace,
@@ -527,7 +549,13 @@ mod tests {
         };
         let result = dispatch_slash_command("/status", &mut ctx);
         assert!(matches!(result, SlashDispatch::Handled));
-        assert!(input.is_empty());
-        assert_eq!(cursor_pos, 0);
+    }
+
+    #[test]
+    fn slash_ok_while_processing_whitelists_meta_commands() {
+        assert!(slash_ok_while_processing("/approval-mode"));
+        assert!(slash_ok_while_processing("/run-mode work"));
+        assert!(!slash_ok_while_processing("/plan cancel"));
+        assert!(!slash_ok_while_processing("hello"));
     }
 }

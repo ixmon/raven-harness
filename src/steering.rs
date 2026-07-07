@@ -34,6 +34,18 @@ pub const CONTINUATION_NUDGE: &str =
     "[Continue working. You paused to describe your plan instead of calling the next tool. \
      Call the next tool now — do not narrate.]";
 
+/// Nudge when an approved plan is executing but the model stopped with text only.
+pub const PLAN_EXECUTION_NUDGE: &str =
+    "[Plan execution in progress. You paused without calling tools. \
+     Finish the current plan step (write/patch/exec as needed), then call complete_plan_step. \
+     Do not narrate — call the next tool now.]";
+
+/// Nudge when plan mode bundles multiple clarification questions in one turn.
+pub const PLAN_ONE_QUESTION_NUDGE: &str =
+    "[Plan mode: ask exactly ONE clarification question per turn. \
+     Pick the single most important decision, offer numbered options for that decision only, \
+     then wait for the user's answer before asking the next question.]";
+
 /// The recovery message pushed when finish_reason is "length" (model hit max_tokens).
 pub const LENGTH_RECOVERY_NUDGE: &str =
     "[system: Your previous response was truncated (output limit). \
@@ -121,6 +133,15 @@ pub struct RoundContext {
     pub has_session: bool,
     /// Last assistant content from session log (for malformed tool detection).
     pub log_tail: String,
+    /// Current agent mode (e.g. "plan" to allow narration during planning).
+    pub agent_mode: String,
+    /// Approved plan is actively executing in work mode.
+    pub plan_executing: bool,
+    /// 0-indexed current step index from plan execution state.
+    pub plan_current_step: usize,
+    pub plan_total_steps: usize,
+    /// Observe-tier step waiting for user input — accept text-only stop.
+    pub plan_pending_observe: bool,
 }
 
 /// Summary of recent actions for safety checks.
@@ -238,8 +259,10 @@ impl SteeringState {
         }
 
         // 3. Criteria-based judge
+        // Skip in plan mode — we are still in clarification; judge/define_done criteria
+        // should not force completion or nudges until after "proceed".
         if let Some(ref criteria) = ctx.criteria {
-            if !criteria.trim().is_empty() {
+            if !criteria.trim().is_empty() && ctx.agent_mode != "plan" {
                 return SteeringDecision::JudgeNeeded {
                     context: "criteria active".into(),
                 };
@@ -247,11 +270,13 @@ impl SteeringState {
         }
 
         // 4. Define-done reminder (no criteria yet, judge enabled, past round 1)
+        // Skip in plan mode.
         if ctx.criteria.is_none()
             && self.total_rounds > 1
             && ctx.has_session
             && self.enable_judge
-            && self.judge_nudges < NUDGE_BUDGET {
+            && self.judge_nudges < NUDGE_BUDGET
+            && ctx.agent_mode != "plan" {
                 self.judge_nudges += 1;
                 return SteeringDecision::Nudge {
                     message: DEFINE_DONE_REMINDER.into(),
@@ -273,10 +298,31 @@ impl SteeringState {
             }
         }
 
-        // 6. Plan narration detection
+        // 6. Plan mode: one question per turn
+        if ctx.agent_mode == "plan"
+            && detect_plan_mode_multiple_questions(&ctx.effective_text)
+            && self.text_nudges < MAX_TEXT_NUDGES
+        {
+            self.text_nudges += 1;
+            return SteeringDecision::Nudge {
+                message: PLAN_ONE_QUESTION_NUDGE.into(),
+                use_continuation_nudge: false,
+                nudge_count: self.text_nudges,
+                nudge_max: MAX_TEXT_NUDGES,
+                log_event: "nudge".into(),
+                log_detail: format!(
+                    "plan-one-question nudge {}/{}",
+                    self.text_nudges, MAX_TEXT_NUDGES
+                ),
+            };
+        }
+
+        // 7. Plan narration detection
+        // Skip during plan mode — the agent is *supposed* to describe and clarify the plan.
         if detect_plan_narration(&ctx.effective_text)
             && !ctx.is_llm_error
             && self.text_nudges < MAX_TEXT_NUDGES
+            && ctx.agent_mode != "plan"
         {
             self.text_nudges += 1;
             return SteeringDecision::Nudge {
@@ -292,7 +338,7 @@ impl SteeringState {
             };
         }
 
-        // 7. Malformed tool syntax + ambiguous stop check
+        // 8. Malformed tool syntax + ambiguous stop check
         let has_malformed = detect_malformed_tool_syntax(&ctx.round_text)
             || detect_malformed_tool_syntax(&ctx.log_tail);
         let model_stopped = ctx.finish_reason.as_deref() == Some("stop");
@@ -301,7 +347,26 @@ impl SteeringState {
             return self.decide_ambiguous_stop(ctx, recent);
         }
 
-        // 8. Natural completion
+        // 9. Active plan execution: do not accept text-only stop mid-step
+        if plan_execution_incomplete(ctx)
+            && ctx.agent_mode == "work"
+            && self.has_round_budget()
+        {
+            let step = ctx.plan_current_step + 1;
+            let total = ctx.plan_total_steps;
+            return SteeringDecision::Nudge {
+                message: format!(
+                    "{PLAN_EXECUTION_NUDGE}\n\nCurrent plan step: {step} of {total}."
+                ),
+                use_continuation_nudge: true,
+                nudge_count: self.text_nudges,
+                nudge_max: MAX_TEXT_NUDGES,
+                log_event: "nudge".into(),
+                log_detail: format!("plan-execution nudge at step {step}/{total}"),
+            };
+        }
+
+        // 10. Natural completion
         SteeringDecision::Accept {
             clear_criteria: false,
         }
@@ -569,6 +634,22 @@ impl SteeringState {
 
 /// Detect "plan narration" responses where the model describes what it will do
 /// but doesn't actually call a tool.
+/// Plan mode should ask one branching decision per turn — detect bundled question lists.
+pub fn detect_plan_mode_multiple_questions(text: &str) -> bool {
+    let mut numbered_items = 0u32;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.len() < 3 {
+            continue;
+        }
+        let starts_digit = t.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if starts_digit && (t.contains(". ") || t.contains(") ")) {
+            numbered_items += 1;
+        }
+    }
+    numbered_items >= 2
+}
+
 pub fn detect_plan_narration(text: &str) -> bool {
     if text.trim().is_empty() {
         return false;
@@ -576,10 +657,20 @@ pub fn detect_plan_narration(text: &str) -> bool {
     let lower = text.to_lowercase();
     lower.contains("let me ")
         || lower.contains("i will ")
+        || lower.contains("i need to ")
+        || lower.contains("now i need to ")
         || lower.contains("the fix is")
         || lower.contains("implement this")
         || lower.contains("re-read the code")
         || (lower.contains("implement") && lower.contains("fix"))
+}
+
+/// True when work-mode plan execution still has steps to finish (not waiting on observe).
+pub fn plan_execution_incomplete(ctx: &RoundContext) -> bool {
+    ctx.plan_executing
+        && !ctx.plan_pending_observe
+        && ctx.plan_total_steps > 0
+        && ctx.plan_current_step < ctx.plan_total_steps
 }
 
 /// Detect malformed/partial tool call XML syntax that didn't parse as a real tool call.
@@ -621,6 +712,8 @@ mod tests {
             last_user_request: None,
             has_session: true,
             log_tail: String::new(),
+            agent_mode: "work".into(),
+            ..Default::default()
         }
     }
 
@@ -635,6 +728,8 @@ mod tests {
             last_user_request: None,
             has_session: true,
             log_tail: String::new(),
+            agent_mode: "work".into(),
+            ..Default::default()
         }
     }
 
@@ -670,8 +765,28 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_multiple_questions_detected() {
+        let text = "1. **Location**: separate dir?\n2. **Library**: SFML?\n3. **Env**: installed?";
+        assert!(detect_plan_mode_multiple_questions(text));
+    }
+
+    #[test]
+    fn plan_mode_one_question_not_flagged() {
+        assert!(!detect_plan_mode_multiple_questions(
+            "Do you want a separate directory or a subdirectory here? I recommend subdirectory."
+        ));
+    }
+
+    #[test]
     fn plan_narration_false_for_empty() {
         assert!(!detect_plan_narration(""));
+    }
+
+    #[test]
+    fn plan_narration_detects_i_need_to() {
+        assert!(detect_plan_narration(
+            "Now I need to rebuild to verify the compilation succeeds."
+        ));
     }
 
     #[test]
@@ -695,6 +810,51 @@ mod tests {
         let mut s = basic_state();
         s.total_rounds = 1;
         let ctx = text_round("Here's the answer to your question.");
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        assert!(matches!(d, SteeringDecision::Accept { clear_criteria: false }));
+    }
+
+    fn plan_exec_round(text: &str, step_index: usize, total: usize) -> RoundContext {
+        RoundContext {
+            effective_text: text.into(),
+            round_text: text.into(),
+            finish_reason: Some("stop".into()),
+            is_llm_error: false,
+            has_tool_calls: false,
+            criteria: None,
+            last_user_request: Some("continue".into()),
+            has_session: true,
+            log_tail: String::new(),
+            agent_mode: "work".into(),
+            plan_executing: true,
+            plan_current_step: step_index,
+            plan_total_steps: total,
+            plan_pending_observe: false,
+        }
+    }
+
+    #[test]
+    fn plan_execution_text_only_nudges_not_accepts() {
+        let mut s = basic_state();
+        s.total_rounds = 5;
+        let ctx = plan_exec_round(
+            "Now I need to rebuild to verify the compilation succeeds.",
+            5,
+            8,
+        );
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        assert!(
+            matches!(d, SteeringDecision::Nudge { .. }),
+            "expected nudge during plan execution, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn plan_execution_accepts_when_all_steps_done() {
+        let mut s = basic_state();
+        s.total_rounds = 5;
+        let mut ctx = plan_exec_round("All steps complete.", 8, 8);
+        ctx.plan_current_step = 8;
         let d = s.decide_no_tools(&ctx, &no_recent());
         assert!(matches!(d, SteeringDecision::Accept { clear_criteria: false }));
     }

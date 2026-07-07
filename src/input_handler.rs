@@ -12,12 +12,19 @@ use std::sync::Mutex;
 use crate::desktop::ActiveDesktop;
 use crate::input_dispatch::apply_settings_actions;
 use crate::keystore::Keystore;
-use crate::tui_render::Pane as RenderPane;
 use raven_tui::agent::Agent;
 use raven_tui::config::Config;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
+
+use crate::plan_flow::{
+    dispatch_plan_slash, format_plan_execution_user_prompt,
+    plan_loop_active, route_plan_entry_intent, spawn_plan_answer_submit,
+    reconcile_plan_execution, spawn_proceed_feedback_work, submit_plan_loop_input,
+    sync_plan_from_agent, sync_plan_to_agent,
+    PlanInputRouting, PlanLoopUserOutcome,
+};
 
 /// Handle a key event and update the app state accordingly.
 #[allow(clippy::too_many_arguments)]
@@ -221,6 +228,75 @@ async fn handle_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
     }
 }
 
+/// Dispatch a slash command from the input buffer (shared by idle and in-flight paths).
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_slash_input(
+    app: &mut App,
+    config: &Config,
+    keystore: &Keystore,
+    agent: &Arc<TokioMutex<Agent>>,
+    prompt: &str,
+    stop: &Arc<AtomicBool>,
+    update_tx: &mpsc::Sender<crate::event_loop::UiUpdate>,
+    approval_req_tx: mpsc::Sender<(String, oneshot::Sender<bool>)>,
+    queued_interject: &Arc<Mutex<Option<String>>>,
+    instant_interject: &Arc<Mutex<Option<String>>>,
+    spawn_agent_on_prompt: bool,
+) -> crate::input_dispatch::SlashDispatch {
+    use crate::tui_render::Pane as RenderPane;
+
+    let focused = match app.focused_pane {
+        crate::app_state::Pane::Left => RenderPane::Left,
+        crate::app_state::Pane::Right => RenderPane::Right,
+        crate::app_state::Pane::Input => RenderPane::Right,
+    };
+    let mut ctx = crate::input_dispatch::SlashContext {
+        left_committed: &mut app.left_committed,
+        trace_lines: &mut app.trace_lines,
+        current_response: &app.current_response,
+        current_thinking: &app.current_thinking,
+        input: &mut app.input,
+        cursor_pos: &mut app.cursor_pos,
+        slash_commands: &app.slash_commands,
+        slash_selected: &mut app.slash_selected,
+        mode_menu_active: &mut app.mode_menu_active,
+        selected_mode_idx: &mut app.selected_mode_idx,
+        agent_mode_menu_active: &mut app.agent_mode_menu_active,
+        selected_agent_mode_idx: &mut app.selected_agent_mode_idx,
+        settings: &mut app.settings,
+        search: &mut app.search,
+        focused_pane: focused,
+        left_scroll: &mut app.left_scroll,
+        right_scroll: &mut app.right_scroll,
+        left_follow_output: &mut app.left_follow_output,
+        right_follow_output: &mut app.right_follow_output,
+        last_left_line_count: app.last_left_line_count,
+        last_right_line_count: app.last_right_line_count,
+        last_left_area_h: app.last_left_area.height,
+        last_right_area_h: app.last_right_area.height,
+        config,
+        keystore,
+        agent,
+    };
+
+    let result = crate::input_dispatch::dispatch_slash_command(prompt, &mut ctx);
+    if spawn_agent_on_prompt {
+        if let crate::input_dispatch::SlashDispatch::AgentPrompt(()) = result {
+            spawn_agent_turn(
+                app,
+                agent,
+                prompt.to_string(),
+                stop,
+                update_tx,
+                &approval_req_tx,
+                queued_interject,
+                instant_interject,
+            );
+        }
+    }
+    result
+}
+
 /// Handle input keys (when not in special modes).
 #[allow(clippy::too_many_arguments)]
 async fn handle_input_key(
@@ -247,7 +323,15 @@ async fn handle_input_key(
     }
 
     // Session/workspace picker screen navigation (combined tree of workspaces + sessions)
-    if app.desktop.showing_picker() && app.handle_picker_key(key.code, agent) {
+    // For overview + harness (Coding Harness nav), we let input/conv have priority on arrows so status/conv/input work.
+    let overview_harness = app.desktop.active == ActiveDesktop::Overview
+        && app.browser_selected_is_harness();
+    if (app.desktop.showing_picker()
+        || app.desktop.active == ActiveDesktop::Splash
+        || app.desktop.active == ActiveDesktop::Overview)
+        && !(overview_harness && app.focused_pane == crate::app_state::Pane::Input)
+        && app.handle_picker_key(key.code, agent)
+    {
         return Ok(true);
     }
 
@@ -258,11 +342,16 @@ async fn handle_input_key(
 
     // When focused on content panes (Left/Right), use arrows for focus or desktop slide
     // (skip when wiki viewer owns the screen — its handler already processed or rejected the key)
+    // Also skip for overview+harness so arrows don't accidentally slide while using conv/input
     if app.focused_pane != crate::app_state::Pane::Input && !app.desktop.showing_wiki_viewer() {
         match key.code {
             KeyCode::Left => {
                 if app.desktop.showing_picker() {
                     // handled above in picker block
+                    return Ok(true);
+                }
+                if app.desktop.active == ActiveDesktop::Overview {
+                    // handled by handle_picker_key (cycles focus or exits to splash)
                     return Ok(true);
                 }
                 if app.desktop.active == ActiveDesktop::Workspace {
@@ -272,14 +361,16 @@ async fn handle_input_key(
                         app.needs_redraw = true;
                         return Ok(true);
                     } else if app.focused_pane == crate::app_state::Pane::Left {
-                        // on Conversation, left goes to wiki viewer if possible, else picker
-                        if !app.wiki_viewer.session_id.is_empty() {
-                            app.desktop.set_wiki_viewer();
-                        } else {
-                            app.desktop.set_picker();
-                            app.picker.focus = crate::app_state::PickerFocus::Tree;
-                            if !app.picker.loaded {
-                                app.refresh_picker();
+                        // on Conversation, left from Screen 4 goes back to Screen 2 (with content focused)
+                        app.desktop.set_overview();
+                        app.view_focus = crate::app_state::ViewFocus::Content;
+                        if !app.picker.loaded {
+                            app.refresh_picker();
+                        }
+                        if app.browser_nav_items.is_empty() {
+                            let sid = app.picker.sessions.get(app.picker.selected_session).map(|m| m.session_id.clone());
+                            if let Some(sid) = sid {
+                                app.rebuild_browser_nav_for_session(&sid);
                             }
                         }
                         app.needs_redraw = true;
@@ -298,11 +389,11 @@ async fn handle_input_key(
                     // handled above
                     return Ok(true);
                 }
-                // Only enter picker from splash, not from workspace (to prevent right arrow on 3rd screen going back to picker)
-                if app.desktop.active == ActiveDesktop::Splash && app.desktop.can_enter_picker() {
-                    app.enter_picker();
+                if app.desktop.active == ActiveDesktop::Overview {
+                    // focus cycle / snap handled in handle_picker_key
                     return Ok(true);
                 }
+                // Note: splash focus cycling and overview slide are handled earlier via handle_picker_key for Splash/Overview.
                 if !app.try_slide_to_workspace() {
                     app.focused_pane = crate::app_state::Pane::Right;
                 }
@@ -348,9 +439,12 @@ async fn handle_input_key(
         }
     }
 
-    // Suppress text input editing on splash and picker screens (input bar is hidden there)
+    // Suppress text input editing on splash/picker/overview screens (input bar is hidden there)
     // except when in adding workspace mode
-    if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker)
+    let overview_harness = matches!(app.desktop.active, ActiveDesktop::Overview)
+        && app.browser_selected_is_harness();
+    if matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview)
+        && !overview_harness
         && !app.picker.adding_workspace
         && matches!(key.code, KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Delete)
     {
@@ -369,7 +463,7 @@ async fn handle_input_key(
         if !is_cursor_move || app.focused_pane == crate::app_state::Pane::Input {
             app.apply_edit_action(action);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview) || overview_harness || app.picker.adding_workspace {
                 app.focused_pane = crate::app_state::Pane::Input;
             }
             return Ok(true);
@@ -381,13 +475,43 @@ async fn handle_input_key(
         KeyCode::Char(c) => {
             app.insert_char(c);
             clamp_slash_selection(&app.slash_commands, &app.input, &mut app.slash_selected);
-            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker) || app.picker.adding_workspace {
+            if !matches!(app.desktop.active, ActiveDesktop::Splash | ActiveDesktop::Picker | ActiveDesktop::Overview) || overview_harness || app.picker.adding_workspace {
                 app.focused_pane = crate::app_state::Pane::Input;
             }
             Ok(true)
         }
         KeyCode::Enter => {
             if app.is_processing {
+                let prompt = app.input.trim().to_string();
+                if !prompt.is_empty()
+                    && crate::input_dispatch::slash_ok_while_processing(&prompt)
+                {
+                    match dispatch_slash_input(
+                        app,
+                        config,
+                        keystore,
+                        agent,
+                        &prompt,
+                        stop,
+                        &update_tx,
+                        approval_req_tx.clone(),
+                        queued_interject,
+                        instant_interject,
+                        false,
+                    )
+                    .await
+                    {
+                        crate::input_dispatch::SlashDispatch::Handled => {
+                            app.needs_redraw = true;
+                            return Ok(true);
+                        }
+                        crate::input_dispatch::SlashDispatch::Quit => {
+                            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                            return Ok(true);
+                        }
+                        crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {}
+                    }
+                }
                 // Submit queued interject or instant interject
                 if is_ctrl {
                     app.submit_instant_interject(
@@ -425,219 +549,128 @@ async fn handle_input_key(
                 if prompt.is_empty() {
                     return Ok(true);
                 }
-                app.left_committed.push(format!("> {}", prompt));
+
+                let backend = {
+                    let ag = agent.lock().await;
+                    ag.llm_backend()
+                };
+                let flags = &config.flags;
+                let workspace = config.workspace.display().to_string();
+
+                if prompt.starts_with("/plan") {
+                    app.clear_input();
+                    app.needs_redraw = true;
+                    let _ = dispatch_plan_slash(&prompt, app, agent);
+                    return Ok(true);
+                }
+
+                if app.plan.pending_observe_prompt.is_some() {
+                    if let Ok(mut ag) = agent.try_lock() {
+                        if let Some(msg) = ag.apply_user_observation(&prompt) {
+                            sync_plan_from_agent(&mut app.plan, &ag);
+                            app.left_committed.push(format!("> {}", prompt));
+                            app.left_committed.push(msg.clone());
+                            ag.push_message(
+                                "user",
+                                &format!(
+                                    "[User observation recorded] {}\n\nContinue with the plan from the next step.",
+                                    prompt
+                                ),
+                            );
+                            app.clear_input();
+                            app.needs_redraw = true;
+                            // Fall through to dispatch as agent prompt to resume work.
+                        }
+                    }
+                }
+
+                let mut agent_prompt = prompt.clone();
+                if plan_loop_active(&app.plan) {
+                    app.clear_input();
+                    match submit_plan_loop_input(app, agent, &prompt) {
+                        PlanLoopUserOutcome::SpawnAnswer {
+                            user_input,
+                            question,
+                        } => {
+                            app.is_processing = true;
+                            app.needs_redraw = true;
+                            spawn_plan_answer_submit(
+                                app,
+                                backend.clone(),
+                                flags.clone(),
+                                workspace.clone(),
+                                update_tx.clone(),
+                                user_input,
+                                question,
+                            );
+                            return Ok(true);
+                        }
+                        PlanLoopUserOutcome::SpawnProceedFeedback { user_input } => {
+                            app.is_processing = true;
+                            app.needs_redraw = true;
+                            spawn_proceed_feedback_work(
+                                app,
+                                backend.clone(),
+                                flags.clone(),
+                                workspace.clone(),
+                                update_tx.clone(),
+                                user_input,
+                            );
+                            return Ok(true);
+                        }
+                        PlanLoopUserOutcome::StartExecution => {
+                            app.left_committed
+                                .push("▶ Plan approved — starting execution.".to_string());
+                            agent_prompt = format_plan_execution_user_prompt(
+                                &app.plan,
+                                &config.workspace,
+                            );
+                        }
+                        PlanLoopUserOutcome::Consumed => {
+                            return Ok(true);
+                        }
+                    }
+                }
+
+                match route_plan_entry_intent(app, agent, &backend, flags, &prompt).await {
+                    PlanInputRouting::Stop => {
+                        app.needs_redraw = true;
+                        return Ok(true);
+                    }
+                    PlanInputRouting::Continue | PlanInputRouting::Pass => {}
+                }
+
+                if agent_prompt.starts_with("Execute the approved plan.") {
+                    app.left_committed
+                        .push("▶ Plan approved — starting execution.".to_string());
+                } else {
+                    app.left_committed.push(format!("> {}", agent_prompt));
+                }
                 app.clear_input();
                 app.needs_redraw = true;
 
-                // Prepare slash context (dispatch uses the prompt string; many /cmds mutate via ctx)
-                let focused = match app.focused_pane {
-                    crate::app_state::Pane::Left => RenderPane::Left,
-                    crate::app_state::Pane::Right => RenderPane::Right,
-                    crate::app_state::Pane::Input => RenderPane::Right,
-                };
-                let mut ctx = crate::input_dispatch::SlashContext {
-                    left_committed: &mut app.left_committed,
-                    trace_lines: &mut app.trace_lines,
-                    current_response: &app.current_response,
-                    current_thinking: &app.current_thinking,
-                    input: &mut app.input,
-                    cursor_pos: &mut app.cursor_pos,
-                    slash_commands: &app.slash_commands,
-                    slash_selected: &mut app.slash_selected,
-                    mode_menu_active: &mut app.mode_menu_active,
-                    selected_mode_idx: &mut app.selected_mode_idx,
-                    agent_mode_menu_active: &mut app.agent_mode_menu_active,
-                    selected_agent_mode_idx: &mut app.selected_agent_mode_idx,
-                    settings: &mut app.settings,
-                    search: &mut app.search,
-                    focused_pane: focused,
-                    left_scroll: &mut app.left_scroll,
-                    right_scroll: &mut app.right_scroll,
-                    left_follow_output: &mut app.left_follow_output,
-                    right_follow_output: &mut app.right_follow_output,
-                    last_left_line_count: app.last_left_line_count,
-                    last_right_line_count: app.last_right_line_count,
-                    last_left_area_h: app.last_left_area.height,
-                    last_right_area_h: app.last_right_area.height,
+                match dispatch_slash_input(
+                    app,
                     config,
                     keystore,
                     agent,
-                };
-
-                match crate::input_dispatch::dispatch_slash_command(&prompt, &mut ctx) {
-                    crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {
-                        // Starting a fresh turn: ensure any prior stop (from Esc abort) is cleared
-                        // so the new drive_turn isn't immediately aborted by a stale flag.
-                        stop.store(false, std::sync::atomic::Ordering::SeqCst);
-                        app.is_processing = true;
-                        app.needs_redraw = true;
-
-                        let agent_c = agent.clone();
-                        let tx_c = update_tx.clone();
-                        let appr_c = approval_req_tx.clone();
-                        let stop_c = stop.clone();
-                        let q_c = queued_interject.clone();
-                        let i_c = instant_interject.clone();
-                        let prompt_c = prompt;
-
-                        tokio::spawn(async move {
-                            let mut ag = agent_c.lock().await;
-                            let mode = ag.current_exec_mode();
-                            let agent_mode = ag.current_agent_mode();
-                            let mut obs = crate::event_loop::TuiObserver {
-                                tx: tx_c.clone(),
-                                approval_req_tx: appr_c,
-                                stop: stop_c.clone(),
-                                queued: q_c,
-                                instant: i_c,
-                                denials_this_turn: 0,
-                                halt_tools: false,
-                                exec_mode: mode,
-                            };
-                            let res = raven_tui::agent_driver::drive_turn(&mut ag, &prompt_c, &mut obs).await;
-                            match res {
-                                Ok(r) => {
-                                    // In "work" mode, run the Super Judge before declaring Done
-                                    if agent_mode == "work" {
-                                        const MAX_SUPER_JUDGE_CYCLES: u32 = 3;
-                                        let mut last_text = r.final_text.clone();
-                                        let mut all_actions = r.actions.clone();
-                                        let mut cycle = 0u32;
-
-                                        loop {
-                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "⏹ Stopped (Esc)".into(),
-                                                }).await;
-                                                break;
-                                            }
-                                            if cycle >= MAX_SUPER_JUDGE_CYCLES {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "🔍 Super Judge: max review cycles reached, accepting".into(),
-                                                }).await;
-                                                break;
-                                            }
-                                            cycle += 1;
-
-                                            // Brief pause for UX (shows Processing off briefly)
-                                            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "⏹ Stopped (Esc)".into(),
-                                                }).await;
-                                                break;
-                                            }
-                                            let _ = tx_c.send(crate::event_loop::UiUpdate::SuperJudgeBegin).await;
-                                            let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                name: "system".into(),
-                                                summary: format!("🔍 Super Judge reviewing work (cycle {}/{})", cycle, MAX_SUPER_JUDGE_CYCLES),
-                                            }).await;
-
-                                            // Use the headless Super Judge observer (its review may run to completion;
-                                            // subsequent nudges and loops will abort on stop).
-                                            let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
-                                            let verdict = raven_tui::super_judge::run_super_judge_with_observer(
-                                                &mut ag, &last_text, &all_actions, &mut sj_obs,
-                                            ).await;
-
-                                            if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                    name: "system".into(),
-                                                    summary: "⏹ Stopped (Esc)".into(),
-                                                }).await;
-                                                break;
-                                            }
-
-                                            match verdict {
-                                                raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: WORK_COMPLETE — {}", note),
-                                                    }).await;
-                                                    break;
-                                                }
-                                                raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: "🔍 Super Judge: NEEDS_WORK — nudging agent".to_string(),
-                                                    }).await;
-                                                    if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
-                                                        let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                            name: "system".into(),
-                                                            summary: "⏹ Stopped (Esc)".into(),
-                                                        }).await;
-                                                        break;
-                                                    }
-                                                    // Inject feedback and re-run
-                                                    let nudge = format!(
-                                                        "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
-                                                        feedback
-                                                    );
-                                                    match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs).await {
-                                                        Ok(r2) => {
-                                                            last_text = r2.final_text.clone();
-                                                            all_actions.extend(r2.actions);
-                                                        }
-                                                        Err(e) => {
-                                                            let _ = tx_c.send(crate::event_loop::UiUpdate::Error(
-                                                                format!("Super Judge re-run error: {}", e)
-                                                            )).await;
-                                                            break;
-                                                        }
-                                                    }
-                                                }
-                                                raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: DEATH_SPIRAL detected — {}", feedback),
-                                                    }).await;
-                                                    // Inject anti-spiral guidance as final message
-                                                    ag.push_message("user", &format!(
-                                                        "[🔍 SUPER JUDGE — DEATH SPIRAL DETECTED]: {}\n\n\
-                                                         Stop repeating the same approach. Try something completely different.",
-                                                        feedback
-                                                    ));
-                                                    break;
-                                                }
-                                                raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
-                                                    let _ = tx_c.send(crate::event_loop::UiUpdate::ToolResult {
-                                                        name: "system".into(),
-                                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
-                                                    }).await;
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
-                                            final_text: last_text,
-                                        }).await;
-                                    } else {
-                                        let _ = tx_c.send(crate::event_loop::UiUpdate::Done {
-                                            final_text: r.final_text,
-                                        }).await;
-                                    }
-                                    let _ = tx_c.send(crate::event_loop::UiUpdate::Usage {
-                                        prompt_tokens: Some(r.metrics.prompt_tokens as u32),
-                                        completion_tokens: Some(r.metrics.completion_tokens as u32),
-                                        total_tokens: Some(r.metrics.total_tokens as u32),
-                                    }).await;
-                                }
-                                Err(e) => {
-                                    let _ = tx_c.send(crate::event_loop::UiUpdate::Error(e.to_string())).await;
-                                }
-                            }
-                        });
-                    }
+                    &agent_prompt,
+                    stop,
+                    &update_tx,
+                    approval_req_tx.clone(),
+                    queued_interject,
+                    instant_interject,
+                    true,
+                )
+                .await
+                {
                     crate::input_dispatch::SlashDispatch::Handled => {
                         app.needs_redraw = true;
                     }
                     crate::input_dispatch::SlashDispatch::Quit => {
                         stop.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
+                    crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {}
                 }
             }
             Ok(true)
@@ -755,5 +788,267 @@ pub fn get_filtered_commands<'a>(
         .filter(|cmd| prefix.is_empty() || cmd.name.starts_with(prefix))
         .collect()
 }
+
+/// Run an agent turn in the background so the TUI event loop can keep animating.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_agent_turn(
+    app: &mut App,
+    agent: &Arc<TokioMutex<Agent>>,
+    prompt: String,
+    stop: &Arc<AtomicBool>,
+    update_tx: &mpsc::Sender<crate::event_loop::UiUpdate>,
+    approval_req_tx: &mpsc::Sender<(String, oneshot::Sender<bool>)>,
+    queued_interject: &Arc<Mutex<Option<String>>>,
+    instant_interject: &Arc<Mutex<Option<String>>>,
+) {
+    stop.store(false, std::sync::atomic::Ordering::SeqCst);
+    app.is_processing = true;
+    app.needs_redraw = true;
+
+    let agent_c = agent.clone();
+    let tx_c = update_tx.clone();
+    let appr_c = approval_req_tx.clone();
+    let stop_c = stop.clone();
+    let q_c = queued_interject.clone();
+    let i_c = instant_interject.clone();
+    let prompt_c = prompt;
+    let exec_mode_c = app.live_exec_mode.clone();
+
+    if let Ok(mut ag) = agent.try_lock() {
+        if let Ok(mut slot) = app.live_exec_mode.lock() {
+            *slot = ag.current_exec_mode();
+        }
+        let workspace = ag.workspace().to_path_buf();
+        let wiki = ag
+            .session()
+            .as_ref()
+            .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
+        reconcile_plan_execution(&mut app.plan, &ag, wiki.as_deref());
+        sync_plan_to_agent(&mut ag, &app.plan, &workspace);
+    }
+
+    tokio::spawn(async move {
+        let mut ag = agent_c.lock().await;
+        let agent_mode = ag.current_agent_mode();
+        let mut obs = crate::event_loop::TuiObserver {
+            tx: tx_c.clone(),
+            approval_req_tx: appr_c,
+            stop: stop_c.clone(),
+            queued: q_c,
+            instant: i_c,
+            denials_this_turn: 0,
+            halt_tools: false,
+            exec_mode: exec_mode_c,
+        };
+        let res = raven_tui::agent_driver::drive_turn(&mut ag, &prompt_c, &mut obs).await;
+        match res {
+            Ok(r) => {
+                // Plan execution has per-step verification; Super Judge mid-plan derails
+                // the agent (denies patches during review, false DEATH_SPIRAL on normal edits).
+                let plan_executing = ag.plan_tool_context().plan_executing;
+                if agent_mode == "work" && !plan_executing {
+                    const MAX_SUPER_JUDGE_CYCLES: u32 = 3;
+                    let mut last_text = r.final_text.clone();
+                    let mut all_actions = r.actions.clone();
+                    let mut cycle = 0u32;
+
+                    loop {
+                        if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary: "⏹ Stopped (Esc)".into(),
+                                })
+                                .await;
+                            break;
+                        }
+                        if cycle >= MAX_SUPER_JUDGE_CYCLES {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary:
+                                        "🔍 Super Judge: max review cycles reached, accepting"
+                                            .into(),
+                                })
+                                .await;
+                            break;
+                        }
+                        cycle += 1;
+
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary: "⏹ Stopped (Esc)".into(),
+                                })
+                                .await;
+                            break;
+                        }
+                        let _ = tx_c
+                            .send(crate::event_loop::UiUpdate::SuperJudgeBegin)
+                            .await;
+                        let _ = tx_c
+                            .send(crate::event_loop::UiUpdate::ToolResult {
+                                name: "system".into(),
+                                summary: format!(
+                                    "🔍 Super Judge reviewing work (cycle {}/{})",
+                                    cycle, MAX_SUPER_JUDGE_CYCLES
+                                ),
+                            })
+                            .await;
+
+                        let mut sj_obs = raven_tui::super_judge::SuperJudgeObserver::new();
+                        let verdict = raven_tui::super_judge::run_super_judge_with_observer(
+                            &mut ag, &last_text, &all_actions, &mut sj_obs,
+                        )
+                        .await;
+
+                        if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                            let _ = tx_c
+                                .send(crate::event_loop::UiUpdate::ToolResult {
+                                    name: "system".into(),
+                                    summary: "⏹ Stopped (Esc)".into(),
+                                })
+                                .await;
+                            break;
+                        }
+
+                        match verdict {
+                            raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: format!(
+                                            "🔍 Super Judge: WORK_COMPLETE — {}",
+                                            note
+                                        ),
+                                    })
+                                    .await;
+                                break;
+                            }
+                            raven_tui::super_judge::SuperJudgeVerdict::Continue { feedback } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: "🔍 Super Judge: NEEDS_WORK — nudging agent"
+                                            .to_string(),
+                                    })
+                                    .await;
+                                if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let _ = tx_c
+                                        .send(crate::event_loop::UiUpdate::ToolResult {
+                                            name: "system".into(),
+                                            summary: "⏹ Stopped (Esc)".into(),
+                                        })
+                                        .await;
+                                    break;
+                                }
+                                let nudge = format!(
+                                    "[🔍 SUPER JUDGE FEEDBACK]: {}\n\nContinue working on the task.",
+                                    feedback
+                                );
+                                match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs)
+                                    .await
+                                {
+                                    Ok(r2) => {
+                                        last_text = r2.final_text.clone();
+                                        all_actions.extend(r2.actions);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_c
+                                            .send(crate::event_loop::UiUpdate::Error(format!(
+                                                "Super Judge re-run error: {}",
+                                                e
+                                            )))
+                                            .await;
+                                        break;
+                                    }
+                                }
+                            }
+                            raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: format!(
+                                            "🔍 Super Judge: DEATH_SPIRAL detected — {}",
+                                            feedback
+                                        ),
+                                    })
+                                    .await;
+                                if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
+                                    let _ = tx_c
+                                        .send(crate::event_loop::UiUpdate::ToolResult {
+                                            name: "system".into(),
+                                            summary: "⏹ Stopped (Esc)".into(),
+                                        })
+                                        .await;
+                                    break;
+                                }
+                                let nudge = format!(
+                                    "[🔍 SUPER JUDGE — DEATH SPIRAL DETECTED]: {}\n\n\
+                                     Stop repeating the same approach. Try something completely different.",
+                                    feedback
+                                );
+                                match raven_tui::agent_driver::drive_turn(&mut ag, &nudge, &mut obs)
+                                    .await
+                                {
+                                    Ok(r2) => {
+                                        last_text = r2.final_text.clone();
+                                        all_actions.extend(r2.actions);
+                                    }
+                                    Err(e) => {
+                                        let _ = tx_c
+                                            .send(crate::event_loop::UiUpdate::Error(format!(
+                                                "Super Judge re-run error: {}",
+                                                e
+                                            )))
+                                            .await;
+                                    }
+                                }
+                                break;
+                            }
+                            raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
+                                let _ = tx_c
+                                    .send(crate::event_loop::UiUpdate::ToolResult {
+                                        name: "system".into(),
+                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
+                                    })
+                                    .await;
+                                break;
+                            }
+                        }
+                    }
+
+                    let _ = tx_c
+                        .send(crate::event_loop::UiUpdate::Done {
+                            final_text: last_text,
+                        })
+                        .await;
+                } else {
+                    let _ = tx_c
+                        .send(crate::event_loop::UiUpdate::Done {
+                            final_text: r.final_text,
+                        })
+                        .await;
+                }
+                let _ = tx_c
+                    .send(crate::event_loop::UiUpdate::Usage {
+                        prompt_tokens: Some(r.metrics.prompt_tokens as u32),
+                        completion_tokens: Some(r.metrics.completion_tokens as u32),
+                        total_tokens: Some(r.metrics.total_tokens as u32),
+                    })
+                    .await;
+            }
+            Err(e) => {
+                let _ = tx_c
+                    .send(crate::event_loop::UiUpdate::Error(e.to_string()))
+                    .await;
+            }
+        }
+    });
+}
+
+
 
 

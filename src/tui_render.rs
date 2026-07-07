@@ -15,6 +15,37 @@ use ratatui::{
     Frame,
 };
 
+const PLAN_ORANGE: Color = Color::Rgb(0xff, 0xc0, 0x40);
+const PLAN_GREEN: Color = Color::Rgb(0x60, 0xc0, 0x60);
+
+fn is_plan_entry_confirm(entry: &str) -> bool {
+    let t = entry.trim();
+    t.starts_with("Enter plan mode?")
+}
+
+fn push_attention_entry(
+    left_text: &mut Text<'static>,
+    entry: &str,
+    highlight_line: Option<usize>,
+    line_idx: &mut usize,
+    fg: Color,
+) {
+    let style = if Some(*line_idx) == highlight_line {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    };
+    for line in entry.lines() {
+        left_text
+            .lines
+            .push(Line::from(Span::styled(line.to_string(), style)));
+        *line_idx += 1;
+    }
+}
+
 // ── Raven markdown renderer ──────────────────────────────────────────────────
 // Replaces tui_markdown with a purpose-built renderer that directly produces
 // ratatui types. Handles: headings, bold/italic/code, links, lists, code
@@ -775,15 +806,18 @@ pub fn draw_mode_menu(
     f.render_widget(menu_block, menu_area);
 }
 
-pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: Rect) {
+pub fn draw_confirmation_modal(
+    f: &mut Frame,
+    dialog: &crate::confirmation_dialog::ConfirmationDialog,
+    screen: Rect,
+    input_area: Rect,
+) {
+    let view = dialog.view();
     let modal_w = screen.width.saturating_sub(4).clamp(44, 64);
-    // Inner text width: borders (2) + default paragraph padding (2).
     let inner_w = modal_w.saturating_sub(4) as usize;
     let available_h = input_area.y.saturating_sub(screen.y + 1).max(7);
-    // Header + detail + spacer + Y/N + top/bottom borders.
     let max_desc_lines = ((available_h as usize).saturating_sub(5)).clamp(1, 4);
-    let (kind, detail) = desc.split_once(": ").unwrap_or(("action", desc));
-    let detail_lines = wrap_approval_lines(detail, inner_w, max_desc_lines);
+    let detail_lines = wrap_approval_lines(&view.detail, inner_w, max_desc_lines);
 
     let body_lines = 1 + detail_lines.len() + 1 + 1;
     let modal_h = (body_lines as u16 + 2).clamp(7, available_h);
@@ -793,18 +827,19 @@ pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: 
     let modal_area = Rect::new(modal_x, modal_y, modal_w, modal_h);
 
     let detail_style = Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa));
-    let mut popup_lines = vec![Line::from(vec![
-        Span::styled(
-            kind,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            " — sandbox approval needed",
+    let mut headline_spans = vec![Span::styled(
+        view.headline.as_str(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )];
+    if !view.headline_suffix.is_empty() {
+        headline_spans.push(Span::styled(
+            view.headline_suffix,
             Style::default().fg(Color::DarkGray),
-        ),
-    ])];
+        ));
+    }
+    let mut popup_lines = vec![Line::from(headline_spans)];
     for line in detail_lines {
         popup_lines.push(Line::from(Span::styled(line, detail_style)));
     }
@@ -827,14 +862,14 @@ pub fn draw_approval_popup(f: &mut Frame, desc: &str, screen: Rect, input_area: 
     let popup = Paragraph::new(Text::from(popup_lines)).block(
         Block::default()
             .title(Span::styled(
-                " Action Approval ",
+                view.title,
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(view.border_color)
                     .add_modifier(Modifier::BOLD),
             ))
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(view.border_color))
             .padding(ratatui::widgets::Padding::new(1, 1, 0, 0)),
     );
     f.render_widget(Clear, modal_area);
@@ -853,35 +888,75 @@ pub fn draw_left_pane(
     focused_pane: Pane,
     scroll_flash_timer: u8,
     highlight_line: Option<usize>,
+    draw_frame: bool,
 ) {
     *last_left_area = left_area;
 
     let mut left_text = Text::default();
     let mut line_idx = 0usize;
+    let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
-        let (prefix_style, body_style) = conversation_entry_styles(entry);
-
-        let lines_iter: Vec<&str> = entry.lines().collect();
-        for (li, line) in lines_iter.iter().enumerate() {
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else if li == 0 {
-                prefix_style
-            } else {
-                body_style
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
+        if is_plan_entry_confirm(entry) {
+            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
+        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
+            let (prefix_style, body_style) = conversation_entry_styles(entry);
+            let lines_iter: Vec<&str> = entry.lines().collect();
+            for (li, line) in lines_iter.iter().enumerate() {
+                let is_blank = line.trim().is_empty();
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 {
+                        continue;
+                    }
+                } else {
+                    consecutive_blanks = 0;
+                }
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if li == 0 {
+                    prefix_style
+                } else {
+                    body_style
+                };
+                left_text
+                    .lines
+                    .push(Line::from(Span::styled(line.to_string(), style)));
+                line_idx += 1;
+            }
+        } else {
+            // Rich markdown rendering for assistant and system-ish messages.
+            // This preserves structure/newlines for plans, lists, code, headings, etc.
+            // (User messages stay plain for chat flow.)
+            let md = wiki_render_markdown(entry);
+            for mut line in md.lines {
+                if Some(line_idx) == highlight_line {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD);
+                    }
+                }
+                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 { /* keep a couple for md separation */ }
+                    else { left_text.lines.push(line); }
+                } else {
+                    consecutive_blanks = 0;
+                    left_text.lines.push(line);
+                }
+                line_idx += 1;
+            }
         }
-        if i < left_committed.len() - 1 {
+        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
             left_text.lines.push(Line::from(""));
             line_idx += 1;
+            consecutive_blanks += 1;
         }
     }
 
@@ -929,6 +1004,12 @@ pub fn draw_left_pane(
         }
     }
 
+    let title_str = if draw_frame { "  Conversation" } else { "" };
+    let subtitle = if draw_frame {
+        Some(format!("  ({} msgs)", left_committed.len()))
+    } else {
+        None
+    };
     render_scrollable_pane(
         f,
         left_area,
@@ -938,9 +1019,9 @@ pub fn draw_left_pane(
         left_scroll,
         focused_pane == Pane::Left,
         scroll_flash_timer,
-        "  Conversation",
+        title_str,
         Color::Cyan,
-        Some(format!("  ({} msgs)", left_committed.len())),
+        subtitle,
     );
 }
 
@@ -1027,7 +1108,7 @@ pub fn draw_overlays(
     screen: Rect,
     input_area: Rect,
     settings: &SettingsModal,
-    pending_approval: Option<&str>,
+    pending_confirmation: Option<&crate::confirmation_dialog::ConfirmationDialog>,
     slash_commands: &[SlashCommand],
     input: &str,
     slash_selected: usize,
@@ -1038,8 +1119,8 @@ pub fn draw_overlays(
     agent_modes: &[&str],
     selected_agent_mode_idx: usize,
 ) {
-    if let Some(desc) = pending_approval {
-        draw_approval_popup(f, desc, screen, input_area);
+    if let Some(dialog) = pending_confirmation {
+        draw_confirmation_modal(f, dialog, screen, input_area);
     }
     if input.starts_with('/') && !input.is_empty() {
         draw_slash_menu(f, input_area, slash_commands, input, slash_selected);
@@ -1091,6 +1172,12 @@ fn conversation_entry_styles(entry: &str) -> (Style, Style) {
             Style::default().fg(Color::DarkGray),
             Style::default().fg(Color::DarkGray),
         )
+    } else if entry.contains("enter plan mode") || entry.contains("Do you want to enter plan mode") || entry.contains("Would you like to enter plan mode") {
+        // Plan mode entry confirmation question — highlighted in orange (same as plan pane) to get attention.
+        (
+            Style::default().fg(PLAN_ORANGE).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(0xff, 0xd0, 0x80)),
+        )
     } else {
         (
             Style::default().fg(Color::Rgb(0x88, 0x88, 0xaa)),
@@ -1127,6 +1214,49 @@ fn trace_line_style(line: &str) -> Style {
     }
 }
 
+/// Horizontal space reserved inside a scrollable pane: scrollbar(1) + borders(2) + padding(2).
+const PANE_INNER_WIDTH_RESERVE: u16 = 5;
+const PANE_BORDER_HEIGHT: u16 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneScrollMetrics {
+    line_count: u16,
+    content_height: u16,
+    max_scroll: u16,
+}
+
+/// Compute wrapped-line scroll limits for a scrollable pane.
+///
+/// The Paragraph widget uses `Wrap { trim: false }`, so logical lines wider than
+/// the inner width occupy multiple visual rows. `max_scroll` is derived from the
+/// visible content height (inside borders, minus an optional title row).
+fn pane_scroll_metrics(area: Rect, text: &Text, has_title: bool) -> PaneScrollMetrics {
+    let title_height = u16::from(has_title);
+    let content_height = area.height.saturating_sub(PANE_BORDER_HEIGHT + title_height);
+    let inner_width = area.width.saturating_sub(PANE_INNER_WIDTH_RESERVE).max(1) as usize;
+    let line_count = count_visual_lines(text, inner_width);
+    let max_scroll = line_count.saturating_sub(content_height);
+    PaneScrollMetrics {
+        line_count,
+        content_height,
+        max_scroll,
+    }
+}
+
+fn count_visual_lines(text: &Text, inner_width: usize) -> u16 {
+    let inner_width = inner_width.max(1);
+    let mut visual_lines: u16 = 0;
+    for line in text.lines.iter() {
+        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+        if line_width == 0 {
+            visual_lines += 1; // empty line still takes 1 row
+        } else {
+            visual_lines += line_width.div_ceil(inner_width) as u16;
+        }
+    }
+    visual_lines
+}
+
 fn render_scrollable_pane(
     f: &mut Frame,
     area: Rect,
@@ -1140,27 +1270,13 @@ fn render_scrollable_pane(
     title_color: Color,
     subtitle: Option<String>,
 ) {
-    // Compute *visual* line count (accounting for wrapping).
-    // The Paragraph widget uses Wrap { trim: false }, so lines longer
-    // than the content width wrap to multiple visual lines. We must count
-    // wrapped lines for correct scroll limits; otherwise the max scroll
-    // is too small and you can never reach the bottom.
-    let content_height = area.height.saturating_sub(2);
-    // Inner width = area width minus borders (2) minus horizontal padding (2)
-    let inner_width = area.width.saturating_sub(4).max(1) as usize;
-    let mut visual_lines: u16 = 0;
-    for line in text.lines.iter() {
-        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        if line_width == 0 {
-            visual_lines += 1; // empty line still takes 1 row
-        } else {
-            // Ceiling division: how many rows does this line occupy?
-            visual_lines += line_width.div_ceil(inner_width) as u16;
-        }
-    }
-    let line_count = visual_lines;
+    let has_title = !title.trim().is_empty();
+    let PaneScrollMetrics {
+        line_count,
+        content_height,
+        max_scroll,
+    } = pane_scroll_metrics(area, text, has_title);
     *last_line_count = line_count;
-    let max_scroll = line_count.saturating_sub(content_height);
     if follow_output {
         *scroll = max_scroll;
     } else {
@@ -1179,37 +1295,50 @@ fn render_scrollable_pane(
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
 
-    let title_line = if let Some(sub) = subtitle {
-        Line::from(vec![
-            Span::styled(
+    let block = if title.trim().is_empty() {
+        Paragraph::new(text.clone())
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(focus_style)
+                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .style(Style::default().bg(Color::Black)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((*scroll, 0))
+    } else {
+        let title_line = if let Some(sub) = subtitle {
+            Line::from(vec![
+                Span::styled(
+                    title,
+                    Style::default()
+                        .fg(title_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(sub, Style::default().fg(Color::DarkGray)),
+            ])
+        } else {
+            Line::from(Span::styled(
                 title,
                 Style::default()
                     .fg(title_color)
                     .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(sub, Style::default().fg(Color::DarkGray)),
-        ])
-    } else {
-        Line::from(Span::styled(
-            title,
-            Style::default()
-                .fg(title_color)
-                .add_modifier(Modifier::BOLD),
-        ))
+            ))
+        };
+        Paragraph::new(text.clone())
+            .block(
+                Block::default()
+                    .title(title_line)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(focus_style)
+                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .style(Style::default().bg(Color::Black)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((*scroll, 0))
     };
-
-    let block = Paragraph::new(text.clone())
-        .block(
-            Block::default()
-                .title(title_line)
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(focus_style)
-                .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
-                .style(Style::default().bg(Color::Black)),
-        )
-        .wrap(Wrap { trim: false })
-        .scroll((*scroll, 0));
 
     f.render_widget(block, area);
 
@@ -1317,6 +1446,98 @@ fn wrap_approval_lines(s: &str, width: usize, max_lines: usize) -> Vec<String> {
 }
 
 #[cfg(test)]
+mod scroll_metrics_tests {
+    use super::{count_visual_lines, pane_scroll_metrics};
+    use ratatui::{
+        layout::Rect,
+        text::{Line, Text},
+    };
+
+    fn text_from_lines(lines: &[&str]) -> Text<'static> {
+        Text::from(
+            lines
+                .iter()
+                .map(|s| Line::from(s.to_string()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn empty_text_single_visual_line() {
+        let text = Text::default();
+        assert_eq!(count_visual_lines(&text, 10), 0);
+    }
+
+    #[test]
+    fn short_lines_one_row_each() {
+        let text = text_from_lines(&["hello", "world"]);
+        assert_eq!(count_visual_lines(&text, 20), 2);
+    }
+
+    #[test]
+    fn long_line_wraps_to_multiple_rows() {
+        let text = text_from_lines(&["abcdefghijklmnop"]); // 16 chars
+        assert_eq!(count_visual_lines(&text, 10), 2);
+        assert_eq!(count_visual_lines(&text, 5), 4);
+    }
+
+    #[test]
+    fn empty_logical_line_counts_as_one_row() {
+        let text = text_from_lines(&[""]);
+        assert_eq!(count_visual_lines(&text, 10), 1);
+    }
+
+    #[test]
+    fn titled_pane_reduces_content_height() {
+        let area = Rect::new(0, 0, 30, 12);
+        let text = text_from_lines(&["line"]);
+        let untitled = pane_scroll_metrics(area, &text, false);
+        let titled = pane_scroll_metrics(area, &text, true);
+        assert_eq!(untitled.content_height, 10);
+        assert_eq!(titled.content_height, 9);
+    }
+
+    #[test]
+    fn inner_width_reserves_scrollbar_and_padding() {
+        let area = Rect::new(0, 0, 20, 10);
+        // inner width = 20 - 5 = 15
+        let text = text_from_lines(&["x".repeat(30).as_str()]);
+        assert_eq!(count_visual_lines(&text, 15), 2);
+        let metrics = pane_scroll_metrics(area, &text, false);
+        assert_eq!(metrics.line_count, 2);
+        assert_eq!(metrics.content_height, 8);
+        assert_eq!(metrics.max_scroll, 0);
+    }
+
+    #[test]
+    fn max_scroll_allows_reaching_bottom() {
+        let area = Rect::new(0, 0, 20, 8);
+        let lines: Vec<String> = (0..20).map(|i| format!("line {i}")).collect();
+        let text = Text::from(
+            lines
+                .iter()
+                .map(|s| Line::from(s.as_str()))
+                .collect::<Vec<_>>(),
+        );
+        let metrics = pane_scroll_metrics(area, &text, true);
+        // height 8 - borders 2 - title 1 = 5 visible rows; 20 lines -> max_scroll 15
+        assert_eq!(metrics.content_height, 5);
+        assert_eq!(metrics.line_count, 20);
+        assert_eq!(metrics.max_scroll, 15);
+    }
+
+    #[test]
+    fn metrics_are_stable_across_calls() {
+        let area = Rect::new(0, 0, 25, 10);
+        let text = text_from_lines(&["alpha", "beta beta beta beta"]);
+        let first = pane_scroll_metrics(area, &text, true);
+        let second = pane_scroll_metrics(area, &text, true);
+        assert_eq!(first, second);
+        assert!(first.max_scroll <= first.line_count);
+    }
+}
+
+#[cfg(test)]
 mod approval_popup_tests {
     use super::{char_count, wrap_approval_lines};
 
@@ -1354,6 +1575,8 @@ pub struct SplashData<'a> {
     pub base_url: &'a str,
     pub model: &'a str,
     pub workspace: &'a str,
+    /// Which side of the first screen is highlighted (default Magenta).
+    pub splash_focus: crate::app_state::SplashFocus,
 }
 
 pub struct PickerDrawData<'a> {
@@ -1366,6 +1589,13 @@ pub struct PickerDrawData<'a> {
     pub wiki_links: &'a [crate::app_state::WikiLink],
     pub active_link_idx: usize,
     pub summary_action: crate::app_state::SummaryAction,
+    /// When in the 3-pane overview (picker | nav | content), which column has focus.
+    pub view_focus: crate::app_state::ViewFocus,
+    // Browser nav for Screen 2 (stable Harness + Wiki tree)
+    pub browser_nav_items: &'a [crate::app_state::WikiNavItem],
+    pub browser_selected_nav: usize,
+    pub browser_wiki_content: &'a str,
+    pub browser_wiki_scroll: usize,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1380,10 +1610,185 @@ pub struct WorkspaceDrawData<'a> {
     pub scroll_flash_timer: u8,
     pub left_highlight: Option<usize>,
     pub right_highlight: Option<usize>,
+    // Plan mode overlay pane (shown when run mode == "plan" or plan.active)
+    pub plan: Option<&'a crate::app_state::PlanState>,
 }
 
 /// Draw splash or workspace, or animate a horizontal slide between them.
 /// When desktop is Picker, draws the combined workspaces+sessions tree + summary (no separate sessions pane).
+fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState) {
+    let is_approved = !plan.steps.is_empty();
+    let pane_color = if is_approved { PLAN_GREEN } else { PLAN_ORANGE };
+    let title_text = if is_approved { " Plan (approved) " } else { " Plan " };
+    let block = Block::default()
+        .title(Span::styled(title_text, Style::default().fg(pane_color).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(pane_color))
+        .style(Style::default().bg(Color::Black));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = vec![];
+
+    // Key fields summary (compact)
+    lines.push(Line::from(vec![
+        Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(if plan.goal.is_empty() { "(gathering from user)" } else { &plan.goal }, Style::default().fg(Color::White)),
+    ]));
+    if !plan.success_criteria.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Success Criteria: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&plan.success_criteria, Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))),
+        ]));
+    }
+    if !plan.verification_steps.is_empty() {
+        lines.push(Line::from(Span::styled("Verification:", Style::default().fg(Color::DarkGray))));
+        for v in plan.verification_steps.iter().take(2) {
+            lines.push(Line::from(Span::styled(format!("  • {}", v), Style::default().fg(Color::Gray))));
+        }
+    }
+    if !plan.rollback.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Rollback: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&plan.rollback, Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    if !plan.constraints.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("Constraints: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&plan.constraints, Style::default().fg(Color::Gray)),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+
+    if plan.steps.is_empty() {
+        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let slow = spins[(plan.spinner_tick / 4) % spins.len()];
+        match plan.loop_phase {
+            crate::app_state::PlanLoopPhase::FetchingQuestion
+            | crate::app_state::PlanLoopPhase::FetchingProposal => {
+                lines.push(Line::from(Span::styled(
+                    format!("{slow} Planning… (JSON loop)"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            crate::app_state::PlanLoopPhase::AwaitingUserAnswer => {
+                if let Some(q) = &plan.pending_question {
+                    lines.push(Line::from(Span::styled(
+                        format!("❓ {}", q.prompt),
+                        Style::default().fg(Color::Rgb(0xff, 0xcc, 0x66)),
+                    )));
+                    for (i, opt) in q.options.iter().enumerate() {
+                        let rec = q
+                            .recommend
+                            .as_deref()
+                            .is_some_and(|r| r == opt.id)
+                            .then_some(" ★");
+                        lines.push(Line::from(Span::styled(
+                            format!(
+                                "  {}. {}{}",
+                                i + 1,
+                                opt.label,
+                                rec.unwrap_or_default()
+                            ),
+                            Style::default().fg(Color::Gray),
+                        )));
+                    }
+                }
+            }
+            crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
+                lines.push(Line::from(Span::styled(
+                    "📋 Review proposal in chat — ready to proceed?",
+                    Style::default().fg(Color::Rgb(0xcc, 0xff, 0xcc)),
+                )));
+            }
+            _ => {
+                lines.push(Line::from(Span::styled(
+                    format!("{slow} Steps: (to be determined)"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+    } else {
+        // Execution phase: show progress + steps
+        // Progress with swirl + optional simple bar
+        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let spin = spins[plan.spinner_tick % spins.len()];
+        let progress = if !plan.steps.is_empty() && plan.current_step < plan.steps.len() {
+            let st = &plan.steps[plan.current_step];
+            let observe = plan
+                .pending_observe_prompt
+                .as_deref()
+                .map(|p| format!(" — waiting: {}", p))
+                .unwrap_or_default();
+            format!(
+                "{} Step {}/{} {}{}",
+                spin,
+                plan.current_step + 1,
+                plan.steps.len(),
+                st.description,
+                observe
+            )
+        } else if !plan.steps.is_empty() {
+            // All steps completed (or forced on final Done / WORK_COMPLETE)
+            "✓ Plan complete".to_string()
+        } else {
+            format!("{} Preparing plan...", spin)
+        };
+        lines.push(Line::from(Span::styled(progress, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+
+        // Simple progress bar
+        if !plan.steps.is_empty() {
+            let total = plan.steps.len();
+            let done = plan.steps.iter().filter(|s| s.status == crate::app_state::PlanStepStatus::Done).count();
+            let mut pct = done.saturating_mul(100) / total.max(1);
+            if plan.current_step >= total || done >= total {
+                pct = 100;
+            }
+            let bar_width = 20;
+            let filled = pct * bar_width / 100;
+            let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
+            lines.push(Line::from(Span::styled(bar, Style::default().fg(pane_color))));
+        }
+
+        // Step list preview
+        for (i, st) in plan.steps.iter().enumerate().take(5) {
+            let mark = if i == plan.current_step {
+                "▶ "
+            } else {
+                match st.status {
+                    crate::app_state::PlanStepStatus::Done => "✓ ",
+                    crate::app_state::PlanStepStatus::Failed => "✗ ",
+                    _ => "  ",
+                }
+            };
+            let tier = st
+                .tier
+                .map(|t| format!(" [{}]", t.pane_label()))
+                .unwrap_or_default();
+            let v = st
+                .verification
+                .as_deref()
+                .or(st.observe_prompt.as_deref())
+                .map(|v| format!(" ({})", v))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!("{}{}{}{}", mark, st.description, tier, v),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    // Footer note about wiki storage
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("Stored in: wiki/plan.md (editable outside)", Style::default().fg(Color::DarkGray))));
+
+    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
+    f.render_widget(para, inner);
+}
+
 pub fn draw_content_desktop(
     f: &mut Frame,
     content_area: Rect,
@@ -1391,6 +1796,7 @@ pub fn draw_content_desktop(
     workspace: &WorkspaceDrawData<'_>,
     splash: &SplashData<'_>,
     picker: &PickerDrawData<'_>,
+    _wiki_viewer: &crate::app_state::WikiViewerState,
     last_left_area: &mut Rect,
     last_right_area: &mut Rect,
     last_left_line_count: &mut u16,
@@ -1445,7 +1851,146 @@ pub fn draw_content_desktop(
 
     match desktop.active {
         ActiveDesktop::Splash => {
-            draw_splash(f, content_area, splash);
+            // Horizontal split: left = magenta pane with raven + help, right = workspace picker (full height, outside magenta)
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .split(content_area);
+
+            let left_area = cols[0];
+            let right_area = cols[1];
+
+            let magenta_focused = splash.splash_focus == crate::app_state::SplashFocus::Magenta;
+            let picker_focused = !magenta_focused;
+
+            // Magenta pane on left enclosing the ASCII raven and help block.
+            // Bright when focused (default), gray when picker is highlighted.
+            let magenta_border = if magenta_focused {
+                Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))
+            } else {
+                Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+            };
+            let outer_block = Block::default()
+                .title(Line::from(vec![
+                    Span::styled(
+                        "  Raven Hotel",
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  v{VERSION}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled("  —  Agent Harness", Style::default().fg(Color::DarkGray)),
+                ]))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(magenta_border)
+                .style(Style::default().bg(Color::Black));
+
+            let left_inner = outer_block.inner(left_area);
+            f.render_widget(outer_block, left_area);
+
+            // Render raven + help inside the magenta pane (full height of left column)
+            let mut left_buf = Buffer::empty(left_inner);
+            render_splash_content(&mut left_buf, left_inner, splash);
+            f.render_widget(
+                BlitWidget {
+                    src: left_buf,
+                    rel_x: 0,
+                    rel_y: 0,
+                },
+                left_inner,
+            );
+
+            // Workspace picker (tree only) on the right, full vertical space, outside the magenta pane.
+            // Gray when magenta focused (default); highlighted (cyan border) after right/tab.
+            draw_picker_tree(f, right_area, picker.picker_items, picker.selected_item, picker_focused);
+
+            *last_left_area = Rect::default();
+            *last_right_area = Rect::default();
+        }
+        ActiveDesktop::Overview => {
+            // Screen 2: workspace picker | nav | content (wiki or harness conv+status+input)
+            // Focus starts on Picker. Right cycles Picker -> Nav -> Content.
+            // Up/down affect the focused pane.
+            // Right from Content does snap to Screen 3 or 4.
+            let cols = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
+                .split(content_area);
+
+            let picker_area = cols[0];
+            let nav_area = cols[1];
+            let content_area = cols[2];
+
+            let is_harness = crate::app_state::browser_nav_is_harness(
+                picker.browser_nav_items,
+                picker.browser_selected_nav,
+            );
+            let picker_focused = picker.view_focus == crate::app_state::ViewFocus::Picker;
+            let nav_focused = picker.view_focus == crate::app_state::ViewFocus::Nav;
+            let content_focused = picker.view_focus == crate::app_state::ViewFocus::Content;
+
+            // Picker column
+            draw_picker_tree(f, picker_area, picker.picker_items, picker.selected_item, picker_focused);
+
+            // Nav column (Coding Harness at top, Wiki subtree under it; stable, no index.md)
+            draw_nav_pane_for_browser(f, nav_area, " Nav ", picker.browser_nav_items, picker.browser_selected_nav, nav_focused);
+
+            // Content column: either wiki content or harness (status + conv + input)
+            if is_harness {
+                // Allocate space at top of content col for real upper status bar (drawn in event_loop overlay for alignment)
+                // then conv, then input space at bottom.
+                let vparts = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(3)])
+                    .split(content_area);
+
+                // Conversation content directly (no extra pane frame for embedded Screen 2 view)
+                let mut dummy_last = Rect::default();
+                let mut dummy_cnt = 0u16;
+                let conv_pane_focus = if content_focused { Pane::Left } else { Pane::Right };
+                draw_left_pane(
+                    f,
+                    workspace.left_committed,
+                    workspace.current_response,
+                    vparts[1],
+                    &mut dummy_last,
+                    &mut dummy_cnt,
+                    false,  // don't auto-follow, allow manual scroll with up/down
+                    left_scroll,
+                    conv_pane_focus,
+                    workspace.scroll_flash_timer,
+                    workspace.left_highlight,
+                    true,  // draw the Conversation frame with label
+                );
+
+                // Bottom space for input box (drawn as overlay in event_loop)
+                // (no block here to let real input bar appear)
+            } else {
+                // Wiki content pane -- use browser content + custom markdown like full wiki
+                let wiki_border = if content_focused { Color::Cyan } else { Color::Rgb(0x55,0x55,0x66) };
+                let txt = if picker.browser_wiki_content.is_empty() {
+                    "(wiki content for selected nav item)".to_string()
+                } else {
+                    picker.browser_wiki_content.to_string()
+                };
+                let md_text = wiki_render_markdown(&txt);
+                let preview = Paragraph::new(md_text)
+                    .wrap(Wrap { trim: true })
+                    .scroll((picker.browser_wiki_scroll as u16, 0))
+                    .block(
+                        Block::default()
+                            .title(Span::styled(" Wiki ", Style::default().fg(if content_focused { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)))
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(wiki_border))
+                            .style(Style::default().bg(Color::Black)),
+                    );
+                f.render_widget(preview, content_area);
+            }
+
             *last_left_area = Rect::default();
             *last_right_area = Rect::default();
         }
@@ -1461,10 +2006,23 @@ pub fn draw_content_desktop(
             *last_right_area = Rect::default();
         }
         ActiveDesktop::Workspace => {
+            let work_area = if let Some(p) = workspace.plan {
+                // Plan pane on top, ~40% height (taller for readability)
+                let plan_h = ((content_area.height as f32 * 0.40) as u16).clamp(12, content_area.height.saturating_sub(10));
+                let vsplit = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(plan_h), Constraint::Min(6)])
+                    .split(content_area);
+                draw_plan_pane(f, vsplit[0], p);
+                vsplit[1]
+            } else {
+                content_area
+            };
+
             let panes = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
-                .split(content_area);
+                .split(work_area);
 
             let left_focus = if workspace.left_focused {
                 Pane::Left
@@ -1489,6 +2047,7 @@ pub fn draw_content_desktop(
                 left_focus,
                 workspace.scroll_flash_timer,
                 workspace.left_highlight,
+                true,
             );
             draw_right_pane(
                 f,
@@ -1507,6 +2066,57 @@ pub fn draw_content_desktop(
     }
 }
 
+/// Draw only the wiki Nav pane (used by full WikiViewer and by the splash Overview 3-col).
+pub fn draw_wiki_nav_pane(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState, focused: bool) {
+    draw_nav_list(f, area, &format!(" {} ", viewer.current_file), &viewer.nav_items, viewer.selected_nav, focused || viewer.focus == crate::app_state::WikiFocus::Nav);
+}
+
+pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
+    draw_nav_list(f, area, title, items, selected, focused);
+}
+
+fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
+    let nav_border = if focused {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
+    };
+    let mut nav_text = Text::default();
+    nav_text.lines.push(Line::from(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    let sel = selected;
+    let nitems = items.len();
+    let nav_vis = (area.height as usize).saturating_sub(2).max(1);
+    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
+        0
+    } else if sel + nav_vis / 2 >= nitems {
+        nitems.saturating_sub(nav_vis)
+    } else {
+        sel.saturating_sub(nav_vis / 2)
+    };
+    for (i, item) in items.iter().enumerate().skip(nav_off).take(nav_vis) {
+        let is_sel = i == sel;
+        let style = if is_sel {
+            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
+        } else {
+            match item.kind {
+                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
+                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
+                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
+                crate::app_state::NavItemKind::Harness => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            }
+        };
+        let prefix = if is_sel { "▶ " } else { "  " };
+        let shown = truncate_str(&format!("{}{}", prefix, item.label), area.width as usize - 4);
+        nav_text.lines.push(Line::from(Span::styled(shown, style)));
+    }
+    if items.is_empty() {
+        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
+    }
+    let nav_para = Paragraph::new(nav_text)
+        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
+    f.render_widget(nav_para, area);
+}
+
 pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -1516,47 +2126,9 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     let nav_area = cols[0];
     let content_area = cols[1];
 
-    // Nav pane with navigational elements (links + headings + files)
-    let nav_border = if viewer.focus == crate::app_state::WikiFocus::Nav {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
-    let mut nav_text = Text::default();
-    let title_label = format!(" {} ", viewer.current_file);
-    nav_text.lines.push(Line::from(Span::styled(title_label, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    draw_wiki_nav_pane(f, nav_area, viewer, viewer.focus == crate::app_state::WikiFocus::Nav);
+
     let sel = viewer.selected_nav;
-    let nitems = viewer.nav_items.len();
-    let nav_vis = (nav_area.height as usize).saturating_sub(2).max(1);
-    // auto scroll the nav view so the selected element is visible (centered-ish)
-    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
-        0
-    } else if sel + nav_vis / 2 >= nitems {
-        nitems.saturating_sub(nav_vis)
-    } else {
-        sel.saturating_sub(nav_vis / 2)
-    };
-    for (i, item) in viewer.nav_items.iter().enumerate().skip(nav_off).take(nav_vis) {
-        let is_sel = i == sel;
-        let style = if is_sel {
-            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-        } else {
-            match item.kind {
-                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
-                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
-                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
-            }
-        };
-        let prefix = if is_sel { "▶ " } else { "  " };
-        let shown = truncate_str(&format!("{}{}", prefix, item.label), nav_area.width as usize - 4);
-        nav_text.lines.push(Line::from(Span::styled(shown, style)));
-    }
-    if viewer.nav_items.is_empty() {
-        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
-    }
-    let nav_para = Paragraph::new(nav_text)
-        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
-    f.render_widget(nav_para, nav_area);
 
     // Content pane - larger wiki display; highlight active nav target where possible
     let content_border = if viewer.focus == crate::app_state::WikiFocus::Content {
@@ -1897,19 +2469,6 @@ fn draw_session_summary(
     f.render_widget(para, content_area);
 }
 
-pub fn draw_splash(f: &mut Frame, area: Rect, data: &SplashData<'_>) {
-    let mut tmp = Buffer::empty(area);
-    render_splash_to_buffer(&mut tmp, area, data);
-    f.render_widget(
-        BlitWidget {
-            src: tmp,
-            rel_x: 0,
-            rel_y: 0,
-        },
-        area,
-    );
-}
-
 fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) {
     let block = Block::default()
         .title(Line::from(vec![
@@ -1932,15 +2491,18 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
 
     let inner = block.inner(area);
     block.render(area, buf);
+    render_splash_content(buf, inner, data);
+}
 
-    if inner.width < 8 || inner.height < 6 {
+fn render_splash_content(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) {
+    if area.width < 8 || area.height < 6 {
         return;
     }
 
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(inner);
+        .split(area);
 
     let art_style = Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff));
     // Add extra padding above and to the left of the ASCII raven art
@@ -2231,32 +2793,59 @@ fn build_left_text(
     let mut consecutive_blanks = 0usize;
 
     for (i, entry) in left_committed.iter().enumerate() {
-        let (prefix_style, body_style) = conversation_entry_styles(entry);
-        let lines_iter: Vec<&str> = entry.lines().collect();
-        for (li, line) in lines_iter.iter().enumerate() {
-            let is_blank = line.trim().is_empty();
-            if is_blank {
-                consecutive_blanks += 1;
-                if consecutive_blanks > 2 {
-                    continue; // collapse excessive blank lines in display
+        if is_plan_entry_confirm(entry) {
+            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
+        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
+            let (prefix_style, body_style) = conversation_entry_styles(entry);
+            let lines_iter: Vec<&str> = entry.lines().collect();
+            for (li, line) in lines_iter.iter().enumerate() {
+                let is_blank = line.trim().is_empty();
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks > 2 {
+                        continue;
+                    }
+                } else {
+                    consecutive_blanks = 0;
                 }
-            } else {
-                consecutive_blanks = 0;
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if li == 0 {
+                    prefix_style
+                } else {
+                    body_style
+                };
+                left_text
+                    .lines
+                    .push(Line::from(Span::styled(line.to_string(), style)));
+                line_idx += 1;
             }
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else if li == 0 {
-                prefix_style
-            } else {
-                body_style
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
+        } else {
+            let md = wiki_render_markdown(entry);
+            for mut line in md.lines {
+                if Some(line_idx) == highlight_line {
+                    for sp in &mut line.spans {
+                        sp.style = sp.style
+                            .fg(Color::Black)
+                            .bg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD);
+                    }
+                }
+                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
+                if is_blank {
+                    consecutive_blanks += 1;
+                    if consecutive_blanks <= 2 {
+                        left_text.lines.push(line);
+                    }
+                } else {
+                    consecutive_blanks = 0;
+                    left_text.lines.push(line);
+                }
+                line_idx += 1;
+            }
         }
         if i < left_committed.len() - 1 && consecutive_blanks < 2 {
             left_text.lines.push(Line::from(""));
@@ -2389,20 +2978,14 @@ fn render_scrollable_pane_buf(
     title_color: Color,
     subtitle: Option<String>,
 ) {
-    // Compute visual (wrapped) line count — same as render_scrollable_pane
-    let inner_width = area.width.saturating_sub(4).max(1) as usize;
-    let mut visual_lines: u16 = 0;
-    for line in text.lines.iter() {
-        let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-        if line_width == 0 {
-            visual_lines += 1;
-        } else {
-            visual_lines += line_width.div_ceil(inner_width) as u16;
-        }
-    }
-    let line_count = visual_lines;
+    let has_title = !title.trim().is_empty();
+    let PaneScrollMetrics {
+        line_count,
+        max_scroll,
+        ..
+    } = pane_scroll_metrics(area, text, has_title);
     *last_line_count = line_count;
-    *scroll = (*scroll).min(line_count.saturating_sub(1));
+    *scroll = (*scroll).min(max_scroll);
 
     let focus_style = if focused {
         if scroll_flash_timer > 0 {

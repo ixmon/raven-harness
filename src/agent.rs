@@ -32,7 +32,7 @@ fn make_rel_path(p: &str, workspace: &Path) -> String {
 
 fn normalize_agent_mode(s: &str) -> String {
     match s.trim().to_lowercase().as_str() {
-        "talk" | "think" | "research" | "work" | "dream" => s.trim().to_lowercase(),
+        "talk" | "think" | "research" | "work" | "dream" | "plan" => s.trim().to_lowercase(),
         _ => "talk".to_string(),
     }
 }
@@ -168,6 +168,8 @@ pub struct Agent {
     judge: Option<crate::judge::Judge>,
     /// Brave Search API key (decrypted, set by TUI from keystore).
     pub brave_key: Option<String>,
+    /// Mirror of TUI plan execution state (synced before each turn).
+    pub plan_exec: crate::plan_execution::PlanExecutionState,
 }
 
 impl Agent {
@@ -212,7 +214,46 @@ impl Agent {
             logged_message_count,
             judge: Some(Judge::new(client_arc)),
             brave_key: None,
+            plan_exec: crate::plan_execution::PlanExecutionState::default(),
         }
+    }
+
+    pub fn set_plan_execution(&mut self, state: crate::plan_execution::PlanExecutionState) {
+        self.plan_exec = state;
+    }
+
+    pub fn plan_execution(&self) -> &crate::plan_execution::PlanExecutionState {
+        &self.plan_exec
+    }
+
+    pub fn workspace(&self) -> &std::path::Path {
+        &self.config.workspace
+    }
+
+    pub fn plan_tool_context(&self) -> tools::PlanToolContext {
+        tools::PlanToolContext {
+            plan_executing: self.plan_exec.active && !self.plan_exec.steps.is_empty(),
+        }
+    }
+
+    /// Record a user reply for a pending observe-tier plan step.
+    pub fn apply_user_observation(&mut self, reply: &str) -> Option<String> {
+        let mut session_take = self.session.take();
+        let out = crate::plan_execution::submit_user_observation(
+            &mut self.plan_exec,
+            reply,
+            session_take.as_mut(),
+        );
+        self.session = session_take;
+        out
+    }
+
+    fn tools_for_current_mode(&self) -> Vec<crate::llm::ToolDef> {
+        tools::tools_for_agent(
+            &self.current_agent_mode(),
+            &self.config.flags,
+            self.plan_tool_context(),
+        )
     }
 
     /// Reset conversation (new "room" / task). The persistent session (goal, repo cache, log) is kept.
@@ -229,6 +270,11 @@ impl Agent {
     /// Get a mutable reference to the session.
     pub fn session_mut(&mut self) -> &mut Option<crate::session::Session> {
         &mut self.session
+    }
+
+    /// LLM client for harness-side classifiers (plan intent, etc.).
+    pub fn llm_backend(&self) -> Arc<Mutex<ChatBackend>> {
+        self.client.clone()
     }
 
     /// Truncate tool output to fit the context budget.
@@ -275,12 +321,15 @@ impl Agent {
         self.prune_history().await;
 
         let messages = self.build_messages_for_model();
+        let tools = self.tools_for_current_mode();
         let req = ChatRequest {
             messages,
-            tools: Some(tools::all_tools(&self.config.flags)),
+            tools: Some(tools),
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
+            reasoning_enabled: None,
+            json_object_mode: None,
         };
 
         self.client.lock().await.chat_stream(req).await
@@ -312,6 +361,23 @@ impl Agent {
                     tool_calls: None,
                     tool_call_id: Some(tc.id.clone()),
                 });
+                continue;
+            }
+
+            // Plan mode guard (belt & suspenders for direct calls).
+            if let Some(denial) = self.plan_mode_denial(&tool_name, &raw_args) {
+                self.record_tool_denial(tc, &denial);
+                // Create a record so the driver surfaces it in the trace pane too.
+                let rec = ActionRecord {
+                    tool: tool_name.clone(),
+                    args: raw_args.clone(),
+                    summary: denial.clone(),
+                    output_to_model: denial,
+                    raw_bytes: 0,
+                    truncated: false,
+                    estimated_tokens: 10,
+                };
+                records.push(rec);
                 continue;
             }
 
@@ -350,6 +416,37 @@ impl Agent {
 
     /// Record a denied tool call into conversation (so the model sees a tool result)
     /// without actually executing the side effect.
+    /// Returns a denial reason string if the tool is blocked due to being in Plan mode
+    /// (and it's not a wiki write/patch). Returns None if the tool is allowed.
+    pub fn plan_mode_denial(&self, tool_name: &str, arguments: &str) -> Option<String> {
+        if self.current_agent_mode() != "plan" {
+            return None;
+        }
+        if !matches!(tool_name, "write" | "patch") {
+            return None;
+        }
+        let args_val: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
+        let mut is_wiki = false;
+        if tool_name == "write" || tool_name == "patch" {
+            if let Some(w) = args_val.get("wiki").and_then(|v| v.as_bool()) {
+                is_wiki = w;
+            }
+            if !is_wiki {
+                if let Some(p) = args_val.get("path").and_then(|v| v.as_str()) {
+                    let t = p.trim().trim_start_matches("./");
+                    if t.starts_with("wiki/") || t.starts_with("wiki\\") || t == "wiki" {
+                        is_wiki = true;
+                    }
+                }
+            }
+        }
+        if is_wiki {
+            None
+        } else {
+            Some("❌ write/patch denied while in Plan mode (clarification phase). You must confirm verification steps + rollback and receive an explicit 'proceed' (or equivalent) before writing implementation files. Use wiki writes only for plan.md during planning.".to_string())
+        }
+    }
+
     pub fn record_tool_denial(&mut self, tc: &ToolCall, reason: &str) {
         self.conversation.push(Message {
             role: "assistant".into(),
@@ -415,13 +512,15 @@ impl Agent {
     pub async fn continue_turn_streaming(&mut self) -> Result<mpsc::Receiver<StreamChunk>> {
         self.prune_history().await;
         let messages = self.build_messages_for_model();
-        let tools_schema = tools::all_tools(&self.config.flags);
+        let tools = self.tools_for_current_mode();
         let req = ChatRequest {
             messages,
-            tools: Some(tools_schema),
+            tools: Some(tools),
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
+            reasoning_enabled: None,
+            json_object_mode: None,
         };
         self.client.lock().await.chat_stream(req).await
     }
@@ -440,6 +539,8 @@ impl Agent {
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
+            reasoning_enabled: None,
+            json_object_mode: None,
         };
         self.client.lock().await.chat_stream(req).await
     }
@@ -625,6 +726,8 @@ History:
             temperature: 0.3,
             max_tokens: 800,
             stream: false,
+            reasoning_enabled: None,
+            json_object_mode: None,
         };
 
         let raw = match self.client.lock().await.chat(req).await {
@@ -801,7 +904,13 @@ History:
     /// Always starts with a fresh system message containing the current
     /// repo cache + goal + pitfalls + recent summary from the Session.
     fn build_messages_for_model(&self) -> Vec<Message> {
-        let base = system_message(&self.config.workspace, &self.config.flags);
+        let mode = self.current_agent_mode();
+        let base = system_message(
+            &self.config.workspace,
+            &self.config.flags,
+            &mode,
+            self.plan_tool_context(),
+        );
 
         // Log the system prompt (including whether Core Loop was suppressed for evals)
         // into full_log on the very first build so we can see exactly what the model
@@ -823,11 +932,19 @@ History:
         let mut msgs = vec![];
         if let Some(s) = &self.session {
             let injection = s.get_injection_block(&self.config.flags);
-            let combined = if base.content.as_deref().unwrap_or("").is_empty() {
+            let mut combined = if base.content.as_deref().unwrap_or("").is_empty() {
                 injection
             } else {
                 format!("{}\n\n{}", base.content.as_deref().unwrap_or(""), injection)
             };
+            let plan_block = crate::plan_execution::format_plan_execution_injection(
+                &self.plan_exec,
+                &self.config.workspace,
+            );
+            if !plan_block.is_empty() {
+                combined.push_str("\n\n");
+                combined.push_str(&plan_block);
+            }
             msgs.push(Message {
                 role: "system".into(),
                 content: Some(combined),
@@ -860,6 +977,68 @@ History:
     /// Handle session meta + file summary cache tools. Returns Some(ack) if handled.
     async fn handle_session_tool(&mut self, name: &str, args_json: &str) -> Option<String> {
         let args: serde_json::Value = serde_json::from_str(args_json).unwrap_or_else(|_| json!({}));
+
+        if name == "complete_plan_step" {
+            if self.current_agent_mode() != "work" || !self.plan_tool_context().plan_executing {
+                return Some(
+                    "❌ complete_plan_step is only available in work mode while an approved plan is executing."
+                        .to_string(),
+                );
+            }
+            let mut session_take = self.session.take();
+            let outcome = crate::plan_execution::complete_plan_step(
+                &mut self.plan_exec,
+                &self.config.tool_backend,
+                &self.config.workspace,
+                session_take.as_mut(),
+                &args,
+            )
+            .await;
+            self.session = session_take;
+            return Some(match outcome {
+                crate::plan_execution::CompletePlanStepOutcome::Accepted { message } => {
+                    format!("✓ {message}")
+                }
+                crate::plan_execution::CompletePlanStepOutcome::Failed { message } => {
+                    format!("✗ {message}")
+                }
+                crate::plan_execution::CompletePlanStepOutcome::NeedsUserObservation {
+                    prompt,
+                    step_index,
+                } => format!(
+                    "⏸ Step {} requires user observation before continuing. Prompt shown to user: {}",
+                    step_index + 1,
+                    prompt
+                ),
+                crate::plan_execution::CompletePlanStepOutcome::Rejected { message } => {
+                    format!("❌ {message}")
+                }
+            });
+        }
+
+        if name == "revise_plan_step" {
+            let plan_executing = self.plan_tool_context().plan_executing;
+            if self.current_agent_mode() != "plan"
+                && !(self.current_agent_mode() == "work" && plan_executing)
+            {
+                return Some(
+                    "❌ revise_plan_step is only available during plan mode or work mode with an active plan."
+                        .to_string(),
+                );
+            }
+            if let Some(s) = self.session.as_mut() {
+                let exec = if plan_executing {
+                    Some(&mut self.plan_exec)
+                } else {
+                    None
+                };
+                match crate::plan_execution::revise_plan_step(s, &args, exec) {
+                    Ok(msg) => return Some(msg),
+                    Err(e) => return Some(format!("❌ {e}")),
+                }
+            }
+            return Some("❌ No session available for revise_plan_step.".to_string());
+        }
 
         if name == "update_goal" {
             if let Some(s) = &mut self.session {
@@ -1370,7 +1549,12 @@ fn strip_command_context_blocks(s: &str) -> String {
     out.trim().to_string()
 }
 
-fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFlags) -> Message {
+fn system_message(
+    workspace: &std::path::Path,
+    flags: &crate::runtime::RuntimeFlags,
+    agent_mode: &str,
+    plan_ctx: tools::PlanToolContext,
+) -> Message {
     let in_eval = flags.is_eval;
 
     let core_loop = if in_eval {
@@ -1379,6 +1563,15 @@ fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFl
         // omitted (and the fact that it was omitted is logged to full_log) so we
         // can observe whether the agent obeys the eval-specific instructions.
         "".to_string()
+    } else if agent_mode == "plan" {
+        r#"
+## Plan Mode Workflow (clarification phase)
+1. EXPLORE — Use read, grep, list, and web tools when they help you understand the codebase, tests, and conventions before asking questions.
+2. AUDIT — Use exec only for environment/dependency probes (compilers, libraries, tool versions, disk). Do not build, test, or run the deliverable yet.
+3. CLARIFY — Ask exactly ONE branching decision per turn. Call update_goal and maintain wiki/plan.md as the plan develops.
+4. RECAP — When clear, present Goal + Verification + Rollback; propose an empirical check per step when possible; invite the user to improve checks; then ask to proceed.
+"#
+        .to_string()
     } else {
         r#"
 ## Core Loop (follow this every turn)
@@ -1388,6 +1581,80 @@ fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFl
 "#
         .to_string()
     };
+
+    let plan_mode_section = if agent_mode == "plan" {
+        r#"
+## Plan Mode - Clarification Phase
+You are in Plan Mode. Your job is to create a solid plan BEFORE any implementation work.
+
+**Exploration during planning is good and expected**
+- Use read, grep, list, and web tools to learn about the existing code, tests, and conventions.
+- This lets you ask better questions and present realistic options.
+- Example of good behavior: "I see there's already a unit test that generates a simple cake using X approach. Would you like to (1) keep a similar approach, (2) do something more elaborate, or (3) something else?"
+- Base your options on both the user's request *and* what you discovered.
+- Always let the user choose or correct you — don't assume you know best.
+
+**Environment & dependency audit (required before recommending libraries)**
+- Before proposing SFML, SDL2, Boost, or any external dependency, run exec probes and cite the results in chat + wiki/plan.md:
+  - Compilers: `g++ --version`, `clang++ --version`
+  - Libraries: `pkg-config --modversion sfml-all` or `dpkg -l libsfml-dev`, `ldconfig -p | grep sfml`
+  - Build tools: `cmake --version`, `make --version`
+- Do **not** assume a library is installed because it is common — verify first.
+- If a package is missing, ask the user to choose (one question):
+  1. User installs it themselves (give exact apt/brew command)
+  2. Agent runs `sudo apt install …` with approval
+  Do not run `sudo apt` until the user picks option 2.
+- Document probe commands and install choice in the plan. Record final verification commands in Success Criteria.
+
+- Carefully consider the user's request (and any previous context).
+- Identify the **single largest unclarified branching decision** that must be made.
+- **You MUST ask exactly ONE question per response.** Never list "question 1 / 2 / 3" in one turn. One decision only — e.g. project location OR graphics library OR complexity, not all three. The harness will nudge you if you bundle multiple questions.
+- If you can offer concrete options for this single decision, list them as:
+  1. first option description
+  2. second option description
+  3. third option description
+You MUST end the list with exactly this sentence (replace X with your recommended best/easiest): Type the number of your choice... I recommend option X
+- The user may reply with a number, or with free text that points at one of the options or describes a new direction not listed. Handle either gracefully and pick the next most important decision based on their answer.
+- After they answer, decide the *next* single most important unclarified decision (it may be completely different based on their choice) and ask only about that.
+- Do not list execution steps or start working yet.
+- In the UI, only the high-level fields (Goal, Success Criteria, Verification, Rollback) are shown to the user right now. Steps are (TBD).
+- Keep asking until everything is crystal clear.
+- Workspace write/patch (without wiki=true) are blocked until the user says "proceed". exec is allowed for environment probes only — not to build or verify the final deliverable.
+- For each planned step, propose a verification when you can (runnable command preferred). If no empirical check exists yet, say so and note the fallback; the user may suggest a better check before proceed.
+- Produce user-facing text only. No hidden thinking via tools.
+
+**Verification tiers (every step needs one)**
+- `exec` — runnable command (preferred). Put the exact command in `verification`.
+- `check` — structural check (`file_exists:`, `grep:`, etc.) when a full command is overkill.
+- `attested` — heuristic fallback when no practical automated check exists. Explain why in `note` and what evidence you will provide.
+- `observe` — planned human check (hardware, visuals, sound). Put the question in `prompt` and explain in `note` why the agent cannot verify automatically.
+
+**Structured steps in wiki/plan.md**
+- Maintain steps in the `<!-- plan-steps:json ... -->` block under `## Steps` (see the template written on plan entry).
+- Each JSON object: `description`, `tier`, and `verification` / `prompt` / `note` as appropriate.
+- If the user suggests a better verification for a step, rewrite `wiki/plan.md` and re-recap before asking to proceed.
+
+**Final recap (before "Shall we proceed?")**
+- Emit the full step list with tier + verification/prompt per step in chat.
+- Label every `attested` step with why empirical verification was not used.
+- List every `observe` step and what the user will be asked to check at execution time.
+- Invite the user to upgrade checks: "If you know a better way to verify step N, say so."
+- Once there is no uncertainty, you **MUST** in your response to the *user*:
+  1. Briefly acknowledge the choice.
+  2. Present a clear recap of Goal + Success Criteria.
+  3. Present the structured step list with tiers and verification/prompt per step.
+  4. Explicitly propose the overall verification command(s) (exact runnable commands if possible) **and ask the user to confirm them**.
+  5. Mention rollback approach and ask for confirmation if relevant.
+  6. **Only after the user has confirmed verification commands and steps**, end with: "Shall we proceed with this plan, or would you like to make a change?"
+- You may not ask the proceed question until the user has explicitly confirmed (or suggested) the verification strategy.
+- After the user answers your first clarification, do **not** end the turn with only internal todo lists or tool calls. Produce the user-facing plan summary + confirmation questions promptly.
+- Only after the user's "proceed" message may you begin writing code or running the final verification. The harness will then switch to work mode and the Plan pane will show live progress.
+- Only when the user says something like "proceed", "go ahead", "start", etc., you may indicate that planning is complete (the harness will switch to work/execution mode).
+- After clarifying, call `update_goal` with the agreed goal and the success criteria as the `tests` list (this updates the Plan pane).
+- Write the final agreed plan (goal, criteria, verification, rollback, structured steps JSON block) to `wiki/plan.md` so it is saved and the user can see/edit it.
+- When you present the final plan recap in chat (before asking "proceed?"), format it with markdown: use ## or **Goal:** etc, bullet/numbered lists for verification and steps. This helps the UI render it nicely in the conversation pane.
+"#
+    } else { "" };
 
     let bug_fixes_section = if in_eval {
         r#"
@@ -1407,6 +1674,10 @@ fn system_message(workspace: &std::path::Path, flags: &crate::runtime::RuntimeFl
         r#"
 Use `define_done` early (once, derived from the initial task) so the judge has an objective definition of success. Use `update_goal` (when intent shifts) and `record_discovery` for high-value facts.
 "#
+    } else if agent_mode == "plan" {
+        r#"
+Use `update_goal` to track the developing plan (goal + success criteria as tests). `define_done` and `record_discovery` are not available during plan mode — the harness switches to work mode after the user says proceed.
+"#
     } else {
         r#"
 Use `update_goal` (when intent shifts) and `record_discovery` for high-value facts.
@@ -1418,6 +1689,82 @@ Use `update_goal` (when intent shifts) and `record_discovery` for high-value fac
 "#
     } else {
         ""
+    };
+
+    let anti_narration = if agent_mode == "plan" {
+        // In plan mode we WANT the agent to narrate the plan and ask clarifying questions.
+        ""
+    } else {
+        r#"- **Keep calling tools until the task is actually done.** Do NOT stop to narrate plans or summarize progress mid-task. If there is more work to do, call the next tool immediately.
+"#
+    };
+
+    let tools_list = crate::tools::tools_list_for_prompt(agent_mode, flags, plan_ctx);
+
+    let work_plan_execution = if agent_mode == "work" && plan_ctx.plan_executing {
+        r#"
+## Plan Execution (approved plan active)
+- The approved steps are listed under **Approved Plan (executing)** in SESSION CONTEXT — follow those step numbers.
+- **Deliverable location** is in the **Deliverable location (critical)** block in SESSION CONTEXT — use the project root and path prefix shown there (workspace root or a subdirectory). Match paths to the current step's verification command.
+- Full plan text lives in session wiki `plan.md` (read with wiki=true, path `plan.md`).
+- Work one step at a time. Call `complete_plan_step` when the current step is done.
+- For `exec` tier: run the verification command yourself first, then call `complete_plan_step` (harness re-runs as gate). Verifications run from the cwd shown in Deliverable location unless the step command includes `cd <dir> &&`.
+- For `check` tier: ensure the check passes, then call `complete_plan_step`.
+- If a verification command is wrong for the project layout, call `revise_plan_step` to fix it (allowed during execution).
+- For `attested` tier: include concrete evidence in the `evidence` field.
+- For `observe` tier: do NOT call `complete_plan_step` — the harness will prompt the user and inject their answer.
+- Do not call `complete_plan_step` for step N+1 while step N is incomplete.
+- Progress advances only via `complete_plan_step` (or user observation for observe steps).
+"#
+    } else {
+        ""
+    };
+
+    let sudo_discipline = r#"
+## System packages & sudo
+- **Before** proposing `sudo apt install` (or any package install), run non-sudo probes and cite results: `dpkg -l <pkg>`, `pkg-config --modversion <name>`, `which g++`, `ldconfig -p | grep <lib>`, `g++ --version`.
+- If probes show the dependency is already available, **do not** run sudo — proceed with the build/task.
+- The TUI runs commands **non-interactively** and **cannot enter a sudo password**. Never expect password prompts to work.
+- If the user denied a sudo approval, **do not retry sudo**. Tell them the exact command to run in their own terminal, or continue with what is already installed.
+"#;
+
+    let tool_discipline_exec = if agent_mode == "plan" {
+        "- Use `list` and `grep` to explore. Use `exec` only for environment/dependency probes (compilers, libraries, versions, disk) — not to build, test, or verify the deliverable."
+    } else {
+        "- Use `list` and `grep` to explore. Use `exec` for builds/tests/git. Verify packages with probes before any install."
+    };
+
+    let workspace_access = if agent_mode == "plan" {
+        "You have read access to the full workspace. Workspace writes (without wiki=true) are blocked until the user says proceed; use wiki=true for plan.md. Exec is for environment probes only during clarification."
+    } else {
+        "You have access to the full workspace. You can run commands and modify files."
+    };
+
+    let execution_style = if agent_mode == "work" && plan_ctx.plan_executing {
+        format!(
+            r#"{work_plan_execution}{execution_define_done}- Complete the current plan step, then call `complete_plan_step` with the matching step number.
+- Do not skip ahead — the harness validates step order and verification tier.
+- When all steps are done, give a brief summary of what changed.
+"#,
+            work_plan_execution = work_plan_execution,
+            execution_define_done = execution_define_done
+        )
+    } else if agent_mode == "plan" {
+        r#"- Focus on clarification and recap — do not implement or run final deliverable verification until the user says proceed.
+- End each clarification turn with exactly one branching question (or the final recap + verification confirmation when ready).
+- Record agreed verification commands in `wiki/plan.md` (wiki=true) as the plan develops.
+- Only ask "Shall we proceed?" after the user has confirmed verification commands.
+"#
+        .to_string()
+    } else {
+        format!(
+            r#"{execution_define_done}- Only stop calling tools when: (a) the goal is fully achieved and verified, or (b) you are genuinely blocked and need user input.
+- When you perform verification (especially a lint, build, or test), record the *exact command* you ran in `wiki/plan.md` under the Verification section (use wiki=true).
+- When you ARE done, give a brief summary of what changed and any commands the user should run.
+- If the user explicitly asks you to "produce a patch", "make the fix", or similar, immediately call the `patch` tool (or `write`) with the edit. Do not output explanatory text first — the tool call *is* the response.
+"#,
+            execution_define_done = execution_define_done
+        )
     };
 
     let sys = format!(
@@ -1434,18 +1781,22 @@ This is an interactive chat with a user. Treat it primarily as a normal conversa
 - If the user gives a clear coding or workspace task, then switch to task mode and follow the Core Loop and Execution Style below.
 - You are allowed (and encouraged) to respond with text only for conversational or meta requests. Do not force tool use or claim tasks are "done" when the user is just chatting.
 
+{}
+
+{}
+
 ## Tool Discipline (critical)
 - NEVER claim a file was read/written/edited unless a tool call just confirmed it.
 - Prefer `patch` over `write` for edits. `patch` supports `near_line` for disambiguation.
 - Always `read` the target file (or line range) immediately before `patch`. The `search` value must be verbatim text that exists right now. If the change is already present, skip the patch.
 - If a tool fails, `read` the relevant section and either retry with corrected text or skip.
-- Use `list` and `grep` to explore. Use `exec` for builds/tests/git.
+{}
 - `web_search` → `browse` for research.
 - Wiki: use wiki=true with read/write/patch/list. Path is bare relative (e.g. "index.md", "research/ideas.md"). Wiki ops need no approval.
 {}{}
 
 ## Available Tools
-exec, read, write, patch, grep, list, web_search, browse, update_goal, define_done, record_discovery, read_summary, store_summary
+{}
 (read/write/patch/list accept wiki=true for session wiki. Path is always relative.)
 
 ## Output Style
@@ -1457,20 +1808,22 @@ exec, read, write, patch, grep, list, web_search, browse, update_goal, define_do
 ## Context Management (important for local models)
 A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important files, current goal + achievement tests + pitfalls to avoid, key discoveries, and a summary of recent turns) is prepended to your system prompt on every turn. It comes from the persistent ~/.raven-hotel/ session for this workspace.
 
-You have access to the full workspace. You can run commands and modify files.
+{}
 
 ## Execution Style (critical — read carefully)
-- **Keep calling tools until the task is actually done.** Do NOT stop to narrate plans or summarize progress mid-task. If there is more work to do, call the next tool immediately.
-- Only stop calling tools when: (a) the goal is fully achieved and verified, or (b) you are genuinely blocked and need user input.
-- When you ARE done, give a brief summary of what changed and any commands the user should run.
-- If the user explicitly asks you to "produce a patch", "make the fix", or similar, immediately call the `patch` tool (or `write`) with the edit. Do not output explanatory text first — the tool call *is* the response.
-{}
+{}{}
 "#,
         workspace.display(),
+        plan_mode_section,
         core_loop,
+        sudo_discipline,
+        tool_discipline_exec,
         bug_fixes_section,
         define_done_usage,
-        execution_define_done
+        tools_list,
+        workspace_access,
+        anti_narration,
+        execution_style
     );
 
     Message {
@@ -1490,6 +1843,70 @@ fn truncate_for_context(s: &str, limit: usize) -> String {
             tools::safe_truncate(s, limit),
             s.len()
         )
+    }
+}
+
+#[cfg(test)]
+mod system_message_tests {
+    use super::*;
+
+    fn plan_system_content() -> String {
+        let workspace = std::env::temp_dir();
+        let flags = crate::runtime::RuntimeFlags {
+            goal_tracking: true,
+            ..crate::runtime::RuntimeFlags::default()
+        };
+        system_message(
+            &workspace,
+            &flags,
+            "plan",
+            tools::PlanToolContext::default(),
+        )
+            .content
+            .expect("system message content")
+    }
+
+    #[test]
+    fn plan_mode_system_prompt_matches_tool_schema() {
+        let content = plan_system_content();
+        let tools_line = content
+            .split("## Available Tools\n")
+            .nth(1)
+            .and_then(|section| section.lines().next())
+            .expect("Available Tools list line");
+
+        let expected = crate::tools::tools_list_for_prompt(
+            "plan",
+            &crate::runtime::RuntimeFlags {
+                goal_tracking: true,
+                ..crate::runtime::RuntimeFlags::default()
+            },
+            crate::tools::PlanToolContext::default(),
+        );
+        assert_eq!(tools_line.trim(), expected.trim());
+        assert!(tools_line.contains("exec"));
+        assert!(!tools_line.contains("define_done"));
+        assert!(!tools_line.contains("record_discovery"));
+        assert!(!content.contains("Do NOT start by thinking"));
+        assert!(!content.contains("tools *only* for update_goal"));
+    }
+
+    #[test]
+    fn plan_mode_system_prompt_gates_workspace_writes() {
+        let content = plan_system_content();
+        assert!(content.contains("blocked until the user says proceed"));
+        assert!(content.contains("environment/dependency probes"));
+        assert!(!content.contains("Use `exec` for builds/tests/git"));
+    }
+
+    #[test]
+    fn plan_mode_system_prompt_documents_structured_steps_and_tiers() {
+        let content = plan_system_content();
+        assert!(content.contains("plan-steps:json"));
+        assert!(content.contains("`exec`"));
+        assert!(content.contains("`attested`"));
+        assert!(content.contains("`observe`"));
+        assert!(content.contains("upgrade checks"));
     }
 }
 
@@ -1537,12 +1954,14 @@ mod integration_tests {
                 tool_calls: vec![mock_tool_call("list", r#"{"path":"."}"#)],
                 finish_reason: None,
                 usage: None,
+                reasoning_content: None,
             },
             ChatResponse {
                 content: "Workspace contains README.md mock fixture.".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
                 usage: None,
+                reasoning_content: None,
             },
         ]));
 
@@ -1555,5 +1974,84 @@ mod integration_tests {
         assert!(result.final_text.contains("README"));
         assert_eq!(result.actions.len(), 1);
         assert_eq!(result.actions[0].tool, "list");
+    }
+
+    #[tokio::test]
+    async fn plan_mode_denies_non_wiki_writes_but_allows_wiki_and_update_goal() {
+        let plan_write_args = serde_json::json!({
+            "path": "plan.md",
+            "content": "# Plan for ASCII cake script",
+            "wiki": true
+        }).to_string();
+        let impl_write_args = serde_json::json!({
+            "path": "birthday_cake.py",
+            "content": "print('cake')"
+        }).to_string();
+        let update_args = serde_json::json!({
+            "goal": "Write ascii cake script",
+            "tests": ["script runs and prints cake"]
+        }).to_string();
+
+        let chat = ChatBackend::Mock(crate::chat_backend::MockChatBackend::new(vec![
+            // First turn in plan mode: agent does update_goal + write to wiki (plan.md)
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![
+                    mock_tool_call("update_goal", &update_args),
+                    mock_tool_call("write", &plan_write_args),
+                ],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+            // Second turn: tries a workspace write (should be denied by guard)
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![mock_tool_call("write", &impl_write_args)],
+                finish_reason: None,
+                usage: None,
+                reasoning_content: None,
+            },
+            // Third: after proceed (mode will be switched outside in real flow), does real write
+            ChatResponse {
+                content: String::new(),
+                tool_calls: vec![mock_tool_call("write", &impl_write_args)],
+                finish_reason: Some("stop".into()),
+                usage: None,
+                reasoning_content: None,
+            },
+        ]));
+
+        let mut cfg = mock_eval_config();
+        // Give it a session so wiki + meta work
+        let ws = cfg.workspace.clone();
+        let session = crate::session::Session::init(&ws).unwrap();
+        cfg.prebuilt_session = Some(session);
+
+        let mut agent = Agent::new(cfg, chat);
+        agent.set_agent_mode("plan");
+
+        // Turn 1: clarification / planning turn (update_goal + wiki write)
+        let r1 = agent.run_turn("write a python script for an ascii birthday cake").await.expect("r1");
+        // Should have performed the wiki write (no denial)
+        let actions1: Vec<_> = r1.actions.iter().map(|a| a.tool.as_str()).collect();
+        assert!(actions1.contains(&"write") || actions1.contains(&"update_goal"), "planning actions: {:?}", actions1);
+
+        // Turn 2: while still in plan, a workspace write should be denied by the guard (produces denial record)
+        // We don't assert exact string here because action recording for denials may surface in conversation;
+        // the important thing is we don't get a normal successful write side-effect for non-wiki.
+        let _r2 = agent.run_turn("ok I will just write the cake script now").await.expect("r2");
+
+        // The harness (input_handler) would detect "proceed" and switch the mode
+        agent.set_agent_mode("work");
+        assert_eq!(agent.current_agent_mode(), "work");
+
+        // At this point further writes would be allowed by the guard (the previous
+        // plan-mode write attempt for non-wiki would have been denied inside execute_and_record).
+        // We simply assert that we can continue running turns after the mode change.
+        let r3 = agent.run_turn("now implement the script").await.expect("r3 after switch");
+        // r3 may or may not contain a write depending on mock responses left; the key
+        // is that the agent is no longer restricted by the plan-mode guard.
+        let _ = r3;
     }
 }

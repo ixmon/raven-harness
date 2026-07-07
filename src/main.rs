@@ -11,10 +11,12 @@ extern crate raven_tui;
 
 mod desktop;
 mod app_state;
+mod confirmation_dialog;
 #[cfg(test)]
 mod eval_scenarios;
 mod input_dispatch;
 mod input_handler;
+mod plan_flow;
 mod key_edit;
 mod event_loop;
 mod keystore;

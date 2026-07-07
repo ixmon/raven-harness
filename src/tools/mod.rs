@@ -10,7 +10,9 @@
 use anyhow::Result;
 use serde_json::json;
 
-pub use self::exec::exec;
+pub use self::exec::{
+    command_uses_sudo, exec, exec_with_exit_code, is_privileged_package_install,
+};
 pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
 pub use self::web::{browse, browse_urls, web_search};
 
@@ -47,7 +49,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "exec".into(),
-                description: "Run a shell command in the workspace. Use for cargo check, git status, tests, etc. No sudo. Prefer non-interactive commands.".into(),
+                description: "Run a shell command in the workspace. Use for cargo check, git status, tests, etc. Before any package install, verify with non-sudo probes (dpkg -l, pkg-config, which). Avoid sudo — the TUI cannot enter passwords; ask the user to install system packages manually if needed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -81,7 +83,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "write".into(),
-                description: "Write (or overwrite) a *file*. Path must point to a file, not a directory. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed.".into(),
+                description: "Write (or overwrite) a *file*. Path must point to a file, not a directory. Set wiki=true to target session wiki root (path relative e.g. 'foo.md', do NOT prefix 'wiki/'). Wiki writes always allowed. In 'plan' mode, non-wiki writes are denied until the user says 'proceed'.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -97,7 +99,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "patch".into(),
-                description: "Search/replace edit on a *file*. Path must be a file (not dir). Set wiki=true for wiki files (path e.g. 'index.md').".into(),
+                description: "Search/replace edit on a *file*. Path must be a file (not dir). Set wiki=true for wiki files (path e.g. 'index.md'). In 'plan' mode, non-wiki patches are denied until the user says 'proceed'.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -278,6 +280,288 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
     tools
 }
 
+/// Tools intended for use while the agent is in "plan" / clarification mode.
+/// 
+/// The goal is to let the agent explore the codebase and existing tests so it
+/// can ask *better* questions, while still preventing it from making changes
+/// to the main workspace until the user has approved the plan.
+///
+/// We deliberately give it read-oriented tools + update_goal + the ability
+/// to write to the session wiki (for plan.md).
+pub fn plan_mode_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
+    let disable_update_goal = flags.disable_goal_tool || !flags.goal_tracking;
+
+    let mut tools = vec![
+        // Exploration / understanding tools - very useful during planning
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "read".into(),
+                description: "Read a file's contents. Set wiki=true to target the session wiki. Use this to understand existing code and tests so you can ask good clarification questions.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Relative path (wiki=true: relative to wiki root only)" },
+                        "lines": { "type": "string", "description": "Optional range like \"10-40\"" },
+                        "full": { "type": "boolean" },
+                        "wiki": { "type": "boolean" }
+                    },
+                    "required": ["path"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "grep".into(),
+                description: "Search for a pattern across files. Great for finding how something is done in the existing code or tests during planning.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string" },
+                        "path": { "type": "string" },
+                        "include": { "type": "string" },
+                        "context": { "type": "integer" },
+                        "fixed": { "type": "boolean" }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "list".into(),
+                description: "List a directory. Use wiki=true for the session wiki.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "wiki": { "type": "boolean" }
+                    }
+                }),
+            },
+        },
+        // Web research tools can still be useful while planning
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "web_search".into(),
+                description: "Search the web. Returns titles, URLs, and short descriptions.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "count": { "type": "integer" }
+                    },
+                    "required": ["query"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "browse".into(),
+                description: "Fetch content from a URL. Useful for researching approaches while planning.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string" },
+                        "depth": { "type": "integer" },
+                        "extract": { "type": "string" }
+                    },
+                    "required": ["url"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "browse_urls".into(),
+                description: "Fetch multiple URLs in parallel.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "urls": { "type": "array", "items": { "type": "string" } },
+                        "extract": { "type": "string" }
+                    },
+                    "required": ["urls"]
+                }),
+            },
+        },
+        // Planning-specific state tools
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "update_goal".into(),
+                description: "Update the tracked goal and success criteria for the plan you are developing.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "goal": { "type": "string" },
+                        "tests": { "type": "array", "items": { "type": "string" } },
+                        "pitfalls": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["goal"]
+                }),
+            },
+        },
+        // Wiki write is how the agent maintains the living plan.md during clarification
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "write".into(),
+                description: "Write a file. In plan mode you should almost always use wiki=true to write to the session's plan.md.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" },
+                        "wiki": { "type": "boolean" }
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+        },
+        // Exec is allowed in plan mode *for environment and dependency checks only*
+        // (compilers present? needed libs? disk space? verification tools?).
+        // Do not use it to build or run the main deliverable until the plan is approved.
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "exec".into(),
+                description: "Run a shell command (for planning: check compilers, libraries, disk space, versions). Use non-sudo probes first (dpkg -l, pkg-config, which). No sudo — TUI cannot enter passwords.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": "The shell command to execute (bash). Will run with the workspace as cwd."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Optional timeout in seconds (default 60)"
+                        }
+                    },
+                    "required": ["command"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "patch".into(),
+                description: "Edit a file with search/replace. Prefer wiki=true in plan mode.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "search": { "type": "string" },
+                        "replace": { "type": "string" },
+                        "near_line": { "type": "integer" },
+                        "wiki": { "type": "boolean" }
+                    },
+                    "required": ["path", "search", "replace"]
+                }),
+            },
+        },
+    ];
+
+    if disable_update_goal {
+        tools.retain(|t| t.function.name != "update_goal");
+    }
+    tools
+}
+
+/// Comma-separated tool names in schema order (for system prompt / help text).
+pub fn format_tool_names(tools: &[ToolDef]) -> String {
+    tools
+        .iter()
+        .map(|t| t.function.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether an approved plan is actively executing (work mode + steps populated).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlanToolContext {
+    pub plan_executing: bool,
+}
+
+fn revise_plan_step_tool() -> ToolDef {
+    ToolDef {
+        r#type: "function".into(),
+        function: crate::llm::ToolFunction {
+            name: "revise_plan_step".into(),
+            description: "Edit one step in wiki/plan.md JSON (tier, verification, prompt, note, description, workdir). Plan or executing work mode.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "step": { "type": "integer", "description": "1-indexed step number" },
+                    "description": { "type": "string" },
+                    "tier": { "type": "string", "description": "exec | check | attested | observe" },
+                    "verification": { "type": "string" },
+                    "prompt": { "type": "string", "description": "User question for observe tier" },
+                    "note": { "type": "string" },
+                    "workdir": { "type": "string", "description": "Project subdirectory for verifications (executing mode only)" }
+                },
+                "required": ["step"]
+            }),
+        },
+    }
+}
+
+fn complete_plan_step_tool() -> ToolDef {
+    ToolDef {
+        r#type: "function".into(),
+        function: crate::llm::ToolFunction {
+            name: "complete_plan_step".into(),
+            description: "Mark the current plan step complete after verification. Work mode with approved plan only.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "step": { "type": "integer", "description": "1-indexed step (must match current step)" },
+                    "evidence": { "type": "string", "description": "Required for attested tier" },
+                    "force": { "type": "boolean", "description": "Skip verification gate (discouraged)" }
+                }
+            }),
+        },
+    }
+}
+
+/// Tools for the current agent mode and plan execution state.
+pub fn tools_for_agent(
+    agent_mode: &str,
+    flags: &crate::runtime::RuntimeFlags,
+    plan_ctx: PlanToolContext,
+) -> Vec<ToolDef> {
+    match agent_mode {
+        "plan" => {
+            let mut tools = plan_mode_tools(flags);
+            tools.push(revise_plan_step_tool());
+            tools
+        }
+        "work" => {
+            let mut tools = all_tools(flags);
+            if plan_ctx.plan_executing {
+                tools.push(complete_plan_step_tool());
+                tools.push(revise_plan_step_tool());
+            }
+            tools
+        }
+        _ => all_tools(flags),
+    }
+}
+
+/// Tool names exposed to the model for the current run mode.
+pub fn tools_list_for_prompt(
+    agent_mode: &str,
+    flags: &crate::runtime::RuntimeFlags,
+    plan_ctx: PlanToolContext,
+) -> String {
+    format_tool_names(&tools_for_agent(agent_mode, flags, plan_ctx))
+}
+
 /// Execute a tool call (name + JSON arguments string) and return the result as a string
 /// that will be fed back to the model as a `tool` message.
 pub async fn execute(
@@ -302,6 +586,69 @@ mod tests {
         assert_eq!(safe_truncate("hello", 10), "hello");
         assert_eq!(safe_truncate("hello", 3), "hel");
         assert_eq!(safe_truncate("", 5), "");
+    }
+
+    fn plan_mode_test_flags() -> crate::runtime::RuntimeFlags {
+        crate::runtime::RuntimeFlags {
+            goal_tracking: true,
+            ..crate::runtime::RuntimeFlags::default()
+        }
+    }
+
+    #[test]
+    fn plan_mode_tool_names_match_schema() {
+        let flags = plan_mode_test_flags();
+        let names = super::format_tool_names(&super::plan_mode_tools(&flags));
+        assert!(names.contains("read"));
+        assert!(names.contains("exec"));
+        assert!(names.contains("update_goal"));
+        assert!(!names.contains("define_done"));
+        assert!(!names.contains("record_discovery"));
+        assert!(!names.contains("read_summary"));
+    }
+
+    #[test]
+    fn tools_list_for_prompt_plan_vs_work() {
+        let flags = plan_mode_test_flags();
+        let plan = super::tools_list_for_prompt("plan", &flags, super::PlanToolContext::default());
+        let work = super::tools_list_for_prompt("work", &flags, super::PlanToolContext::default());
+        let work_exec = super::tools_list_for_prompt(
+            "work",
+            &flags,
+            super::PlanToolContext {
+                plan_executing: true,
+            },
+        );
+        assert!(!plan.contains("define_done"));
+        assert!(plan.contains("revise_plan_step"));
+        assert!(!plan.contains("complete_plan_step"));
+        assert!(work.contains("define_done"));
+        assert!(work.contains("exec"));
+        assert!(!work.contains("complete_plan_step"));
+        assert!(work_exec.contains("complete_plan_step"));
+        assert!(work_exec.contains("revise_plan_step"));
+    }
+
+    #[test]
+    fn tools_for_agent_mode_scoping() {
+        let flags = plan_mode_test_flags();
+        let plan_names = super::format_tool_names(&super::tools_for_agent(
+            "plan",
+            &flags,
+            super::PlanToolContext::default(),
+        ));
+        assert!(plan_names.contains("revise_plan_step"));
+        assert!(!plan_names.contains("complete_plan_step"));
+
+        let work_names = super::format_tool_names(&super::tools_for_agent(
+            "work",
+            &flags,
+            super::PlanToolContext {
+                plan_executing: true,
+            },
+        ));
+        assert!(work_names.contains("complete_plan_step"));
+        assert!(work_names.contains("revise_plan_step"));
     }
 
     #[test]

@@ -630,6 +630,20 @@ impl Session {
         Ok(d)
     }
 
+    /// Read raw wiki file bytes (for harness read/write — not tool-formatted output).
+    pub fn read_wiki_file_raw(&self, rel: &str) -> Result<String, String> {
+        let root = self.wiki_root();
+        let r = Self::strip_wiki_prefix(rel);
+        let clean_rel = if r.is_empty() || r == "." || r == "/" {
+            "index.md".to_string()
+        } else {
+            r
+        };
+        let target = root.join(&clean_rel);
+        fs::read_to_string(&target)
+            .map_err(|e| format!("Could not read wiki/{clean_rel}: {e}"))
+    }
+
     /// Read a wiki file. Returns a formatted result string (similar to read tool output).
     pub fn read_wiki_file(&self, rel: &str, line_range: Option<&str>, full: bool, max_lines: usize) -> String {
         let root = self.wiki_root();
