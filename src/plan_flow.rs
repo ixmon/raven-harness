@@ -606,6 +606,12 @@ fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal:
             recap.push_str(&format!("  • {err}\n"));
         }
     }
+    if !report.warnings.is_empty() {
+        recap.push_str("\n\n💡 Verification advisories (non-blocking, review before proceed):\n");
+        for w in &report.warnings {
+            recap.push_str(&format!("  • {w}\n"));
+        }
+    }
     app.left_committed.push(recap);
 
     if let Ok(mut ag) = agent.try_lock() {

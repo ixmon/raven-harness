@@ -9,8 +9,9 @@ use crate::plan_protocol::{
     PlanQuestionOption,
 };
 use crate::plan_verification::{
-    format_project_workdir_prompt_section, format_validation_retry_nudge, improve_proposal,
-    resolve_project_workdir, resolve_project_workdir_from_context,
+    format_adversarial_critique_nudge, format_project_workdir_prompt_section,
+    format_validation_retry_nudge, improve_proposal, resolve_project_workdir,
+    resolve_project_workdir_from_context,
 };
 use crate::runtime::RuntimeFlags;
 use std::sync::Arc;
@@ -290,24 +291,52 @@ pub async fn fetch_proposal(
 
     let workdir = resolve_project_workdir(initial_request, history, &proposal.steps);
     let first_report = improve_proposal(&mut proposal, workdir.as_deref());
-    if first_report.errors.is_empty() {
-        return Ok(PlanModelPayload::Proposal(proposal));
+
+    // Case 1: blocking errors → retry with structural rules nudge.
+    if !first_report.errors.is_empty() {
+        let nudge = format_validation_retry_nudge(&first_report.errors);
+        let retry_user = format!("{user}{nudge}");
+        return Ok(match fetch_proposal_payload(backend, &retry_user).await {
+            Ok(PlanModelPayload::Proposal(mut retry)) => {
+                let retry_workdir =
+                    resolve_project_workdir(initial_request, history, &retry.steps);
+                let retry_report = improve_proposal(&mut retry, retry_workdir.as_deref());
+                if retry_report.errors.len() <= first_report.errors.len() {
+                    PlanModelPayload::Proposal(retry)
+                } else {
+                    PlanModelPayload::Proposal(proposal)
+                }
+            }
+            Ok(other) => other,
+            Err(_) => PlanModelPayload::Proposal(proposal),
+        });
     }
 
-    let nudge = format_validation_retry_nudge(&first_report.errors);
-    let retry_user = format!("{user}{nudge}");
-    match fetch_proposal_payload(backend, &retry_user).await {
-        Ok(PlanModelPayload::Proposal(mut retry)) => {
+    // Case 2: no errors but warnings → adversarial critique nudge. The
+    // hardcoded lints are language-specific seeds (download/empty-dir,
+    // grep-in-cpp, pipe-masking); this asks the model to harden its own
+    // verifications using its knowledge of THIS project's stack, so the fix
+    // generalizes to languages/platforms the harness has no rules for.
+    if !first_report.warnings.is_empty() {
+        let nudge = format_adversarial_critique_nudge(&first_report.warnings);
+        let retry_user = format!("{user}{nudge}");
+        if let Ok(PlanModelPayload::Proposal(mut retry)) =
+            fetch_proposal_payload(backend, &retry_user).await
+        {
             let retry_workdir =
                 resolve_project_workdir(initial_request, history, &retry.steps);
             let retry_report = improve_proposal(&mut retry, retry_workdir.as_deref());
-            if retry_report.errors.len() <= first_report.errors.len() {
-                Ok(PlanModelPayload::Proposal(retry))
-            } else {
-                Ok(PlanModelPayload::Proposal(proposal))
+            // Accept the hardened proposal only if it introduced no errors and
+            // reduced (or at least did not increase) the warnings.
+            if retry_report.errors.is_empty()
+                && retry_report.warnings.len() <= first_report.warnings.len()
+            {
+                return Ok(PlanModelPayload::Proposal(retry));
             }
         }
-        Ok(other) => Ok(other),
-        Err(_) => Ok(PlanModelPayload::Proposal(proposal)),
+        // Otherwise keep the original; warnings are non-blocking and will be
+        // surfaced to the user in the proposal recap.
     }
+
+    Ok(PlanModelPayload::Proposal(proposal))
 }

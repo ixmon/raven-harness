@@ -11,6 +11,9 @@ pub struct ProposalImprovementReport {
     pub fixes: Vec<String>,
     /// Issues that could not be fixed automatically — proposal retry may be needed.
     pub errors: Vec<String>,
+    /// Non-blocking advisories surfaced to the user (e.g. weak success criteria,
+    /// language-convention anti-patterns). Do not force a retry, but warn.
+    pub warnings: Vec<String>,
 }
 
 const VERIFICATION_RETRY_NUDGE_HEADER: &str = "\n\nYour proposal had invalid step verifications. Resubmit ONLY the corrected proposal JSON.\n";
@@ -287,6 +290,39 @@ fn upgrade_creation_verification(
     None
 }
 
+/// Detect steps whose description indicates an acquire/download and whose
+/// verification is a bare `test -d <path>`. Such a check is satisfied by an
+/// empty directory (the session log showed an agent creating `assets/sprites/`
+/// with only a README to pass `test -d assets/sprites`). We strengthen it to
+/// require the directory be non-empty, which is strictly harder to spoof.
+fn upgrade_download_verification(
+    description: &str,
+    verification: &str,
+    workdir: Option<&str>,
+) -> Option<(String, String)> {
+    let desc = description.to_lowercase();
+    let is_acquire = desc.contains("download")
+        || desc.contains("install ")
+        || desc.contains("fetch ")
+        || desc.contains("pull ")
+        || (desc.contains("get ") && (desc.contains("asset") || desc.contains("sprite") || desc.contains("package")));
+    if !is_acquire {
+        return None;
+    }
+    let v = verification.trim();
+    // Match `test -d <path>` (single dir, no chained commands).
+    let path = v
+        .strip_prefix("test -d ")
+        .map(|p| p.trim().trim_matches(|c| c == '"' || c == '\''))
+        .filter(|p| !p.is_empty() && !p.contains("&&") && !p.contains("||"));
+    let path = path?;
+    let norm = normalize_verification_paths(path, workdir);
+    Some((
+        "exec".to_string(),
+        format!("test -d {norm} && test -n \"$(ls -A {norm})\""),
+    ))
+}
+
 fn validate_step(step: &PlanProposalStep, index: usize, errors: &mut Vec<String>) {
     let n = index + 1;
     if step.description.trim().is_empty() {
@@ -355,6 +391,41 @@ pub fn format_validation_retry_nudge(errors: &[String]) -> String {
     out
 }
 
+/// Build an adversarial-critique nudge appended to the proposal prompt when
+/// `improve_proposal` produced *warnings* (weak verifications). Unlike the
+/// error nudge, this does not tell the model which specific command to use —
+/// it asks the model to reason, for THIS project's stack, whether each
+/// verification could be satisfied by a lazy agent without doing the work, and
+/// to harden them using its own knowledge of the language/tooling.
+///
+/// The hardcoded lints that produced the warnings are language-specific seeds;
+/// this nudge generalizes the fix to any stack the model understands.
+pub fn format_adversarial_critique_nudge(warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nYour proposal passed structural validation, but the harness flagged these \
+         verification weaknesses:\n",
+    );
+    for w in warnings {
+        out.push_str("- ");
+        out.push_str(w);
+        out.push('\n');
+    }
+    out.push_str(
+        "\nRe-examine EVERY step's verification with this question: could a lazy agent \
+         satisfy it WITHOUT doing the actual work? (e.g. an empty directory passes \
+         `test -d`; a symbol exists but does not compile; a pipe masks a failed stage.) \
+         Harden each verification so it proves the real outcome for THIS project's \
+         language and tooling — use the build/test/typecheck/lint command appropriate \
+         to the stack (cargo check, npm test, go build, pytest, tsc --noEmit, etc.) \
+         rather than a generic existence check. Resubmit ONLY the corrected proposal \
+         JSON with the same steps but stronger verifications.\n",
+    );
+    out
+}
+
 /// Auto-upgrade weak verifications and normalize paths. Mutates `proposal` in place.
 pub fn improve_proposal(
     proposal: &mut PlanProposal,
@@ -392,6 +463,22 @@ pub fn improve_proposal(
             }
         }
 
+        // Strengthen "download/install" steps verified by a bare `test -d`
+        // (satisfied by an empty dir) to require a non-empty directory.
+        if let Some(verify) = step.verification.as_deref() {
+            if let Some((new_tier, new_verify)) =
+                upgrade_download_verification(&step.description, verify, workdir.as_deref())
+            {
+                report.fixes.push(format!(
+                    "Step {n}: strengthened `{verify}` → [{new_tier}: {new_verify}] \
+                     (acquire step should not pass on an empty directory)"
+                ));
+                step.tier = Some(new_tier);
+                step.verification = Some(new_verify);
+                continue;
+            }
+        }
+
         if let Some(verify) = step.verification.take() {
             let normalized = normalize_verification_paths(&verify, workdir.as_deref());
             if normalized != verify {
@@ -418,7 +505,129 @@ pub fn improve_proposal(
         validate_step(step, i, &mut report.errors);
     }
 
+    // Surface advisories that don't block the proposal but warn the user.
+    lint_success_criteria(&proposal.success_criteria, &mut report.warnings);
+    for (i, step) in proposal.steps.iter().enumerate() {
+        lint_step_verification(step, i, &mut report.warnings);
+    }
+
     report
+}
+
+/// Heuristic check of the overall success-criteria string for known footguns:
+/// shell pipes that mask exit codes, and commands that never terminate on their own.
+fn lint_success_criteria(criteria: &str, warnings: &mut Vec<String>) {
+    let trimmed = criteria.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    // A pipe makes only the last stage's exit code count. For a build+run goal
+    // this hides build failures (the session log showed `cmake --build build | ./build/galaga`).
+    if trimmed.contains('|') && !trimmed.contains("set -o pipefail") {
+        warnings.push(
+            "Success criteria uses a shell pipe (`|`): only the last stage's exit code is checked. \
+             Consider `set -o pipefail` or splitting into separate checks so a failed build \
+             is not masked by a later command."
+                .to_string(),
+        );
+    }
+    // Commands that are likely non-terminating (games, servers, watchers, REPLs). Running
+    // them as a success gate will hang or require an external timeout/kill.
+    let lower = trimmed.to_lowercase();
+    let non_terminating_markers = [
+        "./build/galaga",
+        "./galaga",
+        "cargo run",
+        "npm start",
+        "npm run dev",
+        "python -m http.server",
+        "uvicorn",
+        "gunicorn",
+        "flask run",
+        "rails server",
+        "rails s",
+        "watch ",
+        "tail -f",
+        "node server",
+        "node app",
+    ];
+    for marker in non_terminating_markers {
+        if lower.contains(marker) && !lower.contains("timeout") {
+            warnings.push(format!(
+                "Success criteria runs `{marker}` which likely does not exit on its own. \
+                 Wrap it with `timeout <N> …` (exit 124 = timeout = OK) or confirm an \
+                 exit condition, otherwise the gate will hang."
+            ));
+            break;
+        }
+    }
+}
+
+/// Per-step advisories: category mismatches and language-convention anti-patterns
+/// that `validate_step` does not reject but that the session log showed are harmful.
+fn lint_step_verification(step: &PlanProposalStep, index: usize, warnings: &mut Vec<String>) {
+    let n = index + 1;
+    let desc = step.description.to_lowercase();
+    let verify = step.verification.as_deref().unwrap_or("");
+
+    // Category mismatch: "download"/"install"/"fetch" verified by mere existence.
+    // The session's step 2 ("Download Kenney sprites") was verified with `test -d`,
+    // which the agent satisfied by creating an empty directory.
+    let is_acquire = desc.contains("download")
+        || desc.contains("install ")
+        || desc.contains("fetch ")
+        || desc.contains("pull ")
+        || desc.contains("get ") && (desc.contains("asset") || desc.contains("sprite") || desc.contains("package"));
+    let is_existence = verify.starts_with("test -d")
+        || verify.starts_with("test -f")
+        || verify.starts_with("file_exists:")
+        || verify.starts_with("test -e");
+    let already_strengthened = verify.contains("ls -A");
+    if is_acquire && is_existence && !already_strengthened {
+        warnings.push(format!(
+            "Step {n}: \"{acquire}\" verified only by existence (`{verify}`). An empty dir/file \
+             satisfies this — prefer a content check (e.g. `test -n \"$(ls -A <dir>/*)\"`) or \
+             use the `attested`/`observe` tier so a blocked download is reported honestly.",
+            acquire = "acquire/download step"
+        ));
+    }
+
+    // Language convention: in C/C++ the class definition belongs in the header, not the .cpp.
+    // The session showed the agent inserting `class Player {}` into Player.cpp to satisfy
+    // `grep:class Player:src/Player.cpp`, which then broke the build (duplicate definition).
+    if let Some(rest) = verify.strip_prefix("grep:") {
+        if let Some((needle, target)) = rest.split_once(':') {
+            let target = target.trim();
+            let needle_lower = needle.to_lowercase();
+            if (target.ends_with(".cpp") || target.ends_with(".cc") || target.ends_with(".c"))
+                && (needle_lower.starts_with("class ")
+                    || needle_lower.starts_with("struct ")
+                    || needle_lower == "class"
+                    || needle_lower == "struct")
+            {
+                warnings.push(format!(
+                    "Step {n}: grep for `{needle}` in `{target}` — for C/C++ the class/struct \
+                     definition belongs in the header (`.h`). A lone grep here can be satisfied \
+                     by inserting the definition into the `.cpp`, which breaks the build. Prefer \
+                     a compile check (`exec` tier) or grep the header instead."
+                ));
+            }
+        }
+    }
+
+    // Lone grep on an "implement"/"add" step: a symbol existing ≠ it working.
+    // The session's steps 4, 5, 6 all used bare grep for implementation steps.
+    let is_implementation = desc.contains("implement")
+        || desc.contains("add ")
+        || desc.contains("create ")
+        && (desc.contains("class") || desc.contains("function") || desc.contains("method"));
+    if is_implementation && verify.starts_with("grep:") && !verify.contains("exec") {
+        warnings.push(format!(
+            "Step {n}: implementation step verified only by `grep` — a symbol existing does not \
+             prove it compiles or works. Pair with a build/compile gate (`exec` tier) or move to \
+             `attested` with evidence."
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -536,5 +745,147 @@ mod tests {
         let nudge = format_validation_retry_nudge(&["Step 2: bad verify".into()]);
         assert!(nudge.contains("file_exists"));
         assert!(nudge.contains("Step 2"));
+    }
+
+    #[test]
+    fn warns_on_piped_success_criteria() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Create CMakeLists".into(),
+            tier: Some("check".into()),
+            verification: Some("file_exists:CMakeLists.txt".into()),
+            prompt: None,
+            note: None,
+        }]);
+        p.success_criteria = "cmake --build build | ./build/galaga".into();
+        let r = improve_proposal(&mut p, None);
+        assert!(r.warnings.iter().any(|w| w.contains("pipe")), "{:?}", r.warnings);
+        assert!(r.warnings.iter().any(|w| w.contains("galaga")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn warns_on_download_verified_by_existence() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Download Kenney.nl sprite pack".into(),
+            tier: Some("exec".into()),
+            verification: Some("test -d assets/sprites".into()),
+            prompt: None,
+            note: None,
+        }]);
+        let r = improve_proposal(&mut p, None);
+        // Auto-upgrade strengthens the bare `test -d` to a non-empty check.
+        assert!(
+            p.steps[0]
+                .verification
+                .as_deref()
+                .unwrap_or("")
+                .contains("ls -A"),
+            "{:?}",
+            p.steps[0].verification
+        );
+        assert!(!r.fixes.is_empty(), "{:?}", r.fixes);
+        // Once strengthened, the "verified only by existence" advisory is suppressed.
+        assert!(
+            !r.warnings
+                .iter()
+                .any(|w| w.contains("verified only by existence")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn download_strengthen_respects_workdir() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Install asset pack".into(),
+            tier: Some("exec".into()),
+            verification: Some("test -d galaga/assets/sprites".into()),
+            prompt: None,
+            note: None,
+        }]);
+        let r = improve_proposal(&mut p, Some("galaga"));
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+        assert_eq!(
+            p.steps[0].verification.as_deref(),
+            Some("test -d assets/sprites && test -n \"$(ls -A assets/sprites)\"")
+        );
+    }
+
+    #[test]
+    fn non_acquire_test_d_is_not_strengthened() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Create source directory".into(),
+            tier: Some("exec".into()),
+            verification: Some("test -d src".into()),
+            prompt: None,
+            note: None,
+        }]);
+        let r = improve_proposal(&mut p, None);
+        assert!(
+            !r.fixes
+                .iter()
+                .any(|f| f.contains("strengthened")),
+            "{:?}",
+            r.fixes
+        );
+        assert_eq!(p.steps[0].verification.as_deref(), Some("test -d src"));
+    }
+
+    #[test]
+    fn warns_on_grep_class_in_cpp() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Implement Player class".into(),
+            tier: Some("check".into()),
+            verification: Some("grep:class Player:src/Player.cpp".into()),
+            prompt: None,
+            note: None,
+        }]);
+        let r = improve_proposal(&mut p, None);
+        assert!(
+            r.warnings.iter().any(|w| w.contains("header") || w.contains(".h")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn no_warning_for_clean_proposal() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Create CMakeLists".into(),
+            tier: Some("check".into()),
+            verification: Some("file_exists:CMakeLists.txt".into()),
+            prompt: None,
+            note: None,
+        }]);
+        p.success_criteria = "cmake --build build".into();
+        let r = improve_proposal(&mut p, None);
+        assert!(r.warnings.is_empty(), "{:?}", r.warnings);
+        assert!(r.errors.is_empty(), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn adversarial_critique_nudge_empty_when_no_warnings() {
+        let nudge = format_adversarial_critique_nudge(&[]);
+        assert!(nudge.is_empty());
+    }
+
+    #[test]
+    fn adversarial_critique_nudge_lists_warnings_and_asks_model_to_harden() {
+        let warnings = vec![
+            "Step 1: verified only by existence (empty-dir footgun)".into(),
+            "Step 2: `grep:class X:*.cpp` — class belongs in header".into(),
+        ];
+        let nudge = format_adversarial_critique_nudge(&warnings);
+        // Each warning is surfaced so the model knows what triggered the critique.
+        assert!(nudge.contains("empty-dir footgun"), "{nudge}");
+        assert!(nudge.contains("class belongs in header"), "{nudge}");
+        // The nudge asks the model to reason about THIS stack, not hardcode a fix.
+        assert!(
+            nudge.contains("could a lazy agent satisfy it WITHOUT doing the actual work"),
+            "{nudge}"
+        );
+        // It points the model at stack-appropriate tools generically.
+        assert!(nudge.contains("cargo check"), "{nudge}");
+        assert!(nudge.contains("pytest"), "{nudge}");
+        assert!(nudge.contains("tsc --noEmit"), "{nudge}");
     }
 }
