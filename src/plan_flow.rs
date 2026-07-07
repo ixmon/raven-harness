@@ -1,6 +1,7 @@
 //! Plan mode entry, proceed confirmation, and plan.md parsing.
 
-use crate::app_state::{App, Pane, PlanState, PlanStep, PlanStepStatus, PlanStepTier};
+use crate::app_state::{App, Pane};
+use crate::plan_state::{PlanLoopPhase, PlanState, PlanStep, PlanStepStatus, PlanStepTier};
 use raven_tui::chat_backend::ChatBackend;
 use raven_tui::plan_intent::{
     classify_plan_answer, classify_plan_entry_intent, classify_proposal_consent,
@@ -168,7 +169,7 @@ pub fn reset_plan_for_new_request(plan: &mut PlanState) {
     plan.steps.clear();
     plan.current_step = 0;
     plan.recap_offered = false;
-    plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+    plan.loop_phase = PlanLoopPhase::Idle;
     plan.initial_request.clear();
     plan.qa_history.clear();
     plan.pending_question = None;
@@ -183,7 +184,7 @@ fn start_json_plan_loop(plan: &mut PlanState, initial_request: &str) {
     plan.pending_proposal = None;
     plan.recap_offered = false;
     plan.steps.clear();
-    plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingQuestion;
+    plan.loop_phase = PlanLoopPhase::FetchingQuestion;
 }
 
 /// True when assistant text invited the user to approve the plan for execution.
@@ -557,7 +558,7 @@ pub fn handle_plan_loop_model_payload(
     match payload {
         PlanModelPayload::Clarify { question } => {
             app.plan.pending_question = Some(question.clone());
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::AwaitingUserAnswer;
+            app.plan.loop_phase = PlanLoopPhase::AwaitingUserAnswer;
             app.left_committed
                 .push(format_question_for_user(&question));
             app.needs_redraw = true;
@@ -566,7 +567,7 @@ pub fn handle_plan_loop_model_payload(
             if let Some(m) = message {
                 app.left_committed.push(m);
             }
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingProposal;
+            app.plan.loop_phase = PlanLoopPhase::FetchingProposal;
             app.needs_redraw = true;
         }
         PlanModelPayload::Proposal(proposal) => {
@@ -579,7 +580,7 @@ fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, proposal: Pla
     apply_proposal_to_plan(&mut app.plan, &proposal);
     app.plan.pending_proposal = Some(proposal.clone());
     app.plan.recap_offered = true;
-    app.plan.loop_phase = crate::app_state::PlanLoopPhase::AwaitingProceedConsent;
+    app.plan.loop_phase = PlanLoopPhase::AwaitingProceedConsent;
     app.left_committed
         .push(format_proposal_for_user(&proposal));
 
@@ -609,7 +610,7 @@ pub fn apply_plan_clarify_done(
     match result {
         Ok(payload) => handle_plan_loop_model_payload(app, agent, payload),
         Err(e) => {
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+            app.plan.loop_phase = PlanLoopPhase::Idle;
             app.left_committed
                 .push(format!("Plan clarify failed: {e}"));
             app.needs_redraw = true;
@@ -631,11 +632,11 @@ pub fn apply_plan_proposal_done(
             app.left_committed.push(format!(
                 "Plan proposal returned unexpected type: {other:?}"
             ));
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+            app.plan.loop_phase = PlanLoopPhase::Idle;
             app.needs_redraw = true;
         }
         Err(e) => {
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+            app.plan.loop_phase = PlanLoopPhase::Idle;
             app.left_committed
                 .push(format!("Plan proposal failed: {e}"));
             app.needs_redraw = true;
@@ -644,7 +645,7 @@ pub fn apply_plan_proposal_done(
 }
 
 pub fn apply_plan_exit_discuss(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
-    app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+    app.plan.loop_phase = PlanLoopPhase::Idle;
     app.plan.pending_question = None;
     if let Ok(mut ag) = agent.try_lock() {
         ag.set_agent_mode("talk");
@@ -657,7 +658,7 @@ pub fn apply_plan_exit_discuss(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
     app.needs_redraw = true;
 }
 
-fn mark_plan_fetching(app: &mut App, phase: crate::app_state::PlanLoopPhase, trace: &str) {
+fn mark_plan_fetching(app: &mut App, phase: PlanLoopPhase, trace: &str) {
     app.plan.loop_phase = phase;
     app.current_response = "⠋ Planning…\n".to_string();
     app.left_follow_output = true;
@@ -704,7 +705,7 @@ pub fn spawn_fetch_clarification(
 ) {
     mark_plan_fetching(
         app,
-        crate::app_state::PlanLoopPhase::FetchingQuestion,
+        PlanLoopPhase::FetchingQuestion,
         "📋 Plan: fetching clarification…",
     );
     let initial = app.plan.initial_request.clone();
@@ -749,7 +750,7 @@ fn spawn_plan_answer_work(
 ) {
     mark_plan_fetching(
         app,
-        crate::app_state::PlanLoopPhase::FetchingQuestion,
+        PlanLoopPhase::FetchingQuestion,
         "📋 Plan: classifying answer…",
     );
     tokio::spawn(async move {
@@ -788,7 +789,7 @@ pub fn submit_plan_loop_input(
     user_input: &str,
 ) -> PlanLoopUserOutcome {
     match app.plan.loop_phase {
-        crate::app_state::PlanLoopPhase::AwaitingUserAnswer => {
+        PlanLoopPhase::AwaitingUserAnswer => {
             let question = match app.plan.pending_question.take() {
                 Some(q) => q,
                 None => return PlanLoopUserOutcome::Consumed,
@@ -800,7 +801,7 @@ pub fn submit_plan_loop_input(
                 question,
             }
         }
-        crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
+        PlanLoopPhase::AwaitingProceedConsent => {
             app.left_committed.push(format!("> {}", user_input));
             if is_explicit_proceed_approval(user_input) {
                 app.needs_redraw = true;
@@ -825,7 +826,7 @@ pub fn spawn_proceed_feedback_work(
 ) {
     mark_plan_fetching(
         app,
-        crate::app_state::PlanLoopPhase::FetchingProposal,
+        PlanLoopPhase::FetchingProposal,
         "📋 Plan: interpreting feedback…",
     );
     app.plan.pending_proposal = None;
@@ -857,7 +858,7 @@ pub fn spawn_proceed_feedback_work(
 pub fn plan_loop_active(plan: &PlanState) -> bool {
     !matches!(
         plan.loop_phase,
-        crate::app_state::PlanLoopPhase::Idle
+        PlanLoopPhase::Idle
     )
 }
 
@@ -955,7 +956,7 @@ pub fn cancel_plan_mode(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
         app.plan.active = false;
         reset_plan_for_new_request(&mut app.plan);
     } else {
-        app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+        app.plan.loop_phase = PlanLoopPhase::Idle;
         app.plan.pending_question = None;
         app.plan.pending_proposal = None;
     }
@@ -1039,7 +1040,7 @@ pub fn start_plan_execution(
     workspace: &std::path::Path,
 ) -> String {
     approve_plan_for_execution(app, agent);
-    app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+    app.plan.loop_phase = PlanLoopPhase::Idle;
     app.plan.pending_proposal = None;
     app.plan.recap_offered = false;
     app.left_committed

@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod agent_driver;
+mod agent_system_prompt;
 pub mod plan_execution;
 pub mod plan_intent;
 pub mod plan_loop;

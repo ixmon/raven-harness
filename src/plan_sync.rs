@@ -1,6 +1,6 @@
 //! Plan progress sync between TUI `PlanState`, agent `PlanExecutionState`, and wiki log.
 
-use crate::app_state::{PlanState, PlanStep, PlanStepStatus, PlanStepTier};
+use crate::plan_state::{PlanState, PlanStep, PlanStepStatus, PlanStepTier};
 use raven_tui::agent::Agent;
 use raven_tui::plan_execution;
 use raven_tui::plan_md::{self, PlanExecutionState, PlanStepData};
@@ -155,7 +155,7 @@ pub fn sync_plan_from_agent(plan: &mut PlanState, agent: &Agent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::PlanStep;
+    use crate::plan_state::PlanStep;
     use raven_tui::agent::Agent;
     use raven_tui::chat_backend::{ChatBackend, MockChatBackend};
     use raven_tui::config::{Config, ContextBudget, ContextSource};

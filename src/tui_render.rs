@@ -3,6 +3,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::desktop::{ActiveDesktop, DesktopState, SlideDirection};
+use crate::plan_pane_render::draw_plan_pane;
+use crate::plan_state::PlanState;
 use crate::input_dispatch::SlashCommand;
 use crate::settings_modal::{draw_settings_modal, SettingsModal};
 use ratatui::{
@@ -16,7 +18,6 @@ use ratatui::{
 };
 
 const PLAN_ORANGE: Color = Color::Rgb(0xff, 0xc0, 0x40);
-const PLAN_GREEN: Color = Color::Rgb(0x60, 0xc0, 0x60);
 
 fn is_plan_entry_confirm(entry: &str) -> bool {
     let t = entry.trim();
@@ -1611,182 +1612,7 @@ pub struct WorkspaceDrawData<'a> {
     pub left_highlight: Option<usize>,
     pub right_highlight: Option<usize>,
     // Plan mode overlay pane (shown when run mode == "plan" or plan.active)
-    pub plan: Option<&'a crate::app_state::PlanState>,
-}
-
-/// Draw splash or workspace, or animate a horizontal slide between them.
-/// When desktop is Picker, draws the combined workspaces+sessions tree + summary (no separate sessions pane).
-fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState) {
-    let is_approved = !plan.steps.is_empty();
-    let pane_color = if is_approved { PLAN_GREEN } else { PLAN_ORANGE };
-    let title_text = if is_approved { " Plan (approved) " } else { " Plan " };
-    let block = Block::default()
-        .title(Span::styled(title_text, Style::default().fg(pane_color).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(pane_color))
-        .style(Style::default().bg(Color::Black));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut lines: Vec<Line> = vec![];
-
-    // Key fields summary (compact)
-    lines.push(Line::from(vec![
-        Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(if plan.goal.is_empty() { "(gathering from user)" } else { &plan.goal }, Style::default().fg(Color::White)),
-    ]));
-    if !plan.success_criteria.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Success Criteria: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&plan.success_criteria, Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))),
-        ]));
-    }
-    if !plan.verification_steps.is_empty() {
-        lines.push(Line::from(Span::styled("Verification:", Style::default().fg(Color::DarkGray))));
-        for v in plan.verification_steps.iter().take(2) {
-            lines.push(Line::from(Span::styled(format!("  • {}", v), Style::default().fg(Color::Gray))));
-        }
-    }
-    if !plan.rollback.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Rollback: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&plan.rollback, Style::default().fg(Color::Yellow)),
-        ]));
-    }
-    if !plan.constraints.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Constraints: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&plan.constraints, Style::default().fg(Color::Gray)),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-
-    if plan.steps.is_empty() {
-        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let slow = spins[(plan.spinner_tick / 4) % spins.len()];
-        match plan.loop_phase {
-            crate::app_state::PlanLoopPhase::FetchingQuestion
-            | crate::app_state::PlanLoopPhase::FetchingProposal => {
-                lines.push(Line::from(Span::styled(
-                    format!("{slow} Planning… (JSON loop)"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            crate::app_state::PlanLoopPhase::AwaitingUserAnswer => {
-                if let Some(q) = &plan.pending_question {
-                    lines.push(Line::from(Span::styled(
-                        format!("❓ {}", q.prompt),
-                        Style::default().fg(Color::Rgb(0xff, 0xcc, 0x66)),
-                    )));
-                    for (i, opt) in q.options.iter().enumerate() {
-                        let rec = q
-                            .recommend
-                            .as_deref()
-                            .is_some_and(|r| r == opt.id)
-                            .then_some(" ★");
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "  {}. {}{}",
-                                i + 1,
-                                opt.label,
-                                rec.unwrap_or_default()
-                            ),
-                            Style::default().fg(Color::Gray),
-                        )));
-                    }
-                }
-            }
-            crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
-                lines.push(Line::from(Span::styled(
-                    "📋 Review proposal in chat — ready to proceed?",
-                    Style::default().fg(Color::Rgb(0xcc, 0xff, 0xcc)),
-                )));
-            }
-            _ => {
-                lines.push(Line::from(Span::styled(
-                    format!("{slow} Steps: (to be determined)"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        }
-    } else {
-        // Execution phase: show progress + steps
-        // Progress with swirl + optional simple bar
-        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let spin = spins[plan.spinner_tick % spins.len()];
-        let progress = if !plan.steps.is_empty() && plan.current_step < plan.steps.len() {
-            let st = &plan.steps[plan.current_step];
-            let observe = plan
-                .pending_observe_prompt
-                .as_deref()
-                .map(|p| format!(" — waiting: {}", p))
-                .unwrap_or_default();
-            format!(
-                "{} Step {}/{} {}{}",
-                spin,
-                plan.current_step + 1,
-                plan.steps.len(),
-                st.description,
-                observe
-            )
-        } else if !plan.steps.is_empty() {
-            // All steps completed (or forced on final Done / WORK_COMPLETE)
-            "✓ Plan complete".to_string()
-        } else {
-            format!("{} Preparing plan...", spin)
-        };
-        lines.push(Line::from(Span::styled(progress, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
-
-        // Simple progress bar
-        if !plan.steps.is_empty() {
-            let total = plan.steps.len();
-            let done = plan.steps.iter().filter(|s| s.status == crate::app_state::PlanStepStatus::Done).count();
-            let mut pct = done.saturating_mul(100) / total.max(1);
-            if plan.current_step >= total || done >= total {
-                pct = 100;
-            }
-            let bar_width = 20;
-            let filled = pct * bar_width / 100;
-            let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
-            lines.push(Line::from(Span::styled(bar, Style::default().fg(pane_color))));
-        }
-
-        // Step list preview
-        for (i, st) in plan.steps.iter().enumerate().take(5) {
-            let mark = if i == plan.current_step {
-                "▶ "
-            } else {
-                match st.status {
-                    crate::app_state::PlanStepStatus::Done => "✓ ",
-                    crate::app_state::PlanStepStatus::Failed => "✗ ",
-                    _ => "  ",
-                }
-            };
-            let tier = st
-                .tier
-                .map(|t| format!(" [{}]", t.pane_label()))
-                .unwrap_or_default();
-            let v = st
-                .verification
-                .as_deref()
-                .or(st.observe_prompt.as_deref())
-                .map(|v| format!(" ({})", v))
-                .unwrap_or_default();
-            lines.push(Line::from(Span::styled(
-                format!("{}{}{}{}", mark, st.description, tier, v),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    }
-
-    // Footer note about wiki storage
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Stored in: wiki/plan.md (editable outside)", Style::default().fg(Color::DarkGray))));
-
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
-    f.render_widget(para, inner);
+    pub plan: Option<&'a PlanState>,
 }
 
 pub fn draw_content_desktop(

@@ -1,6 +1,6 @@
 //! Plan-related user-facing strings: execution prompts, status, wiki templates.
 
-use crate::app_state::{PlanState, PlanStep, PlanStepStatus, PlanStepTier};
+use crate::plan_state::{PlanState, PlanStep, PlanStepStatus, PlanStepTier};
 use raven_tui::plan_execution;
 use raven_tui::plan_md::{self, PlanStepData};
 use std::path::Path;
@@ -182,7 +182,7 @@ pub fn wiki_template_approved(plan: &PlanState) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app_state::PlanStep;
+    use crate::plan_state::PlanStep;
 
     #[test]
     fn execution_user_prompt_lists_steps_and_wiki_hint() {

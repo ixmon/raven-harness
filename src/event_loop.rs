@@ -580,7 +580,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.left_committed.push(msg);
                     }
                     app.current_response = "⠋ Drafting proposal…\n".to_string();
-                    app.plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingProposal;
+                    app.plan.loop_phase = crate::plan_state::PlanLoopPhase::FetchingProposal;
                     app.needs_redraw = true;
                 }
                 UiUpdate::PlanLoopClarifyDone { result, qa_entry } => {
