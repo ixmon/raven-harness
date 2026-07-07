@@ -114,14 +114,32 @@ fn format_verification_list(verification: &[String]) -> String {
 fn plan_steps_section_skeleton() -> String {
     format!(
         "## Steps\n{}\n",
-        format_plan_steps_json_block(&[PlanStep {
-            description: "(Agent will fill during clarification)".to_string(),
-            verification: Some("(propose runnable command per step)".to_string()),
-            tier: Some(PlanStepTier::Exec),
-            note: None,
-            observe_prompt: None,
-            status: PlanStepStatus::Pending,
-        }])
+        format_plan_steps_json_block(&[
+            PlanStep {
+                description: "(e.g. Create project layout)".to_string(),
+                verification: Some("file_exists:CMakeLists.txt".to_string()),
+                tier: Some(PlanStepTier::Check),
+                note: None,
+                observe_prompt: None,
+                status: PlanStepStatus::Pending,
+            },
+            PlanStep {
+                description: "(e.g. Implement core module)".to_string(),
+                verification: Some("grep:fn main:src/main.rs".to_string()),
+                tier: Some(PlanStepTier::Check),
+                note: None,
+                observe_prompt: None,
+                status: PlanStepStatus::Pending,
+            },
+            PlanStep {
+                description: "(e.g. Compile and test)".to_string(),
+                verification: Some("cargo check".to_string()),
+                tier: Some(PlanStepTier::Exec),
+                note: None,
+                observe_prompt: None,
+                status: PlanStepStatus::Pending,
+            },
+        ])
     )
 }
 

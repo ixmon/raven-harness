@@ -8,6 +8,7 @@ use crate::plan_protocol::{
     text_for_plan_json_parse, PlanModelPayload, PlanQaEntry, PlanQuestion,
     PlanQuestionOption,
 };
+use crate::plan_verification::{format_validation_retry_nudge, improve_proposal};
 use crate::runtime::RuntimeFlags;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -153,12 +154,27 @@ const PROPOSAL_SYSTEM: &str = r#"You are the planning engine for a coding-agent 
 Emit the final plan:
 {"type":"proposal","goal":"...","success_criteria":"...","verification":["runnable command",...],"rollback":"...","constraints":"...","steps":[{"description":"...","tier":"exec|check|attested|observe","verification":"...","prompt":"...","note":"..."}]}
 
-Rules:
+Verification rules (critical):
+- Verification PROVES the step outcome — never replay how you would create files.
+- NEVER use as verification: `cat >`, `echo >`, `tee`, `touch`, bare `mkdir` / `mkdir -p`.
+- File scaffold → tier `check`, verification `file_exists:<path>` (path relative to project root).
+- Directory scaffold → tier `exec`, verification `test -d <path>`.
+- Code/content step → tier `check`, verification `grep:<symbol>:<path>`.
+- Build/compile → tier `exec`, verification `cmake --build …`, `cargo check`, `make`, etc.
+- Run/smoke test → tier `exec` with timeout-safe command (not an infinite game loop).
+- `attested` only when no practical check exists — require `note` explaining why.
+- `observe` for human-only checks — put question in `prompt`, explain in `note`.
+
+Example steps for a C++ game in subdirectory `galaga/`:
+{"description":"Create CMakeLists.txt","tier":"check","verification":"file_exists:CMakeLists.txt"}
+{"description":"Implement Player class","tier":"check","verification":"grep:class Player:src/Player.cpp"}
+{"description":"Compile project","tier":"exec","verification":"cmake --build build"}
+
+Other rules:
 - Keep JSON compact: short strings, max 10 steps, omit optional fields when empty
-- verification: concrete runnable commands where possible
-- if the deliverable lives in a workspace subdirectory, prefix verification with `cd <dir> &&` (harness also auto-detects common subdirs)
-- every step needs tier + verification or observe prompt
-- include package-install steps as plan steps if user chose agent install"#;
+- Paths in verifications are relative to the project root (e.g. `src/foo.cpp`), not `galaga/src/...` when the project lives in `galaga/`
+- Every step needs tier + verification (or `prompt` for observe)
+- Include package-install steps if user chose agent install"#;
 
 fn clarify_user_prompt(initial_request: &str, history_text: &str, workspace: &str) -> String {
     format!(
@@ -205,6 +221,20 @@ pub async fn fetch_clarification(
     }
 }
 
+async fn fetch_proposal_payload(
+    backend: &Arc<Mutex<ChatBackend>>,
+    user: &str,
+) -> Result<PlanModelPayload, String> {
+    fetch_plan_payload(
+        backend,
+        PROPOSAL_SYSTEM,
+        user,
+        PROPOSAL_MAX_TOKENS,
+        Some(PROPOSAL_CONCISE_NUDGE),
+    )
+    .await
+}
+
 /// Ask the model for the final plan proposal JSON.
 pub async fn fetch_proposal(
     backend: &Arc<Mutex<ChatBackend>>,
@@ -221,12 +251,28 @@ pub async fn fetch_proposal(
     }
     let history_text = format_qa_history_for_prompt(history);
     let user = proposal_user_prompt(initial_request, &history_text, workspace);
-    fetch_plan_payload(
-        backend,
-        PROPOSAL_SYSTEM,
-        &user,
-        PROPOSAL_MAX_TOKENS,
-        Some(PROPOSAL_CONCISE_NUDGE),
-    )
-    .await
+    let payload = fetch_proposal_payload(backend, &user).await?;
+    let PlanModelPayload::Proposal(mut proposal) = payload else {
+        return Ok(payload);
+    };
+
+    let first_report = improve_proposal(&mut proposal);
+    if first_report.errors.is_empty() {
+        return Ok(PlanModelPayload::Proposal(proposal));
+    }
+
+    let nudge = format_validation_retry_nudge(&first_report.errors);
+    let retry_user = format!("{user}{nudge}");
+    match fetch_proposal_payload(backend, &retry_user).await {
+        Ok(PlanModelPayload::Proposal(mut retry)) => {
+            let retry_report = improve_proposal(&mut retry);
+            if retry_report.errors.len() <= first_report.errors.len() {
+                Ok(PlanModelPayload::Proposal(retry))
+            } else {
+                Ok(PlanModelPayload::Proposal(proposal))
+            }
+        }
+        Ok(other) => Ok(other),
+        Err(_) => Ok(PlanModelPayload::Proposal(proposal)),
+    }
 }

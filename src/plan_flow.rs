@@ -8,6 +8,7 @@ use raven_tui::plan_intent::{
     is_explicit_proceed_approval, PlanAnswerResolution, PlanEntryIntent, PlanProceedIntent,
 };
 use raven_tui::plan_loop::{fetch_clarification, fetch_proposal};
+use raven_tui::plan_verification::improve_proposal;
 use raven_tui::plan_protocol::{
     format_proposal_for_user, format_question_for_user, PlanModelPayload, PlanProposal,
     PlanProposalStep, PlanQaEntry,
@@ -576,13 +577,26 @@ pub fn handle_plan_loop_model_payload(
     }
 }
 
-fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, proposal: PlanProposal) {
+fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal: PlanProposal) {
+    let report = improve_proposal(&mut proposal);
     apply_proposal_to_plan(&mut app.plan, &proposal);
     app.plan.pending_proposal = Some(proposal.clone());
     app.plan.recap_offered = true;
     app.plan.loop_phase = PlanLoopPhase::AwaitingProceedConsent;
-    app.left_committed
-        .push(format_proposal_for_user(&proposal));
+    let mut recap = format_proposal_for_user(&proposal);
+    if !report.fixes.is_empty() {
+        recap.push_str("\n\n⚙ Harness adjusted verifications:\n");
+        for fix in &report.fixes {
+            recap.push_str(&format!("  • {fix}\n"));
+        }
+    }
+    if !report.errors.is_empty() {
+        recap.push_str("\n\n⚠ Remaining verification issues (please revise before proceed):\n");
+        for err in &report.errors {
+            recap.push_str(&format!("  • {err}\n"));
+        }
+    }
+    app.left_committed.push(recap);
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {

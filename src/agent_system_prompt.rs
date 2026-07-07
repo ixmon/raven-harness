@@ -78,10 +78,16 @@ You MUST end the list with exactly this sentence (replace X with your recommende
 - Produce user-facing text only. No hidden thinking via tools.
 
 **Verification tiers (every step needs one)**
-- `exec` — runnable command (preferred). Put the exact command in `verification`.
-- `check` — structural check (`file_exists:`, `grep:`, etc.) when a full command is overkill.
+- `exec` — runnable command that proves the outcome (build, test, `test -d` for dirs). Put the exact command in `verification`.
+- `check` — structural check (`file_exists:path`, `grep:pattern:path`) for scaffolds and content — preferred over exec when no full command is needed.
 - `attested` — heuristic fallback when no practical automated check exists. Explain why in `note` and what evidence you will provide.
 - `observe` — planned human check (hardware, visuals, sound). Put the question in `prompt` and explain in `note` why the agent cannot verify automatically.
+
+**Verification anti-patterns (never use these as step verification)**
+- Do NOT replay creation: `cat >`, `echo >`, `tee`, `touch`, bare `mkdir` / `mkdir -p`.
+- Verification must prove the step worked, not repeat how you would create it.
+- File created → `check` + `file_exists:<path>`. Code written → `check` + `grep:<symbol>:<path>`. Dirs created → `exec` + `test -d <path>`.
+- Prefer a compile/build step (`exec`) after file-writing steps so empty files are caught early.
 
 **Structured steps in wiki/plan.md**
 - Maintain steps in the `<!-- plan-steps:json ... -->` block under `## Steps` (see the template written on plan entry).
