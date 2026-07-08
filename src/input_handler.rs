@@ -407,11 +407,15 @@ async fn handle_input_key(
         }
     }
 
-    // Trace pane fold/unfold: Enter toggles current block, z toggles all
-    if app.focused_pane == crate::app_state::Pane::Right && app.trace_cursor_active {
+    // Trace pane fold/unfold: Enter/Space toggles block under cursor, z toggles all
+    if app.focused_pane == crate::app_state::Pane::Right {
         match key.code {
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !app.trace_cursor_active {
+                    app.activate_trace_cursor_in_viewport();
+                }
                 app.toggle_trace_fold();
+                app.needs_redraw = true;
                 return Ok(true);
             }
             KeyCode::Char('z') => {

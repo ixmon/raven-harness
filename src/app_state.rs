@@ -147,6 +147,8 @@ pub struct App {
     pub trace_cursor: usize,       // highlighted line index in trace_lines
     pub trace_cursor_active: bool, // true once user explicitly moves cursor
     pub trace_expanded: std::collections::HashSet<usize>, // header indices of expanded blocks
+    /// Active scrollbar thumb drag (left or right workspace pane).
+    pub scroll_drag_pane: Option<Pane>,
 
     // Agent turn queued from async plan-loop proceed classification.
     pub deferred_agent_prompt: Option<String>,
@@ -289,6 +291,7 @@ impl App {
             trace_cursor: 0,
             trace_cursor_active: false,
             trace_expanded: std::collections::HashSet::new(),
+            scroll_drag_pane: None,
             deferred_agent_prompt: None,
             is_processing: false,
             spinner_tick: 0,
@@ -641,45 +644,88 @@ impl App {
         }
     }
 
-    /// Move the trace cursor up/down and auto-scroll the viewport to follow.
-    fn move_trace_cursor(&mut self, delta: i16) {
+    fn trace_visible_lines(&self) -> Vec<crate::trace_fold::VisibleLine> {
+        let blocks = crate::trace_fold::detect_tool_blocks(&self.trace_lines);
+        crate::trace_fold::compute_visible_lines(&self.trace_lines, &blocks, &self.trace_expanded)
+    }
+
+    pub(crate) fn right_pane_content_height(&self) -> u16 {
+        self.last_right_area
+            .height
+            .saturating_sub(3)
+            .max(1)
+    }
+
+    pub(crate) fn left_pane_content_height(&self) -> u16 {
+        self.last_left_area
+            .height
+            .saturating_sub(3)
+            .max(1)
+    }
+
+    fn right_max_scroll(&self) -> u16 {
+        self.last_right_line_count
+            .saturating_sub(self.right_pane_content_height())
+    }
+
+    fn left_max_scroll(&self) -> u16 {
+        self.last_left_line_count
+            .saturating_sub(self.left_pane_content_height())
+    }
+
+    /// Place the trace cursor on the first visible row in the viewport.
+    pub fn activate_trace_cursor_in_viewport(&mut self) {
         if self.trace_lines.is_empty() {
             return;
         }
-        let max_idx = self.trace_lines.len().saturating_sub(1);
-        if !self.trace_cursor_active {
-            // First activation: place cursor at the center of the visible viewport
-            self.trace_cursor_active = true;
-            // Approximate: visible height is unknown here, so place at scroll position
-            self.trace_cursor = (self.right_scroll as usize).min(max_idx);
+        let visible = self.trace_visible_lines();
+        if visible.is_empty() {
+            return;
         }
-        let old = self.trace_cursor;
+        let vis_idx = (self.right_scroll as usize).min(visible.len().saturating_sub(1));
+        self.trace_cursor_active = true;
+        self.trace_cursor = crate::trace_fold::cursor_line_for_visible(&visible, vis_idx);
+        self.right_follow_output = false;
+        self.needs_redraw = true;
+    }
+
+    /// Move the trace cursor up/down in visible (fold-aware) line space.
+    fn move_trace_cursor(&mut self, delta: i16) {
+        let visible = self.trace_visible_lines();
+        if visible.is_empty() {
+            return;
+        }
+        let mut vis_idx = if self.trace_cursor_active {
+            let blocks = crate::trace_fold::detect_tool_blocks(&self.trace_lines);
+            crate::trace_fold::visible_index_for_cursor(&visible, self.trace_cursor, &blocks)
+        } else {
+            self.trace_cursor_active = true;
+            (self.right_scroll as usize).min(visible.len().saturating_sub(1))
+        };
+
+        let old_vis = vis_idx;
         if delta < 0 {
             self.right_follow_output = false;
-            self.trace_cursor = self.trace_cursor.saturating_sub((-delta) as usize);
+            vis_idx = vis_idx.saturating_sub(1);
         } else {
             self.right_follow_output = false;
-            self.trace_cursor = (self.trace_cursor + delta as usize).min(max_idx);
+            vis_idx = (vis_idx + 1).min(visible.len().saturating_sub(1));
         }
-        if old == self.trace_cursor {
+        if old_vis == vis_idx {
             self.scroll_flash_timer = 10;
         }
-        // Auto-scroll to keep cursor visible (2-line margin from edges).
-        // The actual content height is computed during render, but we can use
-        // a reasonable estimate from the last known right pane height.
-        // The render loop will clamp scroll as needed.
-        let cursor = self.trace_cursor as u16;
+
+        self.trace_cursor = crate::trace_fold::cursor_line_for_visible(&visible, vis_idx);
+
         let margin: u16 = 2;
-        if cursor < self.right_scroll + margin {
-            self.right_scroll = cursor.saturating_sub(margin);
+        let content_h = self.right_pane_content_height();
+        let vis = vis_idx as u16;
+        if vis < self.right_scroll + margin {
+            self.right_scroll = vis.saturating_sub(margin);
+        } else if vis >= self.right_scroll + content_h.saturating_sub(margin) {
+            self.right_scroll = vis.saturating_sub(content_h.saturating_sub(margin + 1));
         }
-        // Use a reasonable default visible height (will be clamped in render).
-        // We don't have the exact pane height here, but 30 is a safe estimate;
-        // the render pass will clamp scroll to max_scroll anyway.
-        let visible_approx: u16 = 30;
-        if cursor >= self.right_scroll + visible_approx.saturating_sub(margin) {
-            self.right_scroll = cursor.saturating_sub(visible_approx.saturating_sub(margin + 1));
-        }
+        self.right_scroll = self.right_scroll.min(self.right_max_scroll());
         self.needs_redraw = true;
     }
 
@@ -692,14 +738,64 @@ impl App {
     /// Toggle fold on the tool block under the current trace cursor.
     pub fn toggle_trace_fold(&mut self) {
         let blocks = crate::trace_fold::detect_tool_blocks(&self.trace_lines);
-        if let Some(header_idx) = crate::trace_fold::block_for_line(&blocks, self.trace_cursor) {
-            if self.trace_expanded.contains(&header_idx) {
-                self.trace_expanded.remove(&header_idx);
-            } else {
-                self.trace_expanded.insert(header_idx);
+        let visible = crate::trace_fold::compute_visible_lines(
+            &self.trace_lines,
+            &blocks,
+            &self.trace_expanded,
+        );
+        let vis_idx = crate::trace_fold::visible_index_for_cursor(
+            &visible,
+            self.trace_cursor,
+            &blocks,
+        );
+        if let Some(vline) = visible.get(vis_idx) {
+            if let Some(header_idx) =
+                crate::trace_fold::fold_toggle_header(&self.trace_lines, &blocks, vline)
+            {
+                self.toggle_trace_fold_header(header_idx);
             }
-            self.needs_redraw = true;
         }
+    }
+
+    pub fn toggle_trace_fold_header(&mut self, header_idx: usize) {
+        if self.trace_expanded.contains(&header_idx) {
+            self.trace_expanded.remove(&header_idx);
+        } else {
+            self.trace_expanded.insert(header_idx);
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Jump scroll position from a click/drag on the pane scrollbar track.
+    pub fn scroll_pane_from_row(&mut self, pane: Pane, row: u16) {
+        let (area, line_count, content_h, scroll, follow) = match pane {
+            Pane::Left => (
+                self.last_left_area,
+                self.last_left_line_count,
+                self.left_pane_content_height(),
+                &mut self.left_scroll,
+                &mut self.left_follow_output,
+            ),
+            Pane::Right => (
+                self.last_right_area,
+                self.last_right_line_count,
+                self.right_pane_content_height(),
+                &mut self.right_scroll,
+                &mut self.right_follow_output,
+            ),
+            Pane::Input => return,
+        };
+        if line_count <= content_h || area.height == 0 {
+            return;
+        }
+        *follow = false;
+        let content_y = area.y + 1;
+        let track_h = content_h.max(1) as f32;
+        let rel = (row.saturating_sub(content_y) as f32 / track_h).clamp(0.0, 1.0);
+        let max_scroll = line_count.saturating_sub(content_h);
+        *scroll = (rel * max_scroll as f32).round() as u16;
+        *scroll = (*scroll).min(max_scroll);
+        self.needs_redraw = true;
     }
 
     /// Toggle fold all: if any blocks are expanded, collapse all; otherwise expand all.

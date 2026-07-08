@@ -37,10 +37,73 @@ pub fn handle_mouse(app: &mut App, me: MouseEvent, agent: &Arc<TokioMutex<Agent>
 
     match me.kind {
         MouseEventKind::Down(MouseButton::Left) => handle_click(app, me.column, me.row, agent),
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved => {
+            handle_scroll_drag(app, me.column, me.row)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let had = app.scroll_drag_pane.is_some();
+            app.scroll_drag_pane = None;
+            had
+        }
         MouseEventKind::ScrollUp => handle_wheel(app, -3, agent),
         MouseEventKind::ScrollDown => handle_wheel(app, 3, agent),
         _ => false,
     }
+}
+
+fn is_pane_scrollbar_col(area: ratatui::layout::Rect, col: u16) -> bool {
+    area.width > 0 && col == area.x + area.width - 1
+}
+
+fn pane_has_scrollbar(line_count: u16, content_h: u16) -> bool {
+    line_count > content_h
+}
+
+fn handle_scroll_drag(app: &mut App, col: u16, row: u16) -> bool {
+    let Some(pane) = app.scroll_drag_pane else {
+        return false;
+    };
+    let (area, line_count, content_h) = match pane {
+        Pane::Left => (
+            app.last_left_area,
+            app.last_left_line_count,
+            app.left_pane_content_height(),
+        ),
+        Pane::Right => (
+            app.last_right_area,
+            app.last_right_line_count,
+            app.right_pane_content_height(),
+        ),
+        Pane::Input => return false,
+    };
+    if !pane_has_scrollbar(line_count, content_h) || !is_pane_scrollbar_col(area, col) {
+        app.scroll_drag_pane = None;
+        return false;
+    }
+    app.scroll_pane_from_row(pane, row);
+    true
+}
+
+fn try_begin_scroll_drag(app: &mut App, col: u16, row: u16) -> bool {
+    if pane_has_scrollbar(app.last_left_line_count, app.left_pane_content_height())
+        && is_pane_scrollbar_col(app.last_left_area, col)
+        && point_in(app.last_left_area, col, row)
+    {
+        app.scroll_drag_pane = Some(Pane::Left);
+        app.scroll_pane_from_row(Pane::Left, row);
+        app.needs_redraw = true;
+        return true;
+    }
+    if pane_has_scrollbar(app.last_right_line_count, app.right_pane_content_height())
+        && is_pane_scrollbar_col(app.last_right_area, col)
+        && point_in(app.last_right_area, col, row)
+    {
+        app.scroll_drag_pane = Some(Pane::Right);
+        app.scroll_pane_from_row(Pane::Right, row);
+        app.needs_redraw = true;
+        return true;
+    }
+    false
 }
 
 fn handle_wheel(app: &mut App, delta_lines: i16, agent: &Arc<TokioMutex<Agent>>) -> bool {
@@ -297,25 +360,53 @@ fn click_wiki_viewer(app: &mut App, col: u16, row: u16, regions: MouseRegions) -
 }
 
 fn click_workspace(app: &mut App, col: u16, row: u16) -> bool {
-    let in_left = point_in(app.last_left_area, col, row);
-    let in_right = point_in(app.last_right_area, col, row);
-    if in_left {
+    if try_begin_scroll_drag(app, col, row) {
+        return true;
+    }
+
+    if point_in(app.last_left_area, col, row) {
         app.focused_pane = Pane::Left;
         app.needs_redraw = true;
         return true;
     }
-    if in_right {
-        app.focused_pane = Pane::Right;
-        app.trace_cursor_active = false;
+    if point_in(app.last_right_area, col, row) {
+        return click_trace_pane(app, col, row);
+    }
+    app.focused_pane = Pane::Input;
+    app.needs_redraw = true;
+    true
+}
+
+fn click_trace_pane(app: &mut App, _col: u16, row: u16) -> bool {
+    app.focused_pane = Pane::Right;
+    app.right_follow_output = false;
+
+    let content_y = app.last_right_area.y + 1;
+    if row < content_y {
         app.needs_redraw = true;
         return true;
     }
-    if !in_left && !in_right {
-        app.focused_pane = Pane::Input;
-        app.needs_redraw = true;
-        return true;
+
+    let vis_idx = app.right_scroll as usize + (row - content_y) as usize;
+    let blocks = crate::trace_fold::detect_tool_blocks(&app.trace_lines);
+    let visible = crate::trace_fold::compute_visible_lines(
+        &app.trace_lines,
+        &blocks,
+        &app.trace_expanded,
+    );
+
+    if let Some(vline) = visible.get(vis_idx) {
+        app.trace_cursor_active = true;
+        app.trace_cursor = crate::trace_fold::cursor_line_for_visible(&visible, vis_idx);
+        if let Some(header_idx) =
+            crate::trace_fold::fold_toggle_header(&app.trace_lines, &blocks, vline)
+        {
+            app.toggle_trace_fold_header(header_idx);
+        }
     }
-    false
+
+    app.needs_redraw = true;
+    true
 }
 
 fn nav_item_at_row(

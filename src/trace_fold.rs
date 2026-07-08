@@ -194,12 +194,76 @@ pub fn block_for_line(blocks: &[ToolBlock], line_idx: usize) -> Option<usize> {
     })
 }
 
+/// Visible-line index that corresponds to `trace_cursor` (raw trace_lines index).
+pub fn visible_index_for_cursor(
+    visible: &[VisibleLine],
+    trace_cursor: usize,
+    blocks: &[ToolBlock],
+) -> usize {
+    for (i, v) in visible.iter().enumerate() {
+        match v {
+            VisibleLine::Original(idx) if *idx == trace_cursor => return i,
+            VisibleLine::FoldSummary { header_idx, .. } => {
+                if blocks.iter().any(|b| {
+                    b.header_idx == *header_idx
+                        && trace_cursor >= b.header_idx
+                        && trace_cursor < b.end_idx
+                }) {
+                    return i;
+                }
+            }
+            _ => {}
+        }
+    }
+    visible.len().saturating_sub(1)
+}
+
+/// Raw trace_lines index to store in `trace_cursor` for a visible row.
+pub fn cursor_line_for_visible(visible: &[VisibleLine], vis_idx: usize) -> usize {
+    match visible.get(vis_idx) {
+        Some(VisibleLine::Original(i)) => *i,
+        Some(VisibleLine::FoldSummary { header_idx, .. }) => *header_idx,
+        None => 0,
+    }
+}
+
+/// Block header to toggle when activating a visible trace row (click or Enter).
+pub fn fold_toggle_header(
+    trace_lines: &[String],
+    blocks: &[ToolBlock],
+    vline: &VisibleLine,
+) -> Option<usize> {
+    match vline {
+        VisibleLine::FoldSummary { header_idx, .. } => Some(*header_idx),
+        VisibleLine::Original(idx) => {
+            if trace_lines.get(*idx).is_some_and(|l| l.starts_with('🔧')) {
+                Some(*idx)
+            } else {
+                block_for_line(blocks, *idx)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn lines(strs: &[&str]) -> Vec<String> {
         strs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fold_toggle_header_on_summary_and_tool_header() {
+        let trace = lines(&[
+            "🔧 exec(cargo test)",
+            "   ↳ ✅ 150 passed",
+        ]);
+        let blocks = detect_tool_blocks(&trace);
+        let visible = compute_visible_lines(&trace, &blocks, &HashSet::new());
+        assert!(matches!(visible[1], VisibleLine::FoldSummary { .. }));
+        assert_eq!(fold_toggle_header(&trace, &blocks, &visible[0]), Some(0));
+        assert_eq!(fold_toggle_header(&trace, &blocks, &visible[1]), Some(0));
     }
 
     #[test]
