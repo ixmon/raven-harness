@@ -21,6 +21,7 @@ mod plan_sync;
 mod plan_prompts;
 mod plan_state;
 mod plan_pane_render;
+mod code_highlight;
 mod md_render;
 mod wiki_doc;
 mod markdown_pane;

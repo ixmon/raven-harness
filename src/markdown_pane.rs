@@ -1,12 +1,26 @@
 //! Shared helpers for scrollable markdown panes (wiki viewer, picker summary, overview).
 
+use crate::code_highlight::pad_code_block_lines;
 use crate::list_pane::list_selection_style;
 use crate::md_render;
 use ratatui::text::Text;
 
+/// Line count after markdown render + code-block padding (for scroll bounds).
+pub fn markdown_line_count(md: &str, content_width: usize) -> usize {
+    let mut full = md_render::render_markdown(md);
+    pad_code_block_lines(&mut full, content_width);
+    full.lines.len()
+}
+
 /// Render markdown and return a viewport slice `[scroll, scroll + max_lines)`.
-pub fn markdown_viewport(md: &str, scroll: usize, max_lines: usize) -> Text<'static> {
-    let full = md_render::render_markdown(md);
+pub fn markdown_viewport(
+    md: &str,
+    scroll: usize,
+    max_lines: usize,
+    content_width: usize,
+) -> Text<'static> {
+    let mut full = md_render::render_markdown(md);
+    pad_code_block_lines(&mut full, content_width);
     Text::from(
         full.lines
             .into_iter()

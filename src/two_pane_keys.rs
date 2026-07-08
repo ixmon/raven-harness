@@ -65,6 +65,54 @@ pub fn handle_vertical(
     }
 }
 
+/// PageUp/PageDown/Home/End for nav list or markdown content pane.
+pub fn handle_fast_scroll(
+    browser: &mut WikiBrowser,
+    key: KeyCode,
+    pane_focus: Option<WikiFocus>,
+) -> TwoPaneAction {
+    let focus = pane_focus.unwrap_or(browser.focus);
+    match key {
+        KeyCode::PageUp => {
+            if focus == WikiFocus::Nav {
+                browser.scroll_nav_by_page(-1);
+                TwoPaneAction::NavChanged
+            } else {
+                browser.scroll_content_by_page(-1);
+                TwoPaneAction::Handled
+            }
+        }
+        KeyCode::PageDown => {
+            if focus == WikiFocus::Nav {
+                browser.scroll_nav_by_page(1);
+                TwoPaneAction::NavChanged
+            } else {
+                browser.scroll_content_by_page(1);
+                TwoPaneAction::Handled
+            }
+        }
+        KeyCode::Home => {
+            if focus == WikiFocus::Nav {
+                browser.scroll_nav_home();
+                TwoPaneAction::NavChanged
+            } else {
+                browser.scroll_content_home();
+                TwoPaneAction::Handled
+            }
+        }
+        KeyCode::End => {
+            if focus == WikiFocus::Nav {
+                browser.scroll_nav_end();
+                TwoPaneAction::NavChanged
+            } else {
+                browser.scroll_content_end();
+                TwoPaneAction::Handled
+            }
+        }
+        _ => TwoPaneAction::NotHandled,
+    }
+}
+
 /// Left from Content → Nav. Right from Nav → Content. Returns `true` when handled.
 pub fn handle_horizontal_focus(browser: &mut WikiBrowser, key: KeyCode) -> bool {
     match key {
@@ -134,6 +182,19 @@ mod tests {
             TwoPaneAction::NavChanged
         );
         assert_eq!(b.selected_nav, 0);
+    }
+
+    #[test]
+    fn fast_scroll_content_jumps_by_page() {
+        let mut b = sample_browser();
+        b.focus = WikiFocus::Content;
+        b.scroll_metrics.content_visible = 5;
+        b.scroll_metrics.content_lines = 20;
+        b.scroll = 0;
+        handle_fast_scroll(&mut b, KeyCode::PageDown, None);
+        assert_eq!(b.scroll, 5);
+        handle_fast_scroll(&mut b, KeyCode::Home, None);
+        assert_eq!(b.scroll, 0);
     }
 
     #[test]

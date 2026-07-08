@@ -909,7 +909,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             true,
                         );
                     } else {
-                        tui_render::draw_wiki_viewer(f, content_area, &app.wiki_viewer);
+                        tui_render::draw_wiki_viewer(f, content_area, &mut app.wiki_viewer);
                     }
                 } else {
                     tui_render::draw_content_desktop(
@@ -946,9 +946,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         active_link_idx: app.picker.active_link_idx,
                         summary_action: app.picker.summary_action,
                         view_focus: app.view_focus,
-                        overview_browser: &app.overview_browser,
                         summary_is_markdown: app.picker.show_wiki_in_summary,
                     },
+                    &mut app.overview_browser,
                     &app.wiki_viewer,
                     &mut app.last_left_area, &mut app.last_right_area,
                     &mut app.last_left_line_count, &mut app.last_right_line_count,

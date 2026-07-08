@@ -409,6 +409,28 @@ async fn handle_input_key(
                 app.needs_redraw = true;
                 return Ok(true);
             }
+            KeyCode::PageUp => {
+                let page = app.pane_page_lines(app.focused_pane);
+                app.scroll_focused_page(-1, page);
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::PageDown => {
+                let page = app.pane_page_lines(app.focused_pane);
+                app.scroll_focused_page(1, page);
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::Home => {
+                app.scroll_focused_home();
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::End => {
+                app.scroll_focused_end();
+                app.needs_redraw = true;
+                return Ok(true);
+            }
             _ => {}
         }
     }

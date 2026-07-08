@@ -20,7 +20,11 @@ pub mod md_style {
     pub fn bold() -> Style { Style::default().add_modifier(Modifier::BOLD) }
     pub fn italic() -> Style { Style::default().add_modifier(Modifier::ITALIC) }
     pub fn bold_italic() -> Style { Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC) }
-    pub fn code() -> Style { Style::default().fg(Color::Rgb(0xc0, 0xc0, 0xd0)).bg(Color::Rgb(0x28, 0x28, 0x35)) }
+    pub fn code() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0xc0, 0xc0, 0xd0))
+            .bg(Color::Rgb(0x1a, 0x1a, 0x24))
+    }
     pub fn link() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED) }
     pub fn blockquote() -> Style { Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80)).add_modifier(Modifier::ITALIC) }
     pub fn table_border() -> Style { Style::default().fg(Color::DarkGray) }
@@ -34,31 +38,26 @@ pub fn render_markdown(md: &str) -> Text<'static> {
     let src_lines: Vec<&str> = md.lines().collect();
     let n = src_lines.len();
     let mut i = 0;
-    let mut in_code_block = false;
+    let mut code_block: Option<(String, Vec<String>)> = None;
 
     while i < n {
         let raw = src_lines[i];
 
         // ── Code blocks ──
         if raw.trim_start().starts_with("```") {
-            if in_code_block {
-                // End code block
-                in_code_block = false;
-                i += 1;
-                continue;
-            } else {
-                // Start code block — show language label if present
-                let lang = raw.trim_start().trim_start_matches('`').trim();
-                if !lang.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("  {}", lang), md_style::code())));
-                }
-                in_code_block = true;
+            if let Some((lang, body)) = code_block.take() {
+                let body_refs: Vec<&str> = body.iter().map(String::as_str).collect();
+                lines.extend(crate::code_highlight::highlight_fenced_block(&lang, &body_refs));
                 i += 1;
                 continue;
             }
+            let lang = raw.trim_start().trim_start_matches('`').trim().to_string();
+            code_block = Some((lang, Vec::new()));
+            i += 1;
+            continue;
         }
-        if in_code_block {
-            lines.push(Line::from(Span::styled(format!("  {}", raw), md_style::code())));
+        if let Some((_, ref mut body)) = code_block {
+            body.push(raw.to_string());
             i += 1;
             continue;
         }
@@ -147,6 +146,11 @@ pub fn render_markdown(md: &str) -> Text<'static> {
         let spans = parse_inline(trimmed, Style::default());
         lines.push(Line::from(spans));
         i += 1;
+    }
+
+    if let Some((lang, body)) = code_block.take() {
+        let body_refs: Vec<&str> = body.iter().map(String::as_str).collect();
+        lines.extend(crate::code_highlight::highlight_fenced_block(&lang, &body_refs));
     }
 
     Text::from(lines)

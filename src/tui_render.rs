@@ -107,7 +107,7 @@ fn breadcrumb_nav_hint(data: &BreadcrumbData) -> Option<&'static str> {
                 Some("Browser → Wiki")
             }
         }
-        ActiveDesktop::WikiViewer => Some("←→ nav/content · Esc: back"),
+        ActiveDesktop::WikiViewer => Some("↑↓ PgUp/Dn Home/End · ←→ nav/content"),
         ActiveDesktop::Workspace => None,
         _ => None,
     }
@@ -963,6 +963,7 @@ fn render_scrollable_pane(
     };
 
     let inner_width = area.width.saturating_sub(PANE_WIDTH_RESERVE_BASE + left_pad).max(1) as usize;
+    crate::code_highlight::pad_code_block_lines(text, inner_width);
 
     let block = if title.trim().is_empty() {
         Paragraph::new(text.clone())
@@ -1522,7 +1523,6 @@ pub struct PickerDrawData<'a> {
     pub summary_is_markdown: bool,
     /// When in the 3-pane overview (picker | nav | content), which column has focus.
     pub view_focus: crate::app_state::ViewFocus,
-    pub overview_browser: &'a crate::wiki_browser::WikiBrowser,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1552,6 +1552,7 @@ pub fn draw_content_desktop(
     workspace: &WorkspaceDrawData<'_>,
     splash: &SplashData<'_>,
     picker: &PickerDrawData<'_>,
+    overview_browser: &mut crate::wiki_browser::WikiBrowser,
     _wiki_viewer: &crate::app_state::WikiViewerState,
     last_left_area: &mut Rect,
     last_right_area: &mut Rect,
@@ -1681,7 +1682,7 @@ pub fn draw_content_desktop(
             let nav_area = cols[1];
             let content_area = cols[2];
 
-            let is_harness = picker.overview_browser.selected_is_harness();
+            let is_harness = overview_browser.selected_is_harness();
             let picker_focused = picker.view_focus == crate::app_state::ViewFocus::Picker;
             let nav_focused = picker.view_focus == crate::app_state::ViewFocus::Nav;
             let content_focused = picker.view_focus == crate::app_state::ViewFocus::Content;
@@ -1693,8 +1694,8 @@ pub fn draw_content_desktop(
             draw_nav_pane_for_browser(
                 f,
                 nav_area,
-                &picker.overview_browser.nav_items,
-                picker.overview_browser.selected_nav,
+                &overview_browser.nav_items,
+                overview_browser.selected_nav,
                 nav_focused,
             );
 
@@ -1725,6 +1726,12 @@ pub fn draw_content_desktop(
                 let (_status_area, conv_area, _input_area) =
                     overview_harness_split(harness_inner);
 
+                overview_browser.scroll_metrics = crate::wiki_browser::WikiScrollMetrics {
+                    content_visible: conv_area.height.saturating_sub(2).max(5),
+                    nav_visible: (nav_area.height as usize).saturating_sub(2).max(1) as u16,
+                    content_lines: 0,
+                };
+
                 let mut dummy_last = Rect::default();
                 let mut dummy_cnt = 0u16;
                 let conv_pane_focus = if content_focused { Pane::Left } else { Pane::Right };
@@ -1745,15 +1752,23 @@ pub fn draw_content_desktop(
             } else {
                 // Wiki content pane -- use browser content + custom markdown like full wiki
                 let wiki_border = if content_focused { Color::Cyan } else { Color::Rgb(0x55,0x55,0x66) };
-                let txt = if picker.overview_browser.content.is_empty() {
+                let txt = if overview_browser.content.is_empty() {
                     "(wiki content for selected nav item)".to_string()
                 } else {
-                    picker.overview_browser.content.clone()
+                    overview_browser.content.clone()
                 };
-                let md_text = render_markdown(&txt);
+                let content_width = crate::code_highlight::markdown_content_width(content_area);
+                let content_lines = crate::markdown_pane::markdown_line_count(&txt, content_width);
+                overview_browser.scroll_metrics = crate::wiki_browser::WikiScrollMetrics {
+                    content_visible: (content_area.height as usize).saturating_sub(2).max(1) as u16,
+                    nav_visible: (nav_area.height as usize).saturating_sub(2).max(1) as u16,
+                    content_lines,
+                };
+                let mut md_text = render_markdown(&txt);
+                crate::code_highlight::pad_code_block_lines(&mut md_text, content_width);
                 let preview = Paragraph::new(md_text)
                     .wrap(Wrap { trim: true })
-                    .scroll((picker.overview_browser.scroll as u16, 0))
+                    .scroll((overview_browser.scroll as u16, 0))
                     .block(
                         Block::default()
                             .title(Span::styled(" Wiki ", Style::default().fg(if content_focused { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)))
@@ -1918,7 +1933,7 @@ fn draw_nav_list(
     f.render_widget(nav_para, area);
 }
 
-pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState) {
+pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &mut crate::wiki_browser::WikiBrowser) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -1953,9 +1968,16 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     let search = active_item
         .map(|it| nav_highlight_search(it.kind, &it.label))
         .unwrap_or_default();
-    let start = viewer.scroll;
+    let content_width = crate::code_highlight::markdown_content_width(content_area);
     let max = (content_area.height as usize).saturating_sub(4);
-    let mut md_text = markdown_viewport(&md, start, max);
+    let content_lines = crate::markdown_pane::markdown_line_count(&md, content_width);
+    viewer.scroll_metrics = crate::wiki_browser::WikiScrollMetrics {
+        content_visible: max.max(1) as u16,
+        nav_visible: (nav_area.height as usize).saturating_sub(2).max(1) as u16,
+        content_lines,
+    };
+    let start = viewer.scroll;
+    let mut md_text = markdown_viewport(&md, start, max, content_width);
     highlight_markdown_viewport(&mut md_text, &search, 0, max);
     for line in md_text.lines {
         content_text.lines.push(line);
@@ -2196,7 +2218,7 @@ fn draw_session_summary(
             Line::from(Span::styled("  Select a session to preview", Style::default().fg(Color::DarkGray))),
         ])
     } else if summary_is_markdown {
-        markdown_viewport(summary, scroll, max_lines)
+        markdown_viewport(summary, scroll, max_lines, crate::code_highlight::markdown_content_width(content_area))
     } else {
         let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
         let mut plain = Text::default();

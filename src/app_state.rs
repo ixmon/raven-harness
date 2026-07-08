@@ -711,6 +711,64 @@ impl App {
         self.needs_redraw = true;
     }
 
+    pub fn pane_page_lines(&self, pane: Pane) -> u16 {
+        let h = match pane {
+            Pane::Left => self.last_left_area.height,
+            Pane::Right => self.last_right_area.height,
+            Pane::Input => 0,
+        };
+        h.saturating_sub(2).max(5)
+    }
+
+    /// Scroll the focused conversation/trace pane to the top.
+    pub fn scroll_focused_home(&mut self) {
+        if self.desktop.showing_splash() || self.mode_menu_active || self.agent_mode_menu_active {
+            return;
+        }
+        let pane = self.focused_pane;
+        if !matches!(pane, Pane::Left | Pane::Right) {
+            return;
+        }
+        match pane {
+            Pane::Left => {
+                self.left_follow_output = false;
+                self.left_scroll = 0;
+            }
+            Pane::Right => {
+                self.right_follow_output = false;
+                self.right_scroll = 0;
+                self.trace_cursor_active = false;
+            }
+            Pane::Input => return,
+        }
+        self.needs_redraw = true;
+    }
+
+    /// Scroll the focused conversation/trace pane to the bottom.
+    pub fn scroll_focused_end(&mut self) {
+        if self.desktop.showing_splash() || self.mode_menu_active || self.agent_mode_menu_active {
+            return;
+        }
+        let pane = self.focused_pane;
+        if !matches!(pane, Pane::Left | Pane::Right) {
+            return;
+        }
+        let max = self.pane_max_scroll(pane);
+        match pane {
+            Pane::Left => {
+                self.left_follow_output = false;
+                self.left_scroll = max;
+            }
+            Pane::Right => {
+                self.right_follow_output = false;
+                self.right_scroll = max;
+                self.trace_cursor_active = false;
+            }
+            Pane::Input => return,
+        }
+        self.needs_redraw = true;
+    }
+
     /// Scroll the focused pane by `delta` pages (PgUp/PgDn).
     pub fn scroll_focused_page(&mut self, delta: i16, page_lines: u16) {
         if self.desktop.showing_splash() || self.mode_menu_active || self.agent_mode_menu_active {

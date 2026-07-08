@@ -1,6 +1,7 @@
 //! Session/workspace picker and overview screen key handling.
 
 use crate::app_state::{App, SplashFocus, SummaryAction, ViewFocus};
+use crate::two_pane_keys::{handle_fast_scroll, TwoPaneAction};
 use crate::wiki_browser::WikiFocus;
 use crossterm::event::KeyCode;
 use raven_tui::agent::Agent;
@@ -235,6 +236,72 @@ fn handle_overview(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> bo
                     }
                     ViewFocus::Content => {
                         advance_from_overview_content(app, agent);
+                    }
+                }
+                app.needs_redraw = true;
+                true
+            }
+            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+                match app.view_focus {
+                    ViewFocus::Picker => {
+                        let n = app.picker.picker_items.len();
+                        if n == 0 {
+                            return true;
+                        }
+                        match key {
+                            KeyCode::PageUp => {
+                                app.picker.selected_item =
+                                    app.picker.selected_item.saturating_sub(10);
+                            }
+                            KeyCode::PageDown => {
+                                app.picker.selected_item =
+                                    (app.picker.selected_item + 10).min(n - 1);
+                            }
+                            KeyCode::Home => app.picker.selected_item = 0,
+                            KeyCode::End => app.picker.selected_item = n - 1,
+                            _ => {}
+                        }
+                        app.sync_picker_selection();
+                        app.refresh_picker_summary();
+                        app.prepare_overview_for_session(agent);
+                    }
+                    ViewFocus::Nav => {
+                        match handle_fast_scroll(
+                            &mut app.overview_browser,
+                            key,
+                            Some(WikiFocus::Nav),
+                        ) {
+                            TwoPaneAction::NavChanged => overview_browser_preview(app),
+                            TwoPaneAction::Handled => {}
+                            TwoPaneAction::NotHandled => return false,
+                        }
+                    }
+                    ViewFocus::Content => {
+                        if app.overview_browser.selected_is_harness() {
+                            let page = app
+                                .overview_browser
+                                .scroll_metrics
+                                .content_visible
+                                .max(5);
+                            match key {
+                                KeyCode::PageUp => {
+                                    app.left_scroll = app.left_scroll.saturating_sub(page);
+                                }
+                                KeyCode::PageDown => {
+                                    app.left_scroll = app.left_scroll.saturating_add(page);
+                                }
+                                KeyCode::Home => app.left_scroll = 0,
+                                KeyCode::End => app.left_scroll = 10_000,
+                                _ => {}
+                            }
+                        } else if handle_fast_scroll(
+                            &mut app.overview_browser,
+                            key,
+                            Some(WikiFocus::Content),
+                        ) == TwoPaneAction::NotHandled
+                        {
+                            return false;
+                        }
                     }
                 }
                 app.needs_redraw = true;
@@ -513,7 +580,8 @@ fn handle_screen(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> bool
             }
             KeyCode::PageUp => {
                 if app.picker.focus == PickerFocus::Tree || app.picker.focus == PickerFocus::Summary {
-                    app.picker.summary_scroll = app.picker.summary_scroll.saturating_sub(12);
+                    let page = app.picker.last_summary_height.max(5) as usize;
+                    app.picker.summary_scroll = app.picker.summary_scroll.saturating_sub(page);
                     app.recompute_active_link();
                     app.needs_redraw = true;
                     return true;
@@ -522,7 +590,28 @@ fn handle_screen(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> bool
             }
             KeyCode::PageDown => {
                 if app.picker.focus == PickerFocus::Tree || app.picker.focus == PickerFocus::Summary {
-                    app.picker.summary_scroll = app.picker.summary_scroll.saturating_add(12);
+                    let page = app.picker.last_summary_height.max(5) as usize;
+                    app.picker.summary_scroll = app.picker.summary_scroll.saturating_add(page);
+                    app.recompute_active_link();
+                    app.needs_redraw = true;
+                    return true;
+                }
+                false
+            }
+            KeyCode::Home => {
+                if app.picker.focus == PickerFocus::Summary {
+                    app.picker.summary_scroll = 0;
+                    app.recompute_active_link();
+                    app.needs_redraw = true;
+                    return true;
+                }
+                false
+            }
+            KeyCode::End => {
+                if app.picker.focus == PickerFocus::Summary {
+                    let visible = app.picker.last_summary_height.max(5) as usize;
+                    let total = app.picker.summary.lines().count();
+                    app.picker.summary_scroll = total.saturating_sub(visible);
                     app.recompute_active_link();
                     app.needs_redraw = true;
                     return true;

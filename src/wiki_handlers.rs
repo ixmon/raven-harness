@@ -1,7 +1,10 @@
 //! Key handling for the full-screen wiki viewer (Screen 3).
 
 use crate::app_state::{App, ViewFocus};
-use crate::two_pane_keys::{handle_horizontal_focus, handle_tab, handle_vertical, NavScrollStyle, TwoPaneAction};
+use crate::two_pane_keys::{
+    handle_fast_scroll, handle_horizontal_focus, handle_tab, handle_vertical, NavScrollStyle,
+    TwoPaneAction,
+};
 use crate::wiki_browser::WikiFocus;
 use crossterm::event::KeyCode;
 use raven_tui::agent::Agent;
@@ -59,6 +62,20 @@ pub fn handle_key(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> boo
                 key,
                 NavScrollStyle { wrap: true },
             ) {
+                TwoPaneAction::NotHandled => false,
+                TwoPaneAction::NavChanged => {
+                    app.wiki_viewer.scroll_to_nav_if_current_file();
+                    app.needs_redraw = true;
+                    true
+                }
+                TwoPaneAction::Handled => {
+                    app.needs_redraw = true;
+                    true
+                }
+            }
+        }
+        KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+            match handle_fast_scroll(&mut app.wiki_viewer, key, None) {
                 TwoPaneAction::NotHandled => false,
                 TwoPaneAction::NavChanged => {
                     app.wiki_viewer.scroll_to_nav_if_current_file();

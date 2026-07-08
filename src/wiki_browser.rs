@@ -16,6 +16,14 @@ pub enum WikiNavKind {
     Overview,
 }
 
+/// Updated each frame during wiki/overview render for page-scroll key handling.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WikiScrollMetrics {
+    pub content_visible: u16,
+    pub nav_visible: u16,
+    pub content_lines: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct WikiBrowser {
     pub session_id: String,
@@ -27,6 +35,7 @@ pub struct WikiBrowser {
     pub focus: WikiFocus,
     /// File inventory for the full wiki viewer screen.
     pub files: Vec<String>,
+    pub scroll_metrics: WikiScrollMetrics,
     nav_kind: WikiNavKind,
 }
 
@@ -173,6 +182,64 @@ impl WikiBrowser {
         }
     }
 
+    fn content_page_lines(&self) -> usize {
+        self.scroll_metrics.content_visible.max(5) as usize
+    }
+
+    fn nav_page_items(&self) -> usize {
+        self.scroll_metrics.nav_visible.max(1) as usize
+    }
+
+    pub fn scroll_content_by_page(&mut self, delta: i16) {
+        let vis = self.content_page_lines();
+        let max = self
+            .scroll_metrics
+            .content_lines
+            .saturating_sub(vis);
+        if delta < 0 {
+            self.scroll = self.scroll.saturating_sub(vis);
+        } else {
+            self.scroll = (self.scroll + vis).min(max);
+        }
+    }
+
+    pub fn scroll_content_home(&mut self) {
+        self.scroll = 0;
+    }
+
+    pub fn scroll_content_end(&mut self) {
+        let vis = self.content_page_lines();
+        self.scroll = self
+            .scroll_metrics
+            .content_lines
+            .saturating_sub(vis);
+    }
+
+    pub fn scroll_nav_by_page(&mut self, delta: i16) {
+        if self.nav_items.is_empty() {
+            return;
+        }
+        let page = self.nav_page_items();
+        let n = self.nav_items.len();
+        if delta < 0 {
+            self.selected_nav = self.selected_nav.saturating_sub(page);
+        } else {
+            self.selected_nav = (self.selected_nav + page).min(n - 1);
+        }
+    }
+
+    pub fn scroll_nav_home(&mut self) {
+        if !self.nav_items.is_empty() {
+            self.selected_nav = 0;
+        }
+    }
+
+    pub fn scroll_nav_end(&mut self) {
+        if !self.nav_items.is_empty() {
+            self.selected_nav = self.nav_items.len() - 1;
+        }
+    }
+
     /// Seed viewer file before opening the full wiki viewer from overview.
     pub fn seed_viewer_file(&mut self, session_id: &str, target_file: &str) {
         self.session_id = session_id.to_string();
@@ -185,6 +252,42 @@ impl WikiBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn content_page_scroll_clamps_to_end() {
+        let mut b = WikiBrowser::default();
+        b.scroll_metrics = WikiScrollMetrics {
+            content_visible: 10,
+            nav_visible: 5,
+            content_lines: 25,
+        };
+        b.scroll = 0;
+        b.scroll_content_by_page(1);
+        assert_eq!(b.scroll, 10);
+        b.scroll_content_end();
+        assert_eq!(b.scroll, 15);
+        b.scroll_content_home();
+        assert_eq!(b.scroll, 0);
+    }
+
+    #[test]
+    fn nav_page_scroll_moves_selection() {
+        let mut b = WikiBrowser::default();
+        b.nav_items = vec![
+            WikiNavItem::default(),
+            WikiNavItem::default(),
+            WikiNavItem::default(),
+            WikiNavItem::default(),
+        ];
+        b.scroll_metrics.nav_visible = 2;
+        b.selected_nav = 0;
+        b.scroll_nav_by_page(1);
+        assert_eq!(b.selected_nav, 2);
+        b.scroll_nav_end();
+        assert_eq!(b.selected_nav, 3);
+        b.scroll_nav_home();
+        assert_eq!(b.selected_nav, 0);
+    }
 
     #[test]
     fn harness_detection_uses_nav_items() {
