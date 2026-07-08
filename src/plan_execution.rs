@@ -195,9 +195,10 @@ fn subdir_project_score(dir: &Path) -> i32 {
 fn is_plausible_project_root_name(name: &str) -> bool {
     !name.is_empty()
         && !name.starts_with('.')
+        && !name.starts_with('-')
         && !NESTED_PROJECT_DIR_NAMES.contains(&name)
         && !STANDALONE_TOKEN_NOISE.contains(&name)
-        && !matches!(name, "target" | "node_modules" | "dist" | "build")
+        && !matches!(name, "target" | "node_modules" | "dist" | "build" | "&&" | "||")
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
@@ -802,6 +803,16 @@ mod tests {
         let (cwd, cmd) = resolve_verification_cwd("ls src/", ws, Some("galaga"));
         assert_eq!(cwd, Path::new("/tmp/ws/galaga"));
         assert_eq!(cmd, "ls src/");
+    }
+
+    #[test]
+    fn infer_project_workdir_ignores_test_d_flag_tokens() {
+        let steps = vec![PlanStepData {
+            description: "Create project directory structure".into(),
+            verification: Some("test -d src && test -d include && test -d assets".into()),
+            ..Default::default()
+        }];
+        assert_eq!(infer_project_workdir_from_steps(&steps), None);
     }
 
     #[test]

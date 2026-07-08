@@ -258,6 +258,26 @@ impl SteeringState {
             };
         }
 
+        // 2b. Active plan execution: nudge before judge/define_done (criteria must not end the turn mid-step)
+        if plan_execution_incomplete(ctx)
+            && ctx.agent_mode == "work"
+            && self.has_round_budget()
+        {
+            let step = ctx.plan_current_step + 1;
+            let total = ctx.plan_total_steps;
+            self.text_nudges += 1;
+            return SteeringDecision::Nudge {
+                message: format!(
+                    "{PLAN_EXECUTION_NUDGE}\n\nCurrent plan step: {step} of {total}."
+                ),
+                use_continuation_nudge: true,
+                nudge_count: self.text_nudges,
+                nudge_max: MAX_TEXT_NUDGES,
+                log_event: "nudge".into(),
+                log_detail: format!("plan-execution nudge at step {step}/{total}"),
+            };
+        }
+
         // 3. Criteria-based judge
         // Skip in plan mode — we are still in clarification; judge/define_done criteria
         // should not force completion or nudges until after "proceed".
@@ -270,13 +290,14 @@ impl SteeringState {
         }
 
         // 4. Define-done reminder (no criteria yet, judge enabled, past round 1)
-        // Skip in plan mode.
+        // Skip in plan mode and during plan execution.
         if ctx.criteria.is_none()
             && self.total_rounds > 1
             && ctx.has_session
             && self.enable_judge
             && self.judge_nudges < NUDGE_BUDGET
-            && ctx.agent_mode != "plan" {
+            && ctx.agent_mode != "plan"
+            && !plan_execution_incomplete(ctx) {
                 self.judge_nudges += 1;
                 return SteeringDecision::Nudge {
                     message: DEFINE_DONE_REMINDER.into(),
@@ -347,26 +368,7 @@ impl SteeringState {
             return self.decide_ambiguous_stop(ctx, recent);
         }
 
-        // 9. Active plan execution: do not accept text-only stop mid-step
-        if plan_execution_incomplete(ctx)
-            && ctx.agent_mode == "work"
-            && self.has_round_budget()
-        {
-            let step = ctx.plan_current_step + 1;
-            let total = ctx.plan_total_steps;
-            return SteeringDecision::Nudge {
-                message: format!(
-                    "{PLAN_EXECUTION_NUDGE}\n\nCurrent plan step: {step} of {total}."
-                ),
-                use_continuation_nudge: true,
-                nudge_count: self.text_nudges,
-                nudge_max: MAX_TEXT_NUDGES,
-                log_event: "nudge".into(),
-                log_detail: format!("plan-execution nudge at step {step}/{total}"),
-            };
-        }
-
-        // 10. Natural completion
+        // 9. Natural completion
         SteeringDecision::Accept {
             clear_criteria: false,
         }
@@ -846,6 +848,23 @@ mod tests {
         assert!(
             matches!(d, SteeringDecision::Nudge { .. }),
             "expected nudge during plan execution, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn plan_execution_nudge_beats_criteria_judge() {
+        let mut s = basic_state();
+        s.total_rounds = 5;
+        let mut ctx = plan_exec_round(
+            "Verification passed. I should call complete_plan_step for step 5.",
+            4,
+            7,
+        );
+        ctx.criteria = Some("cmake --build build".into());
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        assert!(
+            matches!(d, SteeringDecision::Nudge { .. }),
+            "plan execution nudge must run before criteria judge, got {d:?}"
         );
     }
 

@@ -177,6 +177,12 @@ impl DesktopState {
         self.active = ActiveDesktop::Splash;
     }
 
+    /// Cancel any slide animation and jump directly to splash.
+    pub fn jump_to_splash(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Splash;
+    }
+
     /// Advance the slide by one frame. Returns `true` while animation continues.
     /// Inserts a 250ms pause when reaching the halfway frame so the split view
     /// is briefly visible before the transition completes automatically.
@@ -233,6 +239,18 @@ pub fn load_raven_art() -> String {
         }
     }
     include_str!("../assets/raven.txt").to_string()
+}
+
+/// Load splash layout chunk: prefer `/tmp/chunk2`, then `/tmp/chunk`, then bundled default.
+pub fn load_splash_chunk() -> String {
+    for path in ["/tmp/chunk2", "/tmp/chunk"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if !s.trim().is_empty() {
+                return s;
+            }
+        }
+    }
+    crate::splash_chunk::default_splash_chunk()
 }
 
 #[cfg(test)]

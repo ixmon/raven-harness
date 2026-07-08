@@ -83,10 +83,13 @@ fn detect() -> ColorDepth {
     let in_gnu_screen = std::env::var("STY").is_ok() || term.starts_with("screen");
     let in_tmux = std::env::var("TMUX").is_ok() || term.starts_with("tmux");
 
-    // 5. GNU screen: its 256-color indexed escape handling is broken — it
-    //    claims 256 via `tput colors` but mangles the actual SGR sequences,
-    //    producing garbled backgrounds. Cap at Ansi16 which it handles fine.
+    // 5. GNU screen: plain `screen` terminfo is safest at 16 colors. When the
+    //    term advertises 256 (`screen-256color`, `screen.xterm-256color`), use
+    //    the indexed palette — it usually works and gives us the grayscale ramp.
     if in_gnu_screen {
+        if term.contains("256") {
+            return ColorDepth::Indexed256;
+        }
         return ColorDepth::Ansi16;
     }
 
@@ -139,6 +142,16 @@ fn tput_colors() -> Option<u32> {
 /// and `Color::Default` pass through unchanged; `Color::Rgb` is downsampled
 /// when the depth is less than `True`.
 pub fn resolve(c: Color) -> Color {
+    resolve_with_bg_hint(c, false)
+}
+
+/// Like [`resolve`], but when downsampling to 16 colors keeps very dark
+/// neutral backgrounds on `DarkGray` instead of invisible `Black`.
+pub fn resolve_bg(c: Color) -> Color {
+    resolve_with_bg_hint(c, true)
+}
+
+fn resolve_with_bg_hint(c: Color, for_bg: bool) -> Color {
     match depth() {
         ColorDepth::True => c,
         ColorDepth::None => match c {
@@ -165,7 +178,13 @@ pub fn resolve(c: Color) -> Color {
             other => other,
         },
         ColorDepth::Ansi16 => match c {
-            Color::Rgb(r, g, b) => nearest_16(r, g, b),
+            Color::Rgb(r, g, b) => {
+                if for_bg {
+                    nearest_16_bg(r, g, b)
+                } else {
+                    nearest_16(r, g, b)
+                }
+            }
             Color::Black => Color::Black,
             Color::Red => Color::Red,
             Color::Green => Color::Green,
@@ -230,7 +249,7 @@ impl<B: Backend> Backend for PaletteBackend<B> {
                     .map(|(x, y, cell)| {
                         let mut c = cell.clone();
                         c.fg = resolve(c.fg);
-                        c.bg = resolve(c.bg);
+                        c.bg = resolve_bg(c.bg);
                         // GNU screen renders ITALIC as reverse video (swaps
                         // fg/bg), producing garbled pink backgrounds. Strip
                         // it when we're downsampling — the text is still
@@ -355,6 +374,18 @@ fn dist(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> u32 {
 /// "pick hue then decide bright" approach which incorrectly maps light
 /// purples (e.g. thinking text 0xd0,0xa0,0xff) to White instead of
 /// LightMagenta.
+/// 16-color background mapping: avoid collapsing subtle dark grays to Black.
+fn nearest_16_bg(r: u8, g: u8, b: u8) -> Color {
+    let base = nearest_16(r, g, b);
+    if base == Color::Black {
+        let lum = u32::from(r) + u32::from(g) + u32::from(b);
+        if lum > 36 {
+            return Color::DarkGray;
+        }
+    }
+    base
+}
+
 fn nearest_16(r: u8, g: u8, b: u8) -> Color {
     const PALETTE: [(u8, u8, u8, Color); 16] = [
         (0, 0, 0, Color::Black),
@@ -404,6 +435,16 @@ mod tests {
     fn nearest_16_picks_white() {
         assert_eq!(nearest_16(250, 250, 250), Color::White);
     }
+    #[test]
+    fn nearest_16_bg_subtle_highlight_is_dark_gray() {
+        assert_eq!(nearest_16_bg(0x2a, 0x2a, 0x34), Color::DarkGray);
+    }
+
+    #[test]
+    fn nearest_16_bg_pure_black_stays_black() {
+        assert_eq!(nearest_16_bg(0, 0, 0), Color::Black);
+    }
+
     #[test]
     fn nearest_16_thinking_purple_is_magenta() {
         // The thinking text color (0xd0, 0xa0, 0xff) must map to LightMagenta,

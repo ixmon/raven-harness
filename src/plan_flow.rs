@@ -1,21 +1,21 @@
 //! Plan mode entry, proceed confirmation, and plan.md parsing.
 
-use crate::app_state::{App, Pane, PlanState, PlanStep, PlanStepStatus, PlanStepTier};
+use crate::app_state::{App, Pane};
+use crate::plan_state::{PlanLoopPhase, PlanState, PlanStep, PlanStepStatus, PlanStepTier};
 use raven_tui::chat_backend::ChatBackend;
 use raven_tui::plan_intent::{
-    classify_plan_answer, classify_plan_entry_intent, classify_plan_proceed_intent,
-    classify_proposal_consent, is_explicit_proceed_approval, PlanAnswerResolution,
-    PlanEntryIntent, PlanProceedIntent,
+    classify_plan_answer, classify_plan_entry_intent, classify_proposal_consent,
+    is_explicit_proceed_approval, PlanAnswerResolution, PlanEntryIntent, PlanProceedIntent,
 };
 use raven_tui::plan_loop::{fetch_clarification, fetch_proposal};
+use raven_tui::plan_verification::{improve_proposal, resolve_project_workdir};
 use raven_tui::plan_protocol::{
     format_proposal_for_user, format_question_for_user, PlanModelPayload, PlanProposal,
     PlanProposalStep, PlanQaEntry,
 };
 use raven_tui::runtime::RuntimeFlags;
 use raven_tui::agent::Agent;
-use raven_tui::plan_execution;
-use raven_tui::plan_md::{self, ParsedPlanStep, PlanExecutionState, PlanStepData, PLAN_STEPS_JSON_MARKER};
+use raven_tui::plan_md::{self, ParsedPlanStep, PLAN_STEPS_JSON_MARKER};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex as TokioMutex;
@@ -167,10 +167,11 @@ pub fn reset_plan_for_new_request(plan: &mut PlanState) {
     plan.verification_steps.clear();
     plan.rollback.clear();
     plan.constraints.clear();
+    plan.project_workdir = None;
     plan.steps.clear();
     plan.current_step = 0;
     plan.recap_offered = false;
-    plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+    plan.loop_phase = PlanLoopPhase::Idle;
     plan.initial_request.clear();
     plan.qa_history.clear();
     plan.pending_question = None;
@@ -185,7 +186,7 @@ fn start_json_plan_loop(plan: &mut PlanState, initial_request: &str) {
     plan.pending_proposal = None;
     plan.recap_offered = false;
     plan.steps.clear();
-    plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingQuestion;
+    plan.loop_phase = PlanLoopPhase::FetchingQuestion;
 }
 
 /// True when assistant text invited the user to approve the plan for execution.
@@ -233,207 +234,7 @@ pub fn parse_plan_steps_json(json: &str) -> Option<Vec<ParsedPlanStep>> {
     plan_md::parse_plan_steps_json(json)
 }
 
-pub fn format_plan_steps_json_block(steps: &[PlanStep]) -> String {
-    let data: Vec<PlanStepData> = steps.iter().map(plan_step_to_data).collect();
-    plan_md::format_plan_steps_json_block(&data)
-}
-
-/// User message when starting work mode after plan approval (includes step list).
-pub fn format_plan_execution_user_prompt(plan: &PlanState, workspace: &std::path::Path) -> String {
-    let mut lines = vec![
-        "Execute the approved plan.".to_string(),
-        format!("Goal: {}", plan.goal),
-    ];
-    if !plan.success_criteria.is_empty() {
-        lines.push(format!("Success criteria: {}", plan.success_criteria));
-    }
-    let steps_data: Vec<PlanStepData> = plan.steps.iter().map(plan_step_to_data).collect();
-    let workdir = plan_execution::detect_project_workdir(workspace, &steps_data);
-    lines.push(String::new());
-    lines.push(plan_execution::format_deliverable_location_section(
-        workspace,
-        workdir.as_deref(),
-    ));
-    if !plan.steps.is_empty() {
-        lines.push(String::new());
-        lines.push(
-            "Approved steps (one at a time; call complete_plan_step when each is done):".to_string(),
-        );
-        for (i, step) in plan.steps.iter().enumerate() {
-            let n = i + 1;
-            let tier = step.tier.map(|t| t.as_str()).unwrap_or("exec");
-            let verify = step
-                .verification
-                .as_deref()
-                .or(step.observe_prompt.as_deref())
-                .unwrap_or("—");
-            let cur = if i == plan.current_step {
-                " ← CURRENT"
-            } else {
-                ""
-            };
-            lines.push(format!(
-                "  {n}. {} [{tier}: {verify}]{cur}",
-                step.description
-            ));
-        }
-    }
-    lines.push(String::new());
-    lines.push(
-        "Canonical plan: session wiki plan.md (read with wiki=true). \
-         Follow the approved steps — they define which paths to use."
-            .to_string(),
-    );
-    let step_num = plan.current_step.saturating_add(1);
-    lines.push(format!("Begin with step {step_num}."));
-    lines.join("\n")
-}
-
-pub fn plan_state_to_execution(plan: &PlanState, workspace: &std::path::Path) -> PlanExecutionState {
-    let steps: Vec<PlanStepData> = plan.steps.iter().map(plan_step_to_data).collect();
-    let project_workdir = plan_execution::detect_project_workdir(workspace, &steps);
-    PlanExecutionState {
-        active: plan.active && !plan.steps.is_empty(),
-        steps,
-        current_step: plan.current_step,
-        project_workdir,
-        pending_observe_prompt: plan.pending_observe_prompt.clone(),
-        pending_observe_step: plan.pending_observe_step,
-    }
-}
-
-pub fn apply_execution_to_plan(plan: &mut PlanState, exec: &PlanExecutionState) {
-    plan.current_step = exec.current_step;
-    plan.pending_observe_prompt = exec.pending_observe_prompt.clone();
-    plan.pending_observe_step = exec.pending_observe_step;
-    for (i, data) in exec.steps.iter().enumerate() {
-        if let Some(step) = plan.steps.get_mut(i) {
-            apply_data_to_plan_step(step, data);
-        }
-    }
-}
-
-/// Apply durable PASS lines from `wiki/plan.md` onto in-memory plan progress.
-pub fn apply_execution_log_to_plan(plan: &mut PlanState, wiki_content: &str) {
-    if plan.steps.is_empty() {
-        return;
-    }
-    let passed = plan_md::parse_execution_log_passed_steps(wiki_content);
-    if passed.is_empty() {
-        return;
-    }
-    for &n in &passed {
-        if let Some(step) = plan.steps.get_mut(n - 1) {
-            step.status = PlanStepStatus::Done;
-        }
-    }
-    let highest = *passed.iter().max().unwrap();
-    let new_current = highest.min(plan.steps.len());
-    if new_current > plan.current_step {
-        plan.current_step = new_current;
-    }
-    if plan.current_step < plan.steps.len()
-        && plan.steps[plan.current_step].status != PlanStepStatus::Done
-    {
-        plan.steps[plan.current_step].status = PlanStepStatus::InProgress;
-    }
-}
-
-/// Merge wiki execution log + agent execution state into the TUI plan pane (never regress).
-pub fn reconcile_plan_execution(
-    plan: &mut PlanState,
-    agent: &Agent,
-    wiki_content: Option<&str>,
-) {
-    if !plan.active || plan.steps.is_empty() {
-        return;
-    }
-    if let Some(wiki) = wiki_content {
-        apply_execution_log_to_plan(plan, wiki);
-    }
-    let exec = agent.plan_execution();
-    if exec.active
-        && !exec.steps.is_empty()
-        && exec.steps.len() == plan.steps.len()
-        && exec.current_step > plan.current_step
-    {
-        apply_execution_to_plan(plan, exec);
-    } else if exec.active
-        && !exec.steps.is_empty()
-        && exec.steps.len() == plan.steps.len()
-    {
-        for (i, data) in exec.steps.iter().enumerate() {
-            if let Some(step) = plan.steps.get_mut(i) {
-                if data.status == "done" && step.status != PlanStepStatus::Done {
-                    step.status = PlanStepStatus::Done;
-                }
-            }
-        }
-    }
-}
-
-pub fn sync_plan_to_agent(agent: &mut Agent, plan: &PlanState, workspace: &std::path::Path) {
-    let incoming = plan_state_to_execution(plan, workspace);
-    let existing = agent.plan_execution();
-    if incoming.active
-        && !incoming.steps.is_empty()
-        && existing.active
-        && !existing.steps.is_empty()
-        && existing.steps.len() == incoming.steps.len()
-        && existing.current_step > incoming.current_step
-    {
-        let mut merged = existing.clone();
-        if merged.project_workdir.is_none() {
-            merged.project_workdir = incoming.project_workdir;
-        }
-        for (i, step) in merged.steps.iter_mut().enumerate() {
-            if let Some(in_step) = incoming.steps.get(i) {
-                if in_step.status == "done" {
-                    step.status = "done".to_string();
-                }
-            }
-        }
-        merged.current_step = merged.current_step.max(incoming.current_step);
-        if merged.current_step < merged.steps.len()
-            && merged.steps[merged.current_step].status != "done"
-        {
-            merged.steps[merged.current_step].status = "in_progress".to_string();
-        }
-        agent.set_plan_execution(merged);
-        return;
-    }
-    agent.set_plan_execution(incoming);
-}
-
-pub fn sync_plan_from_agent(plan: &mut PlanState, agent: &Agent) {
-    apply_execution_to_plan(plan, agent.plan_execution());
-}
-
-fn plan_step_to_data(step: &PlanStep) -> PlanStepData {
-    PlanStepData {
-        description: step.description.clone(),
-        verification: step.verification.clone(),
-        tier: step.tier.map(|t| t.as_str().to_string()),
-        note: step.note.clone(),
-        observe_prompt: step.observe_prompt.clone(),
-        status: match step.status {
-            PlanStepStatus::Done => "done".to_string(),
-            PlanStepStatus::Failed => "failed".to_string(),
-            PlanStepStatus::InProgress => "in_progress".to_string(),
-            PlanStepStatus::Pending => "pending".to_string(),
-        },
-    }
-}
-
-fn apply_data_to_plan_step(step: &mut PlanStep, data: &PlanStepData) {
-    step.status = match data.status.as_str() {
-        "done" => PlanStepStatus::Done,
-        "failed" => PlanStepStatus::Failed,
-        "in_progress" => PlanStepStatus::InProgress,
-        _ => PlanStepStatus::Pending,
-    };
-    step.tier = data.tier.as_deref().and_then(PlanStepTier::parse);
-}
+use crate::plan_prompts::{format_plan_execution_user_prompt, format_plan_status};
 
 fn parsed_step_to_plan_step(step: ParsedPlanStep) -> PlanStep {
     let tier = step.tier.as_deref().and_then(PlanStepTier::parse);
@@ -638,82 +439,6 @@ pub fn derive_fallback_steps(goal: &str, verif: &[String]) -> Vec<PlanStep> {
     ]
 }
 
-fn format_verification_list(verification: &[String]) -> String {
-    verification
-        .iter()
-        .map(|v| format!("- {}", v))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn plan_steps_section_skeleton() -> String {
-    format!(
-        "## Steps\n{}\n",
-        format_plan_steps_json_block(&[PlanStep {
-            description: "(Agent will fill during clarification)".to_string(),
-            verification: Some("(propose runnable command per step)".to_string()),
-            tier: Some(PlanStepTier::Exec),
-            note: None,
-            observe_prompt: None,
-            status: PlanStepStatus::Pending,
-        }])
-    )
-}
-
-fn wiki_template_on_entry(plan: &PlanState) -> String {
-    format!(
-        "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n## Verification\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n{}\n## Notes\n\n(Agent will refine this during clarification. Final approved version written on 'proceed'.)\n",
-        plan.goal,
-        plan.success_criteria,
-        format_verification_list(&plan.verification_steps),
-        plan.rollback,
-        plan.constraints,
-        plan_steps_section_skeleton()
-    )
-}
-
-fn wiki_template_on_trigger(goal: &str) -> String {
-    format!(
-        "# Plan\n\n**Goal:** {}\n\n*Template will be expanded on confirmation.*",
-        goal
-    )
-}
-
-fn format_step_human_summary(st: &PlanStep, index: usize) -> String {
-    let tier = st
-        .tier
-        .map(|t| t.as_str())
-        .unwrap_or("exec");
-    let verify = st
-        .verification
-        .as_deref()
-        .or(st.observe_prompt.as_deref())
-        .unwrap_or("");
-    format!("{}. {} [{}: {}]", index + 1, st.description, tier, verify)
-}
-
-fn wiki_template_approved(plan: &PlanState) -> String {
-    let verif = format_verification_list(&plan.verification_steps);
-    let steps_human = plan
-        .steps
-        .iter()
-        .enumerate()
-        .map(|(i, st)| format_step_human_summary(st, i))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let steps_json = format_plan_steps_json_block(&plan.steps);
-    format!(
-        "# Plan\n\n**Goal:** {}\n\n**Success Criteria:** {}\n\n## Verification\n{}\n\n**Rollback:** {}\n\n**Constraints:** {}\n\n## Steps\n{}\n{}\n## Execution Log\n\n(Added as work proceeds after 'proceed'.)\n",
-        plan.goal,
-        plan.success_criteria,
-        verif,
-        plan.rollback,
-        plan.constraints,
-        steps_human,
-        steps_json
-    )
-}
-
 /// Handle y/n response for pending plan mode entry. Returns input to re-submit if confirmed.
 pub fn handle_plan_entry_confirmation(
     app: &mut App,
@@ -754,7 +479,7 @@ pub fn handle_plan_entry_confirmation(
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
-            let _ = s.write_wiki_file("plan.md", &wiki_template_on_entry(&app.plan));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_on_entry(&app.plan));
             app.left_committed.push(
                 "Plan written to session wiki/plan.md (you can edit externally too)".to_string(),
             );
@@ -835,7 +560,7 @@ pub fn handle_plan_loop_model_payload(
     match payload {
         PlanModelPayload::Clarify { question } => {
             app.plan.pending_question = Some(question.clone());
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::AwaitingUserAnswer;
+            app.plan.loop_phase = PlanLoopPhase::AwaitingUserAnswer;
             app.left_committed
                 .push(format_question_for_user(&question));
             app.needs_redraw = true;
@@ -844,7 +569,7 @@ pub fn handle_plan_loop_model_payload(
             if let Some(m) = message {
                 app.left_committed.push(m);
             }
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::FetchingProposal;
+            app.plan.loop_phase = PlanLoopPhase::FetchingProposal;
             app.needs_redraw = true;
         }
         PlanModelPayload::Proposal(proposal) => {
@@ -853,17 +578,45 @@ pub fn handle_plan_loop_model_payload(
     }
 }
 
-fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, proposal: PlanProposal) {
+fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal: PlanProposal) {
+    let workdir = resolve_project_workdir(
+        &app.plan.initial_request,
+        &app.plan.qa_history,
+        &proposal.steps,
+    );
+    app.plan.project_workdir = workdir.clone();
+    let report = improve_proposal(&mut proposal, workdir.as_deref());
     apply_proposal_to_plan(&mut app.plan, &proposal);
     app.plan.pending_proposal = Some(proposal.clone());
     app.plan.recap_offered = true;
-    app.plan.loop_phase = crate::app_state::PlanLoopPhase::AwaitingProceedConsent;
-    app.left_committed
-        .push(format_proposal_for_user(&proposal));
+    app.plan.loop_phase = PlanLoopPhase::AwaitingProceedConsent;
+    let mut recap = format_proposal_for_user(&proposal);
+    if let Some(wd) = &app.plan.project_workdir {
+        recap.push_str(&format!("\n\n📁 **Project directory:** `{wd}/` (all deliverables here)\n"));
+    }
+    if !report.fixes.is_empty() {
+        recap.push_str("\n\n⚙ Harness adjusted verifications:\n");
+        for fix in &report.fixes {
+            recap.push_str(&format!("  • {fix}\n"));
+        }
+    }
+    if !report.errors.is_empty() {
+        recap.push_str("\n\n⚠ Remaining verification issues (please revise before proceed):\n");
+        for err in &report.errors {
+            recap.push_str(&format!("  • {err}\n"));
+        }
+    }
+    if !report.warnings.is_empty() {
+        recap.push_str("\n\n💡 Verification advisories (non-blocking, review before proceed):\n");
+        for w in &report.warnings {
+            recap.push_str(&format!("  • {w}\n"));
+        }
+    }
+    app.left_committed.push(recap);
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
-            let _ = s.write_wiki_file("plan.md", &wiki_template_approved(&app.plan));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_approved(&app.plan));
             let _ = s.update_goal(
                 &app.plan.goal,
                 Some(app.plan.verification_steps.clone()),
@@ -887,7 +640,7 @@ pub fn apply_plan_clarify_done(
     match result {
         Ok(payload) => handle_plan_loop_model_payload(app, agent, payload),
         Err(e) => {
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+            app.plan.loop_phase = PlanLoopPhase::Idle;
             app.left_committed
                 .push(format!("Plan clarify failed: {e}"));
             app.needs_redraw = true;
@@ -909,11 +662,11 @@ pub fn apply_plan_proposal_done(
             app.left_committed.push(format!(
                 "Plan proposal returned unexpected type: {other:?}"
             ));
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+            app.plan.loop_phase = PlanLoopPhase::Idle;
             app.needs_redraw = true;
         }
         Err(e) => {
-            app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+            app.plan.loop_phase = PlanLoopPhase::Idle;
             app.left_committed
                 .push(format!("Plan proposal failed: {e}"));
             app.needs_redraw = true;
@@ -922,7 +675,7 @@ pub fn apply_plan_proposal_done(
 }
 
 pub fn apply_plan_exit_discuss(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
-    app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+    app.plan.loop_phase = PlanLoopPhase::Idle;
     app.plan.pending_question = None;
     if let Ok(mut ag) = agent.try_lock() {
         ag.set_agent_mode("talk");
@@ -935,7 +688,7 @@ pub fn apply_plan_exit_discuss(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
     app.needs_redraw = true;
 }
 
-fn mark_plan_fetching(app: &mut App, phase: crate::app_state::PlanLoopPhase, trace: &str) {
+fn mark_plan_fetching(app: &mut App, phase: PlanLoopPhase, trace: &str) {
     app.plan.loop_phase = phase;
     app.current_response = "⠋ Planning…\n".to_string();
     app.left_follow_output = true;
@@ -982,7 +735,7 @@ pub fn spawn_fetch_clarification(
 ) {
     mark_plan_fetching(
         app,
-        crate::app_state::PlanLoopPhase::FetchingQuestion,
+        PlanLoopPhase::FetchingQuestion,
         "📋 Plan: fetching clarification…",
     );
     let initial = app.plan.initial_request.clone();
@@ -1027,7 +780,7 @@ fn spawn_plan_answer_work(
 ) {
     mark_plan_fetching(
         app,
-        crate::app_state::PlanLoopPhase::FetchingQuestion,
+        PlanLoopPhase::FetchingQuestion,
         "📋 Plan: classifying answer…",
     );
     tokio::spawn(async move {
@@ -1062,11 +815,11 @@ fn spawn_plan_answer_work(
 /// Synchronous plan-loop submit: updates UI immediately and returns whether to spawn background work.
 pub fn submit_plan_loop_input(
     app: &mut App,
-    agent: &Arc<TokioMutex<Agent>>,
+    _agent: &Arc<TokioMutex<Agent>>,
     user_input: &str,
 ) -> PlanLoopUserOutcome {
     match app.plan.loop_phase {
-        crate::app_state::PlanLoopPhase::AwaitingUserAnswer => {
+        PlanLoopPhase::AwaitingUserAnswer => {
             let question = match app.plan.pending_question.take() {
                 Some(q) => q,
                 None => return PlanLoopUserOutcome::Consumed,
@@ -1078,13 +831,9 @@ pub fn submit_plan_loop_input(
                 question,
             }
         }
-        crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
+        PlanLoopPhase::AwaitingProceedConsent => {
             app.left_committed.push(format!("> {}", user_input));
             if is_explicit_proceed_approval(user_input) {
-                confirm_plan_proceed(app, agent);
-                app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
-                app.plan.pending_proposal = None;
-                app.plan.recap_offered = false;
                 app.needs_redraw = true;
                 return PlanLoopUserOutcome::StartExecution;
             }
@@ -1107,7 +856,7 @@ pub fn spawn_proceed_feedback_work(
 ) {
     mark_plan_fetching(
         app,
-        crate::app_state::PlanLoopPhase::FetchingProposal,
+        PlanLoopPhase::FetchingProposal,
         "📋 Plan: interpreting feedback…",
     );
     app.plan.pending_proposal = None;
@@ -1139,7 +888,7 @@ pub fn spawn_proceed_feedback_work(
 pub fn plan_loop_active(plan: &PlanState) -> bool {
     !matches!(
         plan.loop_phase,
-        crate::app_state::PlanLoopPhase::Idle
+        PlanLoopPhase::Idle
     )
 }
 
@@ -1181,7 +930,7 @@ pub fn open_plan_entry_dialog(
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = &mut ag.session_mut() {
             s.meta.current_goal = goal_text.clone();
-            let _ = s.write_wiki_file("plan.md", &wiki_template_on_trigger(&goal_text));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_on_trigger(&goal_text));
             let _ = s.save_meta();
         }
     }
@@ -1215,44 +964,6 @@ pub fn apply_plan_entry_modal_response(
     handle_plan_entry_confirmation(app, agent, "y", Some(goal))
 }
 
-/// Format plan pane state for `/plan status`.
-pub fn format_plan_status(plan: &PlanState, agent_mode: &str) -> String {
-    let mut lines = vec![format!("Plan status (run mode: {})", agent_mode)];
-    if !plan.goal.is_empty() {
-        lines.push(format!("  Goal: {}", plan.goal));
-    }
-    if !plan.success_criteria.is_empty() {
-        lines.push(format!("  Success criteria: {}", plan.success_criteria));
-    }
-    if !plan.verification_steps.is_empty() {
-        lines.push("  Verification:".to_string());
-        for v in plan.verification_steps.iter().take(5) {
-            lines.push(format!("    • {}", v));
-        }
-    }
-    if plan.steps.is_empty() {
-        lines.push("  Steps: (not approved yet)".to_string());
-    } else {
-        lines.push(format!(
-            "  Steps: {}/{} complete (current: {})",
-            plan.steps.iter().filter(|s| s.status == PlanStepStatus::Done).count(),
-            plan.steps.len(),
-            plan.current_step + 1
-        ));
-        for (i, st) in plan.steps.iter().enumerate().take(5) {
-            let tier = st
-                .tier
-                .map(|t| t.as_str())
-                .unwrap_or("exec");
-            lines.push(format!("    {}. {} [{}]", i + 1, st.description, tier));
-        }
-    }
-    if let Some(p) = &plan.pending_observe_prompt {
-        lines.push(format!("  Awaiting observation: {}", p));
-    }
-    lines.join("\n")
-}
-
 /// Exit plan mode / clear pending entry ( `/plan cancel` ).
 pub fn cancel_plan_mode(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
     if app.plan_entry_dialog_open() {
@@ -1275,7 +986,7 @@ pub fn cancel_plan_mode(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
         app.plan.active = false;
         reset_plan_for_new_request(&mut app.plan);
     } else {
-        app.plan.loop_phase = crate::app_state::PlanLoopPhase::Idle;
+        app.plan.loop_phase = PlanLoopPhase::Idle;
         app.plan.pending_question = None;
         app.plan.pending_proposal = None;
     }
@@ -1324,22 +1035,6 @@ pub fn dispatch_plan_slash(
     }
 }
 
-/// Detect natural-language plan intent and open the confirmation dialog (sync heuristic only).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn try_open_plan_entry_dialog(
-    app: &mut App,
-    agent: &Arc<TokioMutex<Agent>>,
-    prompt: &str,
-) -> bool {
-    if app.plan.active || app.plan_entry_dialog_open() {
-        return false;
-    }
-    if !is_plan_trigger_phrase(prompt) {
-        return false;
-    }
-    open_plan_entry_dialog(app, agent, Some(prompt.to_string()))
-}
-
 /// After heuristic plan-trigger match, optionally disambiguate with a cheap LLM call.
 pub async fn route_plan_entry_intent(
     app: &mut App,
@@ -1368,60 +1063,53 @@ pub async fn route_plan_entry_intent(
     }
 }
 
-/// While in plan mode, classify proceed vs clarify vs cancel before agent submit.
-#[allow(dead_code)]
-pub async fn route_plan_proceed_intent(
-    app: &mut App,
-    agent: &Arc<TokioMutex<Agent>>,
-    backend: &Arc<Mutex<ChatBackend>>,
-    flags: &RuntimeFlags,
-    prompt: &str,
-) -> PlanInputRouting {
-    let current_mode = agent
-        .try_lock()
-        .map(|ag| ag.current_agent_mode())
-        .unwrap_or_default();
-    if current_mode != "plan" {
-        return PlanInputRouting::Pass;
+/// When all steps are done: switch to talk mode and keep the pane until the next user message.
+pub fn maybe_finalize_plan_execution(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
+    if !app.plan.is_execution_complete() || app.plan.dismiss_pane_on_next_input {
+        return;
     }
-
-    // Planning requests and clarification answers are not proceed approvals.
-    if is_plan_trigger_phrase(prompt) || raven_tui::plan_intent::is_clarification_response(prompt) {
-        return PlanInputRouting::Continue;
-    }
-
-    if !app.plan.recap_offered {
-        return PlanInputRouting::Continue;
-    }
-
-    let goal = app.plan.goal.clone();
-    let intent = if raven_tui::plan_intent::is_explicit_proceed_approval(prompt) {
-        PlanProceedIntent::Proceed
-    } else if raven_tui::plan_intent::is_soft_proceed_candidate(prompt) {
-        classify_plan_proceed_intent(backend, flags, prompt, &goal).await
-    } else {
-        PlanProceedIntent::ContinuePlanning
-    };
-
-    match intent {
-        PlanProceedIntent::Proceed => {
-            confirm_plan_proceed(app, agent);
-            app.plan.recap_offered = false;
-            PlanInputRouting::Continue
+    app.plan.dismiss_pane_on_next_input = true;
+    if let Ok(mut ag) = agent.try_lock() {
+        if ag.current_agent_mode() == "work" {
+            ag.set_agent_mode("talk");
+            if let Some(s) = ag.session_mut() {
+                let _ = s.save_meta();
+            }
         }
-        PlanProceedIntent::Cancel => {
-            app.left_committed.push(format!("> {}", prompt));
-            cancel_plan_mode(app, agent);
-            app.clear_input();
-            app.needs_redraw = true;
-            PlanInputRouting::Stop
-        }
-        PlanProceedIntent::ContinuePlanning => PlanInputRouting::Continue,
+        let mut exec = ag.plan_execution().clone();
+        exec.active = false;
+        ag.set_plan_execution(exec);
+    }
+    app.left_committed
+        .push("✓ Plan complete — switched to talk mode.".to_string());
+    app.needs_redraw = true;
+}
+
+/// Hide the plan pane after the user sends their next message post-completion.
+pub fn dismiss_plan_pane_if_pending(app: &mut App) {
+    if app.plan.dismiss_pane_on_next_input {
+        app.plan.active = false;
+        app.plan.dismiss_pane_on_next_input = false;
+        app.needs_redraw = true;
     }
 }
 
-/// User approved the plan — switch to work mode and populate steps from plan.md.
-pub fn confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
+/// User approved the plan — switch to work mode, populate steps, return execution prompt.
+pub fn start_plan_execution(
+    app: &mut App,
+    agent: &Arc<TokioMutex<Agent>>,
+    workspace: &std::path::Path,
+) -> String {
+    approve_plan_for_execution(app, agent);
+    app.plan.loop_phase = PlanLoopPhase::Idle;
+    app.plan.pending_proposal = None;
+    app.plan.recap_offered = false;
+    app.left_committed
+        .push("▶ Plan approved — starting execution.".to_string());
+    format_plan_execution_user_prompt(&app.plan, workspace)
+}
+
+fn approve_plan_for_execution(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
     if let Ok(mut ag) = agent.try_lock() {
         ag.set_agent_mode("work");
         if let Some(s) = &mut ag.session_mut() {
@@ -1434,10 +1122,6 @@ pub fn confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
         populate_steps_on_proceed(app, agent);
     }
 
-    app.left_committed.push(
-        "Plan confirmed by user. Switching to work mode. Executing...".to_string(),
-    );
-
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = &mut ag.session_mut() {
             let _ = s.update_goal(
@@ -1447,20 +1131,6 @@ pub fn confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
             );
         }
     }
-}
-
-/// Sync heuristic proceed gate (tests / callers without LLM routing).
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn try_confirm_plan_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>, prompt: &str) -> bool {
-    let current_mode = agent
-        .try_lock()
-        .map(|ag| ag.current_agent_mode())
-        .unwrap_or_default();
-    if current_mode != "plan" || !is_proceed_confirmation(prompt) {
-        return false;
-    }
-    confirm_plan_proceed(app, agent);
-    true
 }
 
 fn populate_steps_on_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
@@ -1517,7 +1187,7 @@ fn populate_steps_on_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
-            let _ = s.write_wiki_file("plan.md", &wiki_template_approved(&app.plan));
+            let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_approved(&app.plan));
         }
     }
 }
@@ -1525,29 +1195,6 @@ fn populate_steps_on_proceed(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn execution_user_prompt_lists_steps_and_wiki_hint() {
-        let mut plan = PlanState::default();
-        plan.goal = "Build game".into();
-        plan.success_criteria = "Runs".into();
-        plan.current_step = 0;
-        plan.steps = vec![PlanStep {
-            description: "mkdir galaga".into(),
-            verification: Some("mkdir -p galaga".into()),
-            tier: Some(PlanStepTier::Exec),
-            status: PlanStepStatus::InProgress,
-            ..Default::default()
-        }];
-        let ws = std::env::temp_dir();
-        let prompt = format_plan_execution_user_prompt(&plan, &ws);
-        assert!(prompt.contains("mkdir galaga"));
-        assert!(prompt.contains("wiki plan.md"));
-        assert!(prompt.contains("← CURRENT"));
-        assert!(prompt.contains("Begin with step 1"));
-        assert!(prompt.contains("Deliverable location"));
-        assert!(prompt.contains("galaga/"));
-    }
 
     #[test]
     fn detects_various_plan_triggers() {
@@ -1682,51 +1329,10 @@ mod tests {
     }
 
     #[test]
-    fn format_plan_steps_json_block_roundtrip() {
-        let steps = vec![PlanStep {
-            description: "Ship it".to_string(),
-            verification: Some("cargo test".to_string()),
-            tier: Some(PlanStepTier::Exec),
-            note: None,
-            observe_prompt: None,
-            status: PlanStepStatus::Pending,
-        }];
-        let block = format_plan_steps_json_block(&steps);
-        assert!(block.contains(PLAN_STEPS_JSON_MARKER));
-        let json = extract_plan_steps_json(&block).expect("extract");
-        let parsed = parse_plan_steps_json(&json).expect("parse");
-        assert_eq!(parsed[0].description, "Ship it");
-        assert_eq!(parsed[0].tier.as_deref(), Some("exec"));
-    }
-
-    #[test]
     fn derive_fallback_steps_three_phases() {
         let steps = derive_fallback_steps("fix the bug", &["cargo test".to_string()]);
         assert_eq!(steps.len(), 3);
         assert!(steps[0].description.contains("Implement"));
-    }
-
-    #[test]
-    fn format_plan_status_shows_goal_and_steps() {
-        let mut plan = PlanState {
-            goal: "Ship feature".to_string(),
-            steps: vec![PlanStep {
-                description: "Implement".to_string(),
-                tier: Some(PlanStepTier::Exec),
-                status: PlanStepStatus::InProgress,
-                ..Default::default()
-            }],
-            current_step: 0,
-            ..Default::default()
-        };
-        let text = format_plan_status(&plan, "work");
-        assert!(text.contains("Ship feature"));
-        assert!(text.contains("Implement"));
-        assert!(text.contains("exec"));
-        plan.steps[0].status = PlanStepStatus::Done;
-        plan.current_step = 1;
-        let done = format_plan_status(&plan, "work");
-        assert!(done.contains("1/1 complete"));
     }
 
     #[test]
@@ -1759,108 +1365,6 @@ mod tests {
             "Shall we proceed with this plan, or would you like to make a change?"
         ));
         assert!(!detect_plan_recap_invite("Where should the project live?"));
-    }
-
-    #[test]
-    fn execution_log_hydrates_stale_plan_pane() {
-        let mut plan = PlanState {
-            active: true,
-            steps: (1..=8)
-                .map(|n| PlanStep {
-                    description: format!("step {n}"),
-                    status: PlanStepStatus::Pending,
-                    ..Default::default()
-                })
-                .collect(),
-            current_step: 3,
-            ..Default::default()
-        };
-        let wiki = r#"## Execution Log
-- Step 1 exec `true` → PASS
-- Step 2 exec `true` → PASS
-- Step 3 exec `true` → PASS
-- Step 4 exec `true` → PASS
-- Step 5 exec `true` → PASS
-- Step 6 exec `true` → PASS
-- Step 7 exec `true` → PASS
-- Step 8 exec `true` → PASS
-"#;
-        apply_execution_log_to_plan(&mut plan, wiki);
-        assert_eq!(plan.current_step, 8);
-        assert!(plan.steps.iter().all(|s| s.status == PlanStepStatus::Done));
-    }
-
-    #[test]
-    fn sync_plan_to_agent_does_not_regress_progress() {
-        use raven_tui::agent::Agent;
-        use raven_tui::chat_backend::{ChatBackend, MockChatBackend};
-        use raven_tui::config::{Config, ContextBudget, ContextSource};
-        use raven_tui::plan_md::PlanExecutionState;
-        use raven_tui::tools::backend::{MockToolBackend, ToolBackend};
-
-        let workspace =
-            std::env::temp_dir().join(format!("raven_plan_sync_test_{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&workspace);
-        let cfg = Config {
-            base_url: "http://mock.local/v1".into(),
-            model: "mock".into(),
-            api_key: None,
-            workspace,
-            temperature: 0.0,
-            max_tokens: 512,
-            max_rounds: 5,
-            prebuilt_session: None,
-            context_budget: ContextBudget {
-                context_tokens: 8192,
-                tool_result_bytes: 4000,
-                read_line_limit: 80,
-                source: ContextSource::Default,
-            },
-            tool_backend: ToolBackend::Mock(MockToolBackend::default()),
-            tools_enabled: true,
-            enable_judge: false,
-            flags: raven_tui::runtime::RuntimeFlags::default(),
-            harness: raven_tui::runtime::EvalHarness::default(),
-        };
-        let chat = ChatBackend::Mock(MockChatBackend::new(vec![]));
-        let mut ag = Agent::new(cfg, chat);
-        ag.set_plan_execution(PlanExecutionState {
-            active: true,
-            steps: vec![
-                PlanStepData {
-                    description: "a".into(),
-                    status: "done".into(),
-                    ..Default::default()
-                },
-                PlanStepData {
-                    description: "b".into(),
-                    status: "in_progress".into(),
-                    ..Default::default()
-                },
-            ],
-            current_step: 1,
-            ..Default::default()
-        });
-        let stale_plan = PlanState {
-            active: true,
-            steps: vec![
-                PlanStep {
-                    description: "a".into(),
-                    status: PlanStepStatus::Done,
-                    ..Default::default()
-                },
-                PlanStep {
-                    description: "b".into(),
-                    status: PlanStepStatus::Pending,
-                    ..Default::default()
-                },
-            ],
-            current_step: 0,
-            ..Default::default()
-        };
-        let workspace = ag.workspace().to_path_buf();
-        sync_plan_to_agent(&mut ag, &stale_plan, &workspace);
-        assert_eq!(ag.plan_execution().current_step, 1);
     }
 
     #[test]

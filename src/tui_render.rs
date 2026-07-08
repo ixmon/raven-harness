@@ -2,7 +2,16 @@
 
 #![allow(clippy::too_many_arguments)]
 
+use crate::conversation_pane::build_conversation_text;
 use crate::desktop::{ActiveDesktop, DesktopState, SlideDirection};
+use crate::list_pane::{
+    list_focus_border_style, list_selection_style, list_unselected_style, list_visible_offset,
+};
+use crate::markdown_pane::{highlight_markdown_viewport, markdown_viewport, nav_highlight_search};
+use crate::md_render::render_markdown;
+use crate::plan_pane_render::draw_plan_pane;
+use crate::plan_state::PlanState;
+use crate::wiki_doc::{NavItemKind, WikiLink, WikiNavItem};
 use crate::input_dispatch::SlashCommand;
 use crate::settings_modal::{draw_settings_modal, SettingsModal};
 use ratatui::{
@@ -15,409 +24,7 @@ use ratatui::{
     Frame,
 };
 
-const PLAN_ORANGE: Color = Color::Rgb(0xff, 0xc0, 0x40);
-const PLAN_GREEN: Color = Color::Rgb(0x60, 0xc0, 0x60);
-
-fn is_plan_entry_confirm(entry: &str) -> bool {
-    let t = entry.trim();
-    t.starts_with("Enter plan mode?")
-}
-
-fn push_attention_entry(
-    left_text: &mut Text<'static>,
-    entry: &str,
-    highlight_line: Option<usize>,
-    line_idx: &mut usize,
-    fg: Color,
-) {
-    let style = if Some(*line_idx) == highlight_line {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(fg).add_modifier(Modifier::BOLD)
-    };
-    for line in entry.lines() {
-        left_text
-            .lines
-            .push(Line::from(Span::styled(line.to_string(), style)));
-        *line_idx += 1;
-    }
-}
-
-// ── Raven markdown renderer ──────────────────────────────────────────────────
-// Replaces tui_markdown with a purpose-built renderer that directly produces
-// ratatui types. Handles: headings, bold/italic/code, links, lists, code
-// blocks, blockquotes, tables (box-drawn), and horizontal rules.
-
-/// Styles for our dark TUI theme (#1a1a22 background).
-mod md_style {
-    use ratatui::style::{Color, Modifier, Style};
-    pub fn h1() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED) }
-    pub fn h2() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) }
-    pub fn h3() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC) }
-    pub fn h_other() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::ITALIC) }
-    pub fn bold() -> Style { Style::default().add_modifier(Modifier::BOLD) }
-    pub fn italic() -> Style { Style::default().add_modifier(Modifier::ITALIC) }
-    pub fn bold_italic() -> Style { Style::default().add_modifier(Modifier::BOLD | Modifier::ITALIC) }
-    pub fn code() -> Style { Style::default().fg(Color::Rgb(0xc0, 0xc0, 0xd0)).bg(Color::Rgb(0x28, 0x28, 0x35)) }
-    pub fn link() -> Style { Style::default().fg(Color::Cyan).add_modifier(Modifier::UNDERLINED) }
-    pub fn blockquote() -> Style { Style::default().fg(Color::Rgb(0x80, 0xb0, 0x80)).add_modifier(Modifier::ITALIC) }
-    pub fn table_border() -> Style { Style::default().fg(Color::DarkGray) }
-    pub fn table_header() -> Style { Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD) }
-    pub fn rule() -> Style { Style::default().fg(Color::DarkGray) }
-    pub fn list_marker() -> Style { Style::default().fg(Color::DarkGray) }
-}
-
-fn wiki_render_markdown(md: &str) -> Text<'static> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let src_lines: Vec<&str> = md.lines().collect();
-    let n = src_lines.len();
-    let mut i = 0;
-    let mut in_code_block = false;
-
-    while i < n {
-        let raw = src_lines[i];
-
-        // ── Code blocks ──
-        if raw.trim_start().starts_with("```") {
-            if in_code_block {
-                // End code block
-                in_code_block = false;
-                i += 1;
-                continue;
-            } else {
-                // Start code block — show language label if present
-                let lang = raw.trim_start().trim_start_matches('`').trim();
-                if !lang.is_empty() {
-                    lines.push(Line::from(Span::styled(format!("  {}", lang), md_style::code())));
-                }
-                in_code_block = true;
-                i += 1;
-                continue;
-            }
-        }
-        if in_code_block {
-            lines.push(Line::from(Span::styled(format!("  {}", raw), md_style::code())));
-            i += 1;
-            continue;
-        }
-
-        let trimmed = raw.trim();
-
-        // ── Empty line ──
-        if trimmed.is_empty() {
-            lines.push(Line::default());
-            i += 1;
-            continue;
-        }
-
-        // ── Horizontal rule ──
-        if (trimmed.starts_with("---") || trimmed.starts_with("***") || trimmed.starts_with("___"))
-            && trimmed.chars().all(|c| c == '-' || c == '*' || c == '_' || c == ' ')
-            && trimmed.len() >= 3
-        {
-            lines.push(Line::from(Span::styled("────────────────────────────────", md_style::rule())));
-            i += 1;
-            continue;
-        }
-
-        // ── Tables ──
-        if is_table_row(raw) && i + 1 < n && is_separator_row(src_lines[i + 1]) {
-            let table_lines = render_table_lines(&src_lines, &mut i);
-            lines.extend(table_lines);
-            continue;
-        }
-
-        // ── Headings ──
-        if trimmed.starts_with('#') {
-            let level = trimmed.chars().take_while(|c| *c == '#').count();
-            let text = trimmed[level..].trim();
-            let style = match level {
-                1 => md_style::h1(),
-                2 => md_style::h2(),
-                3 => md_style::h3(),
-                _ => md_style::h_other(),
-            };
-            if !lines.is_empty() {
-                lines.push(Line::default()); // spacing before heading
-            }
-            lines.push(Line::from(Span::styled(text.to_string(), style)));
-            i += 1;
-            continue;
-        }
-
-        // ── Blockquotes ──
-        if let Some(stripped) = trimmed.strip_prefix('>') {
-            let content = stripped.trim_start();
-            let mut spans = vec![Span::styled("▎ ", md_style::blockquote())];
-            spans.extend(parse_inline(content, md_style::blockquote()));
-            lines.push(Line::from(spans));
-            i += 1;
-            continue;
-        }
-
-        // ── Unordered lists ──
-        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
-            let indent = raw.len() - raw.trim_start().len();
-            let content = &trimmed[2..];
-            let prefix = " ".repeat(indent) + "• ";
-            let mut spans = vec![Span::styled(prefix, md_style::list_marker())];
-            spans.extend(parse_inline(content, Style::default()));
-            lines.push(Line::from(spans));
-            i += 1;
-            continue;
-        }
-
-        // ── Ordered lists ──
-        if let Some(rest) = try_ordered_list(trimmed) {
-            let indent = raw.len() - raw.trim_start().len();
-            // Find the number prefix
-            let num_end = trimmed.find('.').unwrap_or(0);
-            let num = &trimmed[..num_end + 1];
-            let prefix = " ".repeat(indent) + num + " ";
-            let mut spans = vec![Span::styled(prefix, md_style::list_marker())];
-            spans.extend(parse_inline(rest, Style::default()));
-            lines.push(Line::from(spans));
-            i += 1;
-            continue;
-        }
-
-        // ── Normal paragraph text ──
-        let spans = parse_inline(trimmed, Style::default());
-        lines.push(Line::from(spans));
-        i += 1;
-    }
-
-    Text::from(lines)
-}
-
-/// Parse inline markdown formatting: **bold**, *italic*, ***both***, `code`, [links](url)
-fn parse_inline(text: &str, base_style: Style) -> Vec<Span<'static>> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let chars: Vec<char> = text.chars().collect();
-    let len = chars.len();
-    let mut pos = 0;
-    let mut buf = String::new();
-
-    while pos < len {
-        // ── Inline code: `...` ──
-        if chars[pos] == '`' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 1;
-            let mut code = String::new();
-            while pos < len && chars[pos] != '`' {
-                code.push(chars[pos]);
-                pos += 1;
-            }
-            if pos < len { pos += 1; } // skip closing `
-            spans.push(Span::styled(code, md_style::code()));
-            continue;
-        }
-
-        // ── Links: [text](url) ──
-        if chars[pos] == '[' {
-            // Look ahead for ](url)
-            if let Some((link_text, url, end_pos)) = try_parse_link(&chars, pos) {
-                if !buf.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-                }
-                spans.push(Span::styled(link_text, md_style::link()));
-                pos = end_pos;
-                // Store url in a dimmed span for reference
-                let _ = url; // We display link text styled, url is implicit for TUI
-                continue;
-            }
-        }
-
-        // ── Bold+italic: ***...*** ──
-        if pos + 2 < len && chars[pos] == '*' && chars[pos+1] == '*' && chars[pos+2] == '*' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 3;
-            let mut inner = String::new();
-            while pos + 2 < len && !(chars[pos] == '*' && chars[pos+1] == '*' && chars[pos+2] == '*') {
-                inner.push(chars[pos]);
-                pos += 1;
-            }
-            if pos + 2 < len { pos += 3; }
-            spans.push(Span::styled(inner, md_style::bold_italic()));
-            continue;
-        }
-
-        // ── Bold: **...** ──
-        if pos + 1 < len && chars[pos] == '*' && chars[pos+1] == '*' {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 2;
-            let mut inner = String::new();
-            while pos + 1 < len && !(chars[pos] == '*' && chars[pos+1] == '*') {
-                inner.push(chars[pos]);
-                pos += 1;
-            }
-            if pos + 1 < len { pos += 2; }
-            spans.push(Span::styled(inner, md_style::bold()));
-            continue;
-        }
-
-        // ── Italic: *...* (single) ──
-        if chars[pos] == '*' && (pos + 1 < len && chars[pos+1] != '*') {
-            if !buf.is_empty() {
-                spans.push(Span::styled(std::mem::take(&mut buf), base_style));
-            }
-            pos += 1;
-            let mut inner = String::new();
-            while pos < len && chars[pos] != '*' {
-                inner.push(chars[pos]);
-                pos += 1;
-            }
-            if pos < len { pos += 1; }
-            spans.push(Span::styled(inner, md_style::italic()));
-            continue;
-        }
-
-        buf.push(chars[pos]);
-        pos += 1;
-    }
-
-    if !buf.is_empty() {
-        spans.push(Span::styled(buf, base_style));
-    }
-    spans
-}
-
-/// Try to parse a markdown link at position `start` (which should be '[').
-/// Returns (link_text, url, end_position) if successful.
-fn try_parse_link(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    let len = chars.len();
-    if start >= len || chars[start] != '[' { return None; }
-    let mut pos = start + 1;
-    let mut text = String::new();
-    // Find closing ]
-    while pos < len && chars[pos] != ']' {
-        text.push(chars[pos]);
-        pos += 1;
-    }
-    if pos >= len { return None; }
-    pos += 1; // skip ]
-    // Expect (
-    if pos >= len || chars[pos] != '(' { return None; }
-    pos += 1;
-    let mut url = String::new();
-    while pos < len && chars[pos] != ')' {
-        url.push(chars[pos]);
-        pos += 1;
-    }
-    if pos >= len { return None; }
-    pos += 1; // skip )
-    Some((text, url, pos))
-}
-
-/// Try to match an ordered list item: "1. text", "2. text", etc.
-fn try_ordered_list(trimmed: &str) -> Option<&str> {
-    let dot_pos = trimmed.find('.')?;
-    let num_part = &trimmed[..dot_pos];
-    if num_part.chars().all(|c| c.is_ascii_digit()) && !num_part.is_empty() {
-        let rest = &trimmed[dot_pos + 1..];
-        if rest.starts_with(' ') {
-            return Some(rest.trim_start());
-        }
-    }
-    None
-}
-
-// ── Table rendering ──────────────────────────────────────────────────────────
-
-fn is_table_row(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.ends_with('|') && t.len() > 2
-}
-
-fn is_separator_row(line: &str) -> bool {
-    let t = line.trim();
-    t.starts_with('|') && t.contains("---")
-}
-
-fn parse_table_row(line: &str) -> Vec<String> {
-    let t = line.trim().trim_matches('|');
-    t.split('|').map(|cell| cell.trim().to_string()).collect()
-}
-
-/// Render a markdown table starting at `src_lines[*i]` into styled Lines.
-/// Advances `*i` past the table.
-fn render_table_lines(src_lines: &[&str], i: &mut usize) -> Vec<Line<'static>> {
-    let mut rows: Vec<Vec<String>> = vec![];
-    rows.push(parse_table_row(src_lines[*i]));
-    *i += 1; // skip header
-    *i += 1; // skip separator
-    while *i < src_lines.len() && is_table_row(src_lines[*i]) && !is_separator_row(src_lines[*i]) {
-        rows.push(parse_table_row(src_lines[*i]));
-        *i += 1;
-    }
-
-    if rows.is_empty() { return vec![]; }
-    let ncols = rows.iter().map(|r| r.len()).max().unwrap_or(0);
-    let mut widths = vec![0usize; ncols];
-    for row in &rows {
-        for (j, cell) in row.iter().enumerate() {
-            if j < ncols { widths[j] = widths[j].max(cell.len()); }
-        }
-    }
-    for w in &mut widths { *w = (*w).max(3); }
-
-    let border = md_style::table_border();
-    let header_style = md_style::table_header();
-    let mut out: Vec<Line<'static>> = Vec::new();
-
-    // Top border: ┌───┬───┐
-    let mut top = String::from("┌");
-    for (j, w) in widths.iter().enumerate() {
-        top.push_str(&"─".repeat(*w + 2));
-        if j + 1 < ncols { top.push('┬'); }
-    }
-    top.push('┐');
-    out.push(Line::from(Span::styled(top, border)));
-
-    for (ri, row) in rows.iter().enumerate() {
-        let cell_style = if ri == 0 { header_style } else { Style::default() };
-        let mut spans: Vec<Span<'static>> = vec![Span::styled("│", border)];
-        for (j, w) in widths.iter().enumerate() {
-            let cell = row.get(j).map(|s| s.as_str()).unwrap_or("");
-            spans.push(Span::styled(format!(" {:<width$} ", cell, width = w), cell_style));
-            spans.push(Span::styled("│", border));
-        }
-        out.push(Line::from(spans));
-
-        // Header separator
-        if ri == 0 && rows.len() > 1 {
-            let mut sep = String::from("├");
-            for (j, w) in widths.iter().enumerate() {
-                sep.push_str(&"─".repeat(*w + 2));
-                if j + 1 < ncols { sep.push('┼'); }
-            }
-            sep.push('┤');
-            out.push(Line::from(Span::styled(sep, border)));
-        }
-    }
-
-    // Bottom border: └───┴───┘
-    let mut bot = String::from("└");
-    for (j, w) in widths.iter().enumerate() {
-        bot.push_str(&"─".repeat(*w + 2));
-        if j + 1 < ncols { bot.push('┴'); }
-    }
-    bot.push('┘');
-    out.push(Line::from(Span::styled(bot, border)));
-
-    out
-}
-
-
+// markdown rendering: see md_render.rs
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Pane {
@@ -438,6 +45,268 @@ pub struct StatusBarData<'a> {
     pub tps: f64,
 }
 
+const BREADCRUMB_MAGENTA: Color = Color::Rgb(0xc0, 0x80, 0xff);
+const BREADCRUMB_DIM: Color = Color::Rgb(0x55, 0x55, 0x66);
+const BREADCRUMB_SEP: Color = Color::Rgb(0x45, 0x45, 0x52);
+
+pub struct BreadcrumbData {
+    pub active: ActiveDesktop,
+    /// Splash split-pane focus (magenta vs workspace picker).
+    pub splash_focus: crate::app_state::SplashFocus,
+    /// Overview 3-column focus (workspaces picker vs browser nav vs content).
+    pub view_focus: crate::app_state::ViewFocus,
+    /// Overview browser nav: Coding Harness selected vs wiki subtree.
+    pub browser_harness_selected: bool,
+    /// When true (narrow terminal), show only the current desktop name.
+    pub compact: bool,
+}
+
+/// Which breadcrumb step is highlighted (may differ from `active` when a sub-pane has focus).
+fn resolve_breadcrumb_active(data: &BreadcrumbData) -> ActiveDesktop {
+    match data.active {
+        ActiveDesktop::Splash if data.splash_focus == crate::app_state::SplashFocus::Picker => {
+            ActiveDesktop::Picker
+        }
+        ActiveDesktop::Overview if data.view_focus == crate::app_state::ViewFocus::Picker => {
+            ActiveDesktop::Picker
+        }
+        other => other,
+    }
+}
+
+fn breadcrumb_steps() -> &'static [(ActiveDesktop, &'static str)] {
+    &[
+        (ActiveDesktop::Splash, "Main"),
+        (ActiveDesktop::Picker, "Workspaces"),
+        (ActiveDesktop::Overview, "Browser"),
+        (ActiveDesktop::Workspace, "Harness"),
+        (ActiveDesktop::WikiViewer, "Wiki"),
+    ]
+}
+
+fn breadcrumb_nav_hint(data: &BreadcrumbData) -> Option<&'static str> {
+    use crate::app_state::{SplashFocus, ViewFocus};
+
+    match data.active {
+        ActiveDesktop::Splash if data.splash_focus == SplashFocus::Magenta => {
+            Some("→ Workspaces")
+        }
+        ActiveDesktop::Splash if data.splash_focus == SplashFocus::Picker => {
+            Some("Workspaces → Browser")
+        }
+        ActiveDesktop::Picker => Some("Workspaces → Browser"),
+        ActiveDesktop::Overview if data.view_focus == ViewFocus::Picker => {
+            Some("Workspaces → Browser")
+        }
+        ActiveDesktop::Overview
+            if data.view_focus == ViewFocus::Nav || data.view_focus == ViewFocus::Content =>
+        {
+            if data.browser_harness_selected {
+                Some("Browser → Harness")
+            } else {
+                Some("Browser → Wiki")
+            }
+        }
+        ActiveDesktop::WikiViewer => Some("↑↓ PgUp/Dn Home/End · ←→ nav/content"),
+        ActiveDesktop::Workspace => None,
+        _ => None,
+    }
+}
+
+fn breadcrumb_trail_spans(active: ActiveDesktop) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (desktop, label)) in breadcrumb_steps().iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(BREADCRUMB_SEP)));
+        }
+        let is_active = *desktop == active;
+        let marker = if is_active { '◉' } else { '○' };
+        let style = if is_active {
+            Style::default()
+                .fg(BREADCRUMB_MAGENTA)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(BREADCRUMB_DIM)
+        };
+        spans.push(Span::styled(format!("{marker} {label}"), style));
+    }
+    spans
+}
+
+/// One-row desktop trail (Main → Workspaces → Browser → Harness → Wiki).
+pub fn draw_breadcrumb_bar(f: &mut Frame, area: Rect, data: &BreadcrumbData) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let highlighted = resolve_breadcrumb_active(data);
+    let hint = breadcrumb_nav_hint(data);
+    let (trail_area, hint_area) = if let Some(hint_text) = hint {
+        let hint_len = hint_text.chars().count() as u16 + 1;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(12),
+                Constraint::Length(hint_len.min(area.width.saturating_sub(12))),
+            ])
+            .split(area);
+        (cols[0], Some((cols[1], hint_text)))
+    } else {
+        (area, None)
+    };
+
+    let trail_spans = if data.compact {
+        let label = breadcrumb_steps()
+            .iter()
+            .find(|(d, _)| *d == highlighted)
+            .map(|(_, l)| *l)
+            .unwrap_or("?");
+        vec![
+            Span::styled(
+                format!("◉ {label}"),
+                Style::default()
+                    .fg(BREADCRUMB_MAGENTA)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
+    } else {
+        breadcrumb_trail_spans(highlighted)
+    };
+
+    f.render_widget(
+        Paragraph::new(Line::from(trail_spans)).style(Style::default().bg(Color::Black)),
+        trail_area,
+    );
+
+    if let Some((hint_rect, hint_text)) = hint_area {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            ))
+            .alignment(Alignment::Right),
+            hint_rect,
+        );
+    }
+}
+
+/// Clickable segment within the breadcrumb row (trail step or nav-hint label).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BreadcrumbClickSegment {
+    pub x_start: u16,
+    pub x_end: u16,
+    pub target: ActiveDesktop,
+}
+
+fn hint_label_to_desktop(label: &str) -> Option<ActiveDesktop> {
+    match label {
+        "Workspaces" => Some(ActiveDesktop::Picker),
+        "Browser" => Some(ActiveDesktop::Overview),
+        "Harness" => Some(ActiveDesktop::Workspace),
+        "Wiki" => Some(ActiveDesktop::WikiViewer),
+        _ => None,
+    }
+}
+
+fn breadcrumb_trail_hint_split(
+    area: Rect,
+    data: &BreadcrumbData,
+) -> (Rect, Option<(Rect, &'static str)>) {
+    let hint = breadcrumb_nav_hint(data);
+    if let Some(hint_text) = hint {
+        let hint_len = hint_text.chars().count() as u16 + 1;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(12),
+                Constraint::Length(hint_len.min(area.width.saturating_sub(12))),
+            ])
+            .split(area);
+        (cols[0], Some((cols[1], hint_text)))
+    } else {
+        (area, None)
+    }
+}
+
+/// Column ranges for each breadcrumb trail step and nav-hint destination.
+pub fn breadcrumb_click_segments(area: Rect, data: &BreadcrumbData) -> Vec<BreadcrumbClickSegment> {
+    if area.height == 0 || area.width == 0 {
+        return Vec::new();
+    }
+
+    let highlighted = resolve_breadcrumb_active(data);
+    let (trail_area, hint_area) = breadcrumb_trail_hint_split(area, data);
+    let mut segments = Vec::new();
+    let mut x = trail_area.x;
+
+    if data.compact {
+        let label = breadcrumb_steps()
+            .iter()
+            .find(|(d, _)| *d == highlighted)
+            .map(|(_, l)| *l)
+            .unwrap_or("?");
+        let text = format!("◉ {label}");
+        let width = text.chars().count() as u16;
+        segments.push(BreadcrumbClickSegment {
+            x_start: x,
+            x_end: x.saturating_add(width),
+            target: highlighted,
+        });
+    } else {
+        for (i, (desktop, label)) in breadcrumb_steps().iter().enumerate() {
+            if i > 0 {
+                x = x.saturating_add(3);
+            }
+            let marker = if *desktop == highlighted { '◉' } else { '○' };
+            let text = format!("{marker} {label}");
+            let width = text.chars().count() as u16;
+            segments.push(BreadcrumbClickSegment {
+                x_start: x,
+                x_end: x.saturating_add(width),
+                target: *desktop,
+            });
+            x = x.saturating_add(width);
+        }
+    }
+
+    if let Some((hint_rect, hint_text)) = hint_area {
+        let parts: Vec<&str> = hint_text.split(" → ").collect();
+        let mut hx = hint_rect.x;
+        for (i, part) in parts.iter().enumerate() {
+            let label = part.trim_start_matches('→').trim();
+            if let Some(target) = hint_label_to_desktop(label) {
+                let width = label.chars().count() as u16;
+                segments.push(BreadcrumbClickSegment {
+                    x_start: hx,
+                    x_end: hx.saturating_add(width),
+                    target,
+                });
+                hx = hx.saturating_add(width);
+            }
+            if i + 1 < parts.len() {
+                hx = hx.saturating_add(3);
+            }
+        }
+    }
+
+    segments
+}
+
+pub fn breadcrumb_target_at(
+    bar: Rect,
+    segments: &[BreadcrumbClickSegment],
+    col: u16,
+    row: u16,
+) -> Option<ActiveDesktop> {
+    if bar.height == 0 || row != bar.y || col < bar.x || col >= bar.x + bar.width {
+        return None;
+    }
+    segments
+        .iter()
+        .find(|s| col >= s.x_start && col < s.x_end)
+        .map(|s| s.target)
+}
+
 pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
     let ctx = data.budget;
     let mut spans = vec![
@@ -450,7 +319,7 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
         ),
         Span::styled("  ", Style::default()),
         Span::styled(data.balance_label, balance_label_style(data.balance_label)),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x60, 0x60, 0x70))),
         Span::styled("ctx:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             {
@@ -469,25 +338,25 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
                 }
             },
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x55, 0x55, 0x64))),
         Span::styled("tps:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{:.1}", data.tps),
             Style::default().fg(Color::Rgb(0x80, 0xd0, 0x80)),
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x4a, 0x4a, 0x58))),
         Span::styled("Approval:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             data.mode_label.split(" - ").next().unwrap_or("?"),
             Style::default().fg(Color::Yellow),
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x40, 0x40, 0x4e))),
         Span::styled("Run Mode:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             data.agent_mode,
             Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff)),
         ),
-        Span::styled("  │  ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  │  ", Style::default().fg(Color::Rgb(0x38, 0x38, 0x44))),
         Span::styled("goal:", Style::default().fg(Color::DarkGray)),
         Span::styled(
             truncate_str(data.goal_text, 40),
@@ -892,117 +761,8 @@ pub fn draw_left_pane(
 ) {
     *last_left_area = left_area;
 
-    let mut left_text = Text::default();
-    let mut line_idx = 0usize;
-    let mut consecutive_blanks = 0usize;
-
-    for (i, entry) in left_committed.iter().enumerate() {
-        if is_plan_entry_confirm(entry) {
-            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
-        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-            let (prefix_style, body_style) = conversation_entry_styles(entry);
-            let lines_iter: Vec<&str> = entry.lines().collect();
-            for (li, line) in lines_iter.iter().enumerate() {
-                let is_blank = line.trim().is_empty();
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 {
-                        continue;
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                }
-                let style = if Some(line_idx) == highlight_line {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD)
-                } else if li == 0 {
-                    prefix_style
-                } else {
-                    body_style
-                };
-                left_text
-                    .lines
-                    .push(Line::from(Span::styled(line.to_string(), style)));
-                line_idx += 1;
-            }
-        } else {
-            // Rich markdown rendering for assistant and system-ish messages.
-            // This preserves structure/newlines for plans, lists, code, headings, etc.
-            // (User messages stay plain for chat flow.)
-            let md = wiki_render_markdown(entry);
-            for mut line in md.lines {
-                if Some(line_idx) == highlight_line {
-                    for sp in &mut line.spans {
-                        sp.style = sp.style
-                            .fg(Color::Black)
-                            .bg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD);
-                    }
-                }
-                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 { /* keep a couple for md separation */ }
-                    else { left_text.lines.push(line); }
-                } else {
-                    consecutive_blanks = 0;
-                    left_text.lines.push(line);
-                }
-                line_idx += 1;
-            }
-        }
-        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
-            left_text.lines.push(Line::from(""));
-            line_idx += 1;
-            consecutive_blanks += 1;
-        }
-    }
-
-    if !current_response.is_empty() {
-        left_text.lines.push(Line::from(Span::styled(
-            "Agent (streaming):",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        )));
-        line_idx += 1;
-
-        let lines: Vec<&str> = current_response.lines().collect();
-        let has_partial = !current_response.ends_with('\n');
-        let complete_count = if has_partial {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len()
-        };
-
-        for line in &lines[..complete_count] {
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
-        }
-
-        if has_partial {
-            if let Some(partial) = lines.last() {
-                left_text.lines.push(Line::from(Span::styled(
-                    partial.to_string(),
-                    Style::default()
-                        .fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
-        }
-    }
+    let (mut left_text, gutter_colors) =
+        build_conversation_text(left_committed, current_response, highlight_line);
 
     let title_str = if draw_frame { "  Conversation" } else { "" };
     let subtitle = if draw_frame {
@@ -1022,6 +782,8 @@ pub fn draw_left_pane(
         title_str,
         Color::Cyan,
         subtitle,
+        3, // border + space + gutter column, then content
+        Some(&gutter_colors),
     );
 }
 
@@ -1037,36 +799,105 @@ pub fn draw_right_pane(
     focused_pane: Pane,
     scroll_flash_timer: u8,
     highlight_line: Option<usize>,
+    trace_cursor: usize,
+    trace_cursor_active: bool,
+    trace_expanded: &std::collections::HashSet<usize>,
 ) {
     *last_right_area = right_area;
+
+    let cursor_bg = Color::Rgb(0x14, 0x28, 0x40); // deep navy — high contrast with white text
+    let fold_indicator_style = Style::default().fg(Color::DarkGray);
+
+    // Compute fold-aware visible lines
+    let blocks = crate::trace_fold::detect_tool_blocks(trace_lines);
+    let visible = crate::trace_fold::compute_visible_lines(trace_lines, &blocks, trace_expanded);
 
     let mut right_text = Text::default();
     let mut line_idx = 0usize;
 
-    for line in trace_lines {
-        let style = if Some(line_idx) == highlight_line {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Magenta)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            trace_line_style(line)
-        };
-        right_text
-            .lines
-            .push(Line::from(Span::styled(line.clone(), style)));
+    for vline in &visible {
+        match vline {
+            crate::trace_fold::VisibleLine::Original(orig_idx) => {
+                let line = &trace_lines[*orig_idx];
+                let is_cursor_line = trace_cursor_active && *orig_idx == trace_cursor;
+                let style = if Some(line_idx) == highlight_line {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_cursor_line {
+                    // Cursor line: bright text on navy blue bg
+                    Style::default()
+                        .fg(Color::White)
+                        .bg(cursor_bg)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    trace_line_style(line)
+                };
+
+                // Check if this is the first body line of an expanded block — add ▾
+                let is_expanded_body_start = blocks.iter().any(|b| {
+                    trace_expanded.contains(&b.header_idx) && *orig_idx == b.body_start && b.body_len() > 0
+                });
+
+                if is_expanded_body_start {
+                    if is_cursor_line {
+                        right_text.lines.push(Line::from(vec![
+                            Span::styled(format!("▶{}", line), style),
+                            Span::styled("  ▾", fold_indicator_style),
+                        ]));
+                    } else {
+                        right_text.lines.push(Line::from(vec![
+                            Span::styled(line.clone(), style),
+                            Span::styled("  ▾", fold_indicator_style),
+                        ]));
+                    }
+                } else if is_cursor_line {
+                    right_text
+                        .lines
+                        .push(Line::from(Span::styled(format!("▶{}", line), style)));
+                } else {
+                    right_text
+                        .lines
+                        .push(Line::from(Span::styled(line.clone(), style)));
+                }
+            }
+            crate::trace_fold::VisibleLine::FoldSummary {
+                header_idx,
+                line_count,
+                is_error,
+                summary,
+                ..
+            } => {
+                let is_cursor_line = trace_cursor_active
+                    && blocks.iter().any(|b| {
+                        b.header_idx == *header_idx && trace_cursor >= b.header_idx && trace_cursor < b.end_idx
+                    });
+                let icon = if *is_error { "❌" } else { "✅" };
+                let summary_short = truncate_str(summary, 57);
+                let fold_text = format!("   {} {} ({} lines) ▸", icon, summary_short, line_count);
+                let style = if is_cursor_line {
+                    Style::default().fg(Color::DarkGray).bg(cursor_bg)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                right_text
+                    .lines
+                    .push(Line::from(Span::styled(fold_text, style)));
+            }
+        }
         line_idx += 1;
     }
 
     if !current_thinking.is_empty() {
-        if !trace_lines.is_empty() {
+        if !visible.is_empty() {
             right_text.lines.push(Line::from(""));
             line_idx += 1;
         }
         right_text.lines.push(Line::from(Span::styled(
             "Thinking (live):",
             Style::default()
-                .fg(Color::LightCyan) // ANSI16: LightCyan, 256-color: 14, TrueColor: #00e5e5
+                .fg(Color::LightCyan)
                 .add_modifier(Modifier::BOLD | Modifier::ITALIC),
         )));
         line_idx += 1;
@@ -1099,6 +930,8 @@ pub fn draw_right_pane(
         scroll_flash_timer,
         "  Trace",
         Color::Rgb(0xd0, 0xa0, 0xff),
+        None,
+        1,
         None,
     );
 }
@@ -1134,58 +967,6 @@ pub fn draw_overlays(
     draw_settings_modal(f, screen, settings);
 }
 
-fn conversation_entry_styles(entry: &str) -> (Style, Style) {
-    if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-        (
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xb0, 0xe0, 0xff)),
-        )
-    } else if entry.starts_with("Agent: ") || entry.starts_with("Agent (partial): ") {
-        (
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0)),
-        )
-    } else if entry.contains("ERROR") || entry.starts_with("⚠") {
-        (
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xff, 0xa0, 0xa0)),
-        )
-    } else if entry.starts_with("✅")
-        || entry.starts_with("⛔")
-        || entry.starts_with("⏹")
-        || entry.starts_with("🔒")
-    {
-        (
-            Style::default().fg(Color::Yellow),
-            Style::default().fg(Color::Yellow),
-        )
-    } else if entry.starts_with("Raven Hotel - Loaded session")
-        || entry.starts_with("Use ↑/↓")
-    {
-        // Subtle instructions and initial session banners — keep them visually
-        // separate from actual conversation turns.
-        (
-            Style::default().fg(Color::DarkGray),
-            Style::default().fg(Color::DarkGray),
-        )
-    } else if entry.contains("enter plan mode") || entry.contains("Do you want to enter plan mode") || entry.contains("Would you like to enter plan mode") {
-        // Plan mode entry confirmation question — highlighted in orange (same as plan pane) to get attention.
-        (
-            Style::default().fg(PLAN_ORANGE).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(0xff, 0xd0, 0x80)),
-        )
-    } else {
-        (
-            Style::default().fg(Color::Rgb(0x88, 0x88, 0xaa)),
-            Style::default().fg(Color::Rgb(0x88, 0x88, 0xaa)),
-        )
-    }
-}
-
 fn trace_line_style(line: &str) -> Style {
     // 1 🔧 / 🧠 icon at start of tool/thought block; continuations indented (no repeat icon).
     if line.starts_with("🔧") {
@@ -1214,8 +995,9 @@ fn trace_line_style(line: &str) -> Style {
     }
 }
 
-/// Horizontal space reserved inside a scrollable pane: scrollbar(1) + borders(2) + padding(2).
-const PANE_INNER_WIDTH_RESERVE: u16 = 5;
+/// Horizontal space reserved inside a scrollable pane (excluding left_pad):
+/// scrollbar(1) + borders(2) + right_pad(1) = 4; add left_pad at call site.
+const PANE_WIDTH_RESERVE_BASE: u16 = 4;
 const PANE_BORDER_HEIGHT: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1230,10 +1012,10 @@ struct PaneScrollMetrics {
 /// The Paragraph widget uses `Wrap { trim: false }`, so logical lines wider than
 /// the inner width occupy multiple visual rows. `max_scroll` is derived from the
 /// visible content height (inside borders, minus an optional title row).
-fn pane_scroll_metrics(area: Rect, text: &Text, has_title: bool) -> PaneScrollMetrics {
+fn pane_scroll_metrics(area: Rect, text: &Text, has_title: bool, left_pad: u16) -> PaneScrollMetrics {
     let title_height = u16::from(has_title);
     let content_height = area.height.saturating_sub(PANE_BORDER_HEIGHT + title_height);
-    let inner_width = area.width.saturating_sub(PANE_INNER_WIDTH_RESERVE).max(1) as usize;
+    let inner_width = area.width.saturating_sub(PANE_WIDTH_RESERVE_BASE + left_pad).max(1) as usize;
     let line_count = count_visual_lines(text, inner_width);
     let max_scroll = line_count.saturating_sub(content_height);
     PaneScrollMetrics {
@@ -1269,13 +1051,15 @@ fn render_scrollable_pane(
     title: &str,
     title_color: Color,
     subtitle: Option<String>,
+    left_pad: u16,
+    gutter_colors: Option<&[Color]>,
 ) {
     let has_title = !title.trim().is_empty();
     let PaneScrollMetrics {
         line_count,
         content_height,
         max_scroll,
-    } = pane_scroll_metrics(area, text, has_title);
+    } = pane_scroll_metrics(area, text, has_title, left_pad);
     *last_line_count = line_count;
     if follow_output {
         *scroll = max_scroll;
@@ -1295,6 +1079,9 @@ fn render_scrollable_pane(
         Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
 
+    let inner_width = area.width.saturating_sub(PANE_WIDTH_RESERVE_BASE + left_pad).max(1) as usize;
+    crate::code_highlight::pad_code_block_lines(text, inner_width);
+
     let block = if title.trim().is_empty() {
         Paragraph::new(text.clone())
             .block(
@@ -1302,18 +1089,19 @@ fn render_scrollable_pane(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(focus_style)
-                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .padding(ratatui::widgets::Padding::new(left_pad, 1, 0, 0))
                     .style(Style::default().bg(Color::Black)),
             )
             .wrap(Wrap { trim: false })
             .scroll((*scroll, 0))
     } else {
+        let active_title_color = if focused { title_color } else { Color::Rgb(0x55, 0x55, 0x66) };
         let title_line = if let Some(sub) = subtitle {
             Line::from(vec![
                 Span::styled(
                     title,
                     Style::default()
-                        .fg(title_color)
+                        .fg(active_title_color)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(sub, Style::default().fg(Color::DarkGray)),
@@ -1322,7 +1110,7 @@ fn render_scrollable_pane(
             Line::from(Span::styled(
                 title,
                 Style::default()
-                    .fg(title_color)
+                    .fg(active_title_color)
                     .add_modifier(Modifier::BOLD),
             ))
         };
@@ -1333,7 +1121,7 @@ fn render_scrollable_pane(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(focus_style)
-                    .padding(ratatui::widgets::Padding::new(1, 1, 0, 0))
+                    .padding(ratatui::widgets::Padding::new(left_pad, 1, 0, 0))
                     .style(Style::default().bg(Color::Black)),
             )
             .wrap(Wrap { trim: false })
@@ -1342,12 +1130,64 @@ fn render_scrollable_pane(
 
     f.render_widget(block, area);
 
+    // Paint gutter overlay in the padding column.
+    if let Some(colors) = gutter_colors {
+        // Gutter column: 2 chars after the left border (1 char breathing room)
+        let gutter_x = area.x + 2;
+        // Content rows start right after the top border (title is ON the border)
+        let content_y = area.y + 1;
+        let visible_rows = content_height as usize;
+
+        // Walk logical lines, accumulating visual rows to find which logical
+        // line maps to each visible row (accounting for scroll offset).
+        let mut visual_row: usize = 0; // absolute visual row (before scroll)
+        let scroll_offset = *scroll as usize;
+
+        for (logical_idx, line) in text.lines.iter().enumerate() {
+            let line_width: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+            let rows_for_line = if line_width == 0 {
+                1
+            } else {
+                line_width.div_ceil(inner_width)
+            };
+
+            let color = colors.get(logical_idx).copied().unwrap_or(Color::Reset);
+
+            for r in 0..rows_for_line {
+                let abs_row = visual_row + r;
+                if abs_row >= scroll_offset {
+                    let screen_row = abs_row - scroll_offset;
+                    if screen_row >= visible_rows {
+                        break;
+                    }
+                    if color != Color::Reset {
+                        let y = content_y + screen_row as u16;
+                        let buf = f.buffer_mut();
+                        if gutter_x < area.x + area.width && y < area.y + area.height {
+                            buf[(gutter_x, y)]
+                                .set_char('▎')
+                                .set_style(Style::default().fg(color));
+                        }
+                    }
+                }
+            }
+            visual_row += rows_for_line;
+            if visual_row >= scroll_offset + visible_rows {
+                break; // past the visible area, stop
+            }
+        }
+    }
+
     if line_count > content_height {
         use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
         let mut sb_state = ScrollbarState::new(line_count as usize).position((*scroll) as usize);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .begin_symbol(None)
-            .end_symbol(None);
+            .end_symbol(None)
+            .track_symbol(Some("░"))
+            .track_style(Style::default().fg(Color::Rgb(0x28, 0x28, 0x35)))
+            .thumb_symbol("█")
+            .thumb_style(Style::default().fg(Color::Rgb(0x55, 0x55, 0x66)));
         f.render_stateful_widget(scrollbar, area, &mut sb_state);
     }
 }
@@ -1358,6 +1198,245 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     }
     let truncated: String = s.chars().take(max_chars).collect();
     format!("{}…", truncated)
+}
+
+/// Vertical space reserved for the overview harness input strip inside the Harness frame.
+pub const OVERVIEW_HARNESS_INPUT_H: u16 = 3;
+
+/// Inner area of the overview harness preview column (inside the Harness border).
+pub fn overview_harness_block_inner(harness_column: Rect) -> Rect {
+    Block::default()
+        .borders(Borders::ALL)
+        .inner(harness_column)
+}
+
+/// Status, conversation, and input areas inside an overview harness frame.
+pub fn overview_harness_split(inner: Rect) -> (Rect, Rect, Rect) {
+    let vparts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(OVERVIEW_HARNESS_INPUT_H),
+        ])
+        .split(inner);
+    (vparts[0], vparts[1], vparts[2])
+}
+
+/// Locate the overview harness preview column and its inner sub-areas.
+pub fn overview_harness_areas(content_area: Rect) -> (Rect, Rect, Rect, Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+        ])
+        .split(content_area);
+    let harness_column = cols[2];
+    let inner = overview_harness_block_inner(harness_column);
+    let (status, conv, input) = overview_harness_split(inner);
+    (harness_column, status, conv, input)
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    use super::{breadcrumb_nav_hint, breadcrumb_trail_spans, resolve_breadcrumb_active, BreadcrumbData};
+    use crate::app_state::{SplashFocus, ViewFocus};
+    use crate::desktop::ActiveDesktop;
+
+    fn breadcrumb_data(
+        active: ActiveDesktop,
+        splash_focus: SplashFocus,
+        view_focus: ViewFocus,
+        browser_harness_selected: bool,
+    ) -> BreadcrumbData {
+        BreadcrumbData {
+            active,
+            splash_focus,
+            view_focus,
+            browser_harness_selected,
+            compact: false,
+        }
+    }
+
+    #[test]
+    fn trail_marks_active_desktop() {
+        let spans = breadcrumb_trail_spans(ActiveDesktop::Picker);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('◉'));
+        assert!(text.contains("Workspaces"));
+        assert!(text.contains('○'));
+        assert!(text.contains("Main"));
+    }
+
+    #[test]
+    fn splash_picker_focus_highlights_workspaces() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Splash,
+            SplashFocus::Picker,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(resolve_breadcrumb_active(&data), ActiveDesktop::Picker);
+    }
+
+    #[test]
+    fn overview_nav_focus_highlights_browser() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Nav,
+            false,
+        );
+        assert_eq!(resolve_breadcrumb_active(&data), ActiveDesktop::Overview);
+    }
+
+    #[test]
+    fn overview_picker_focus_highlights_workspaces() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(resolve_breadcrumb_active(&data), ActiveDesktop::Picker);
+    }
+
+    #[test]
+    fn workspace_has_no_nav_hint() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Workspace,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert!(breadcrumb_nav_hint(&data).is_none());
+    }
+
+    #[test]
+    fn main_pane_hints_workspaces() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Splash,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(breadcrumb_nav_hint(&data), Some("→ Workspaces"));
+    }
+
+    #[test]
+    fn workspaces_pane_hints_browser() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(breadcrumb_nav_hint(&data), Some("Workspaces → Browser"));
+    }
+
+    #[test]
+    fn breadcrumb_click_maps_trail_and_hint() {
+        use super::{breadcrumb_click_segments, breadcrumb_target_at};
+        use ratatui::layout::Rect;
+
+        let data = breadcrumb_data(
+            ActiveDesktop::Splash,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        let bar = Rect::new(0, 0, 80, 1);
+        let segments = breadcrumb_click_segments(bar, &data);
+        assert!(segments.iter().any(|s| s.target == ActiveDesktop::Splash));
+        assert!(segments.iter().any(|s| s.target == ActiveDesktop::Picker));
+
+        let overview_data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        let segs = breadcrumb_click_segments(bar, &overview_data);
+        assert!(segs.iter().any(|s| s.target == ActiveDesktop::Overview));
+
+        let first = segments
+            .iter()
+            .find(|s| s.target == ActiveDesktop::Splash)
+            .unwrap();
+        assert_eq!(
+            breadcrumb_target_at(bar, &segments, first.x_start, 0),
+            Some(ActiveDesktop::Splash)
+        );
+    }
+
+    #[test]
+    fn browser_pane_hints_wiki_or_harness() {
+        let wiki = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Nav,
+            false,
+        );
+        assert_eq!(breadcrumb_nav_hint(&wiki), Some("Browser → Wiki"));
+
+        let harness = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Nav,
+            true,
+        );
+        assert_eq!(breadcrumb_nav_hint(&harness), Some("Browser → Harness"));
+    }
+}
+
+#[cfg(test)]
+mod splash_help_tests {
+    use super::SplashData;
+    use crate::app_state::SplashFocus;
+    use crate::desktop::load_splash_chunk;
+
+    #[test]
+    fn splash_chunk_describes_frame_navigation() {
+        let chunk = load_splash_chunk();
+        assert!(chunk.contains("Workspaces"));
+        assert!(chunk.contains("Harness"));
+        assert!(chunk.contains("Browser"));
+    }
+
+    #[test]
+    fn splash_data_carries_chunk_field() {
+        let chunk = load_splash_chunk();
+        let data = SplashData {
+            raven_art: "",
+            splash_chunk: &chunk,
+            splash_tip: "tip",
+            splash_tip_fade: 0,
+            splash_focus: SplashFocus::Magenta,
+        };
+        assert!(!data.splash_chunk.is_empty());
+    }
+
+    #[test]
+    fn splash_chunk_indent_is_twenty_five_percent() {
+        assert_eq!(super::splash_chunk_indent(100), 25);
+        assert_eq!(super::splash_chunk_indent(60), 15);
+        assert_eq!(super::splash_chunk_indent(40), 10);
+    }
+}
+
+#[cfg(test)]
+mod truncate_str_tests {
+    use super::truncate_str;
+
+    #[test]
+    fn truncates_on_char_boundary_with_multibyte_punctuation() {
+        let s = "grep:'init()':rocket.py — matched";
+        let out = truncate_str(s, 20);
+        assert!(out.ends_with('…'));
+        assert!(out.is_char_boundary(out.len()));
+    }
 }
 
 fn char_count(s: &str) -> usize {
@@ -1491,8 +1570,8 @@ mod scroll_metrics_tests {
     fn titled_pane_reduces_content_height() {
         let area = Rect::new(0, 0, 30, 12);
         let text = text_from_lines(&["line"]);
-        let untitled = pane_scroll_metrics(area, &text, false);
-        let titled = pane_scroll_metrics(area, &text, true);
+        let untitled = pane_scroll_metrics(area, &text, false, 1);
+        let titled = pane_scroll_metrics(area, &text, true, 1);
         assert_eq!(untitled.content_height, 10);
         assert_eq!(titled.content_height, 9);
     }
@@ -1503,7 +1582,7 @@ mod scroll_metrics_tests {
         // inner width = 20 - 5 = 15
         let text = text_from_lines(&["x".repeat(30).as_str()]);
         assert_eq!(count_visual_lines(&text, 15), 2);
-        let metrics = pane_scroll_metrics(area, &text, false);
+        let metrics = pane_scroll_metrics(area, &text, false, 1);
         assert_eq!(metrics.line_count, 2);
         assert_eq!(metrics.content_height, 8);
         assert_eq!(metrics.max_scroll, 0);
@@ -1519,7 +1598,7 @@ mod scroll_metrics_tests {
                 .map(|s| Line::from(s.as_str()))
                 .collect::<Vec<_>>(),
         );
-        let metrics = pane_scroll_metrics(area, &text, true);
+        let metrics = pane_scroll_metrics(area, &text, true, 1);
         // height 8 - borders 2 - title 1 = 5 visible rows; 20 lines -> max_scroll 15
         assert_eq!(metrics.content_height, 5);
         assert_eq!(metrics.line_count, 20);
@@ -1530,8 +1609,8 @@ mod scroll_metrics_tests {
     fn metrics_are_stable_across_calls() {
         let area = Rect::new(0, 0, 25, 10);
         let text = text_from_lines(&["alpha", "beta beta beta beta"]);
-        let first = pane_scroll_metrics(area, &text, true);
-        let second = pane_scroll_metrics(area, &text, true);
+        let first = pane_scroll_metrics(area, &text, true, 1);
+        let second = pane_scroll_metrics(area, &text, true, 1);
         assert_eq!(first, second);
         assert!(first.max_scroll <= first.line_count);
     }
@@ -1572,9 +1651,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct SplashData<'a> {
     pub raven_art: &'a str,
-    pub base_url: &'a str,
-    pub model: &'a str,
-    pub workspace: &'a str,
+    /// Layout diagram + frame navigation blurb (from `/tmp/chunk` or default).
+    pub splash_chunk: &'a str,
+    /// Current cycling tip for the upper-right of the magenta pane.
+    pub splash_tip: &'a str,
+    /// Tip fade level (0 = full brightness, 10 = invisible).
+    pub splash_tip_fade: u8,
     /// Which side of the first screen is highlighted (default Magenta).
     pub splash_focus: crate::app_state::SplashFocus,
 }
@@ -1586,16 +1668,13 @@ pub struct PickerDrawData<'a> {
     pub focus: crate::app_state::PickerFocus,
     pub summary: &'a str,
     pub summary_scroll: usize,
-    pub wiki_links: &'a [crate::app_state::WikiLink],
+    pub wiki_links: &'a [WikiLink],
     pub active_link_idx: usize,
     pub summary_action: crate::app_state::SummaryAction,
+    /// When true, `summary` is wiki markdown (render richly); otherwise plain session meta.
+    pub summary_is_markdown: bool,
     /// When in the 3-pane overview (picker | nav | content), which column has focus.
     pub view_focus: crate::app_state::ViewFocus,
-    // Browser nav for Screen 2 (stable Harness + Wiki tree)
-    pub browser_nav_items: &'a [crate::app_state::WikiNavItem],
-    pub browser_selected_nav: usize,
-    pub browser_wiki_content: &'a str,
-    pub browser_wiki_scroll: usize,
 }
 
 pub struct WorkspaceDrawData<'a> {
@@ -1611,182 +1690,11 @@ pub struct WorkspaceDrawData<'a> {
     pub left_highlight: Option<usize>,
     pub right_highlight: Option<usize>,
     // Plan mode overlay pane (shown when run mode == "plan" or plan.active)
-    pub plan: Option<&'a crate::app_state::PlanState>,
-}
-
-/// Draw splash or workspace, or animate a horizontal slide between them.
-/// When desktop is Picker, draws the combined workspaces+sessions tree + summary (no separate sessions pane).
-fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &crate::app_state::PlanState) {
-    let is_approved = !plan.steps.is_empty();
-    let pane_color = if is_approved { PLAN_GREEN } else { PLAN_ORANGE };
-    let title_text = if is_approved { " Plan (approved) " } else { " Plan " };
-    let block = Block::default()
-        .title(Span::styled(title_text, Style::default().fg(pane_color).add_modifier(Modifier::BOLD)))
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(pane_color))
-        .style(Style::default().bg(Color::Black));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let mut lines: Vec<Line> = vec![];
-
-    // Key fields summary (compact)
-    lines.push(Line::from(vec![
-        Span::styled("Goal: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(if plan.goal.is_empty() { "(gathering from user)" } else { &plan.goal }, Style::default().fg(Color::White)),
-    ]));
-    if !plan.success_criteria.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Success Criteria: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&plan.success_criteria, Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd))),
-        ]));
-    }
-    if !plan.verification_steps.is_empty() {
-        lines.push(Line::from(Span::styled("Verification:", Style::default().fg(Color::DarkGray))));
-        for v in plan.verification_steps.iter().take(2) {
-            lines.push(Line::from(Span::styled(format!("  • {}", v), Style::default().fg(Color::Gray))));
-        }
-    }
-    if !plan.rollback.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Rollback: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&plan.rollback, Style::default().fg(Color::Yellow)),
-        ]));
-    }
-    if !plan.constraints.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("Constraints: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(&plan.constraints, Style::default().fg(Color::Gray)),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-
-    if plan.steps.is_empty() {
-        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let slow = spins[(plan.spinner_tick / 4) % spins.len()];
-        match plan.loop_phase {
-            crate::app_state::PlanLoopPhase::FetchingQuestion
-            | crate::app_state::PlanLoopPhase::FetchingProposal => {
-                lines.push(Line::from(Span::styled(
-                    format!("{slow} Planning… (JSON loop)"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-            crate::app_state::PlanLoopPhase::AwaitingUserAnswer => {
-                if let Some(q) = &plan.pending_question {
-                    lines.push(Line::from(Span::styled(
-                        format!("❓ {}", q.prompt),
-                        Style::default().fg(Color::Rgb(0xff, 0xcc, 0x66)),
-                    )));
-                    for (i, opt) in q.options.iter().enumerate() {
-                        let rec = q
-                            .recommend
-                            .as_deref()
-                            .is_some_and(|r| r == opt.id)
-                            .then_some(" ★");
-                        lines.push(Line::from(Span::styled(
-                            format!(
-                                "  {}. {}{}",
-                                i + 1,
-                                opt.label,
-                                rec.unwrap_or_default()
-                            ),
-                            Style::default().fg(Color::Gray),
-                        )));
-                    }
-                }
-            }
-            crate::app_state::PlanLoopPhase::AwaitingProceedConsent => {
-                lines.push(Line::from(Span::styled(
-                    "📋 Review proposal in chat — ready to proceed?",
-                    Style::default().fg(Color::Rgb(0xcc, 0xff, 0xcc)),
-                )));
-            }
-            _ => {
-                lines.push(Line::from(Span::styled(
-                    format!("{slow} Steps: (to be determined)"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        }
-    } else {
-        // Execution phase: show progress + steps
-        // Progress with swirl + optional simple bar
-        let spins = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-        let spin = spins[plan.spinner_tick % spins.len()];
-        let progress = if !plan.steps.is_empty() && plan.current_step < plan.steps.len() {
-            let st = &plan.steps[plan.current_step];
-            let observe = plan
-                .pending_observe_prompt
-                .as_deref()
-                .map(|p| format!(" — waiting: {}", p))
-                .unwrap_or_default();
-            format!(
-                "{} Step {}/{} {}{}",
-                spin,
-                plan.current_step + 1,
-                plan.steps.len(),
-                st.description,
-                observe
-            )
-        } else if !plan.steps.is_empty() {
-            // All steps completed (or forced on final Done / WORK_COMPLETE)
-            "✓ Plan complete".to_string()
-        } else {
-            format!("{} Preparing plan...", spin)
-        };
-        lines.push(Line::from(Span::styled(progress, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
-
-        // Simple progress bar
-        if !plan.steps.is_empty() {
-            let total = plan.steps.len();
-            let done = plan.steps.iter().filter(|s| s.status == crate::app_state::PlanStepStatus::Done).count();
-            let mut pct = done.saturating_mul(100) / total.max(1);
-            if plan.current_step >= total || done >= total {
-                pct = 100;
-            }
-            let bar_width = 20;
-            let filled = pct * bar_width / 100;
-            let bar = format!("[{}{}] {}%", "=".repeat(filled), " ".repeat(bar_width - filled), pct);
-            lines.push(Line::from(Span::styled(bar, Style::default().fg(pane_color))));
-        }
-
-        // Step list preview
-        for (i, st) in plan.steps.iter().enumerate().take(5) {
-            let mark = if i == plan.current_step {
-                "▶ "
-            } else {
-                match st.status {
-                    crate::app_state::PlanStepStatus::Done => "✓ ",
-                    crate::app_state::PlanStepStatus::Failed => "✗ ",
-                    _ => "  ",
-                }
-            };
-            let tier = st
-                .tier
-                .map(|t| format!(" [{}]", t.pane_label()))
-                .unwrap_or_default();
-            let v = st
-                .verification
-                .as_deref()
-                .or(st.observe_prompt.as_deref())
-                .map(|v| format!(" ({})", v))
-                .unwrap_or_default();
-            lines.push(Line::from(Span::styled(
-                format!("{}{}{}{}", mark, st.description, tier, v),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    }
-
-    // Footer note about wiki storage
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Stored in: wiki/plan.md (editable outside)", Style::default().fg(Color::DarkGray))));
-
-    let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
-    f.render_widget(para, inner);
+    pub plan: Option<&'a PlanState>,
+    // Trace pane cursor
+    pub trace_cursor: usize,
+    pub trace_cursor_active: bool,
+    pub trace_expanded: &'a std::collections::HashSet<usize>,
 }
 
 pub fn draw_content_desktop(
@@ -1796,6 +1704,7 @@ pub fn draw_content_desktop(
     workspace: &WorkspaceDrawData<'_>,
     splash: &SplashData<'_>,
     picker: &PickerDrawData<'_>,
+    overview_browser: &mut crate::wiki_browser::WikiBrowser,
     _wiki_viewer: &crate::app_state::WikiViewerState,
     last_left_area: &mut Rect,
     last_right_area: &mut Rect,
@@ -1851,7 +1760,7 @@ pub fn draw_content_desktop(
 
     match desktop.active {
         ActiveDesktop::Splash => {
-            // Horizontal split: left = magenta pane with raven + help, right = workspace picker (full height, outside magenta)
+            // Horizontal split: left = magenta pane (raven, help, layout chunk), right = workspace picker.
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -1925,10 +1834,7 @@ pub fn draw_content_desktop(
             let nav_area = cols[1];
             let content_area = cols[2];
 
-            let is_harness = crate::app_state::browser_nav_is_harness(
-                picker.browser_nav_items,
-                picker.browser_selected_nav,
-            );
+            let is_harness = overview_browser.selected_is_harness();
             let picker_focused = picker.view_focus == crate::app_state::ViewFocus::Picker;
             let nav_focused = picker.view_focus == crate::app_state::ViewFocus::Nav;
             let content_focused = picker.view_focus == crate::app_state::ViewFocus::Content;
@@ -1937,18 +1843,47 @@ pub fn draw_content_desktop(
             draw_picker_tree(f, picker_area, picker.picker_items, picker.selected_item, picker_focused);
 
             // Nav column (Coding Harness at top, Wiki subtree under it; stable, no index.md)
-            draw_nav_pane_for_browser(f, nav_area, " Nav ", picker.browser_nav_items, picker.browser_selected_nav, nav_focused);
+            draw_nav_pane_for_browser(
+                f,
+                nav_area,
+                &overview_browser.nav_items,
+                overview_browser.selected_nav,
+                nav_focused,
+            );
 
             // Content column: either wiki content or harness (status + conv + input)
             if is_harness {
-                // Allocate space at top of content col for real upper status bar (drawn in event_loop overlay for alignment)
-                // then conv, then input space at bottom.
-                let vparts = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(3)])
-                    .split(content_area);
+                let harness_border = if content_focused {
+                    Color::Cyan
+                } else {
+                    Color::Rgb(0x55, 0x55, 0x66)
+                };
+                let harness_block = Block::default()
+                    .title(Span::styled(
+                        " Harness ",
+                        Style::default()
+                            .fg(if content_focused {
+                                Color::Cyan
+                            } else {
+                                Color::DarkGray
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(harness_border))
+                    .style(Style::default().bg(Color::Black));
+                let harness_inner = harness_block.inner(content_area);
+                f.render_widget(harness_block, content_area);
 
-                // Conversation content directly (no extra pane frame for embedded Screen 2 view)
+                let (_status_area, conv_area, _input_area) =
+                    overview_harness_split(harness_inner);
+
+                overview_browser.scroll_metrics = crate::wiki_browser::WikiScrollMetrics {
+                    content_visible: conv_area.height.saturating_sub(2).max(5),
+                    nav_visible: (nav_area.height as usize).saturating_sub(2).max(1) as u16,
+                    content_lines: 0,
+                };
+
                 let mut dummy_last = Rect::default();
                 let mut dummy_cnt = 0u16;
                 let conv_pane_focus = if content_focused { Pane::Left } else { Pane::Right };
@@ -1956,31 +1891,36 @@ pub fn draw_content_desktop(
                     f,
                     workspace.left_committed,
                     workspace.current_response,
-                    vparts[1],
+                    conv_area,
                     &mut dummy_last,
                     &mut dummy_cnt,
-                    false,  // don't auto-follow, allow manual scroll with up/down
+                    false,
                     left_scroll,
                     conv_pane_focus,
                     workspace.scroll_flash_timer,
                     workspace.left_highlight,
-                    true,  // draw the Conversation frame with label
+                    false,
                 );
-
-                // Bottom space for input box (drawn as overlay in event_loop)
-                // (no block here to let real input bar appear)
             } else {
                 // Wiki content pane -- use browser content + custom markdown like full wiki
                 let wiki_border = if content_focused { Color::Cyan } else { Color::Rgb(0x55,0x55,0x66) };
-                let txt = if picker.browser_wiki_content.is_empty() {
+                let txt = if overview_browser.content.is_empty() {
                     "(wiki content for selected nav item)".to_string()
                 } else {
-                    picker.browser_wiki_content.to_string()
+                    overview_browser.content.clone()
                 };
-                let md_text = wiki_render_markdown(&txt);
+                let content_width = crate::code_highlight::markdown_content_width(content_area);
+                let content_lines = crate::markdown_pane::markdown_line_count(&txt, content_width);
+                overview_browser.scroll_metrics = crate::wiki_browser::WikiScrollMetrics {
+                    content_visible: (content_area.height as usize).saturating_sub(2).max(1) as u16,
+                    nav_visible: (nav_area.height as usize).saturating_sub(2).max(1) as u16,
+                    content_lines,
+                };
+                let mut md_text = render_markdown(&txt);
+                crate::code_highlight::pad_code_block_lines(&mut md_text, content_width);
                 let preview = Paragraph::new(md_text)
                     .wrap(Wrap { trim: true })
-                    .scroll((picker.browser_wiki_scroll as u16, 0))
+                    .scroll((overview_browser.scroll as u16, 0))
                     .block(
                         Block::default()
                             .title(Span::styled(" Wiki ", Style::default().fg(if content_focused { Color::Cyan } else { Color::DarkGray }).add_modifier(Modifier::BOLD)))
@@ -2061,48 +2001,70 @@ pub fn draw_content_desktop(
                 right_focus,
                 workspace.scroll_flash_timer,
                 workspace.right_highlight,
+                workspace.trace_cursor,
+                workspace.trace_cursor_active,
+                workspace.trace_expanded,
             );
         }
     }
 }
 
-/// Draw only the wiki Nav pane (used by full WikiViewer and by the splash Overview 3-col).
+/// Draw only the wiki browser pane (full WikiViewer and Overview 3-col).
 pub fn draw_wiki_nav_pane(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState, focused: bool) {
-    draw_nav_list(f, area, &format!(" {} ", viewer.current_file), &viewer.nav_items, viewer.selected_nav, focused || viewer.focus == crate::app_state::WikiFocus::Nav);
+    draw_nav_list(
+        f,
+        area,
+        " Browser ",
+        None,
+        &viewer.nav_items,
+        viewer.selected_nav,
+        focused || viewer.focus == crate::app_state::WikiFocus::Nav,
+    );
 }
 
-pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
-    draw_nav_list(f, area, title, items, selected, focused);
+pub fn draw_nav_pane_for_browser(
+    f: &mut Frame,
+    area: Rect,
+    items: &[WikiNavItem],
+    selected: usize,
+    focused: bool,
+) {
+    draw_nav_list(f, area, " Browser ", None, items, selected, focused);
 }
 
-fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_state::WikiNavItem], selected: usize, focused: bool) {
-    let nav_border = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+fn draw_nav_list(
+    f: &mut Frame,
+    area: Rect,
+    block_title: &str,
+    inner_label: Option<&str>,
+    items: &[WikiNavItem],
+    selected: usize,
+    focused: bool,
+) {
+    let nav_border = list_focus_border_style(focused);
     let mut nav_text = Text::default();
-    nav_text.lines.push(Line::from(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    if let Some(label) = inner_label {
+        nav_text.lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        nav_text.lines.push(Line::from(""));
+    }
     let sel = selected;
     let nitems = items.len();
     let nav_vis = (area.height as usize).saturating_sub(2).max(1);
-    let nav_off = if nitems <= nav_vis || sel < nav_vis / 2 {
-        0
-    } else if sel + nav_vis / 2 >= nitems {
-        nitems.saturating_sub(nav_vis)
-    } else {
-        sel.saturating_sub(nav_vis / 2)
-    };
+    let nav_off = list_visible_offset(sel, nav_vis, nitems);
     for (i, item) in items.iter().enumerate().skip(nav_off).take(nav_vis) {
         let is_sel = i == sel;
         let style = if is_sel {
-            Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
+            list_selection_style()
         } else {
             match item.kind {
-                crate::app_state::NavItemKind::Back => Style::default().fg(Color::Yellow),
-                crate::app_state::NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
-                crate::app_state::NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
-                crate::app_state::NavItemKind::Harness => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                NavItemKind::Back => Style::default().fg(Color::Yellow),
+                NavItemKind::Header => Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
+                NavItemKind::Link => Style::default().fg(Color::Rgb(0x66, 0xcc, 0xee)),
+                NavItemKind::Harness => Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             }
         };
         let prefix = if is_sel { "▶ " } else { "  " };
@@ -2110,14 +2072,20 @@ fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[crate::app_sta
         nav_text.lines.push(Line::from(Span::styled(shown, style)));
     }
     if items.is_empty() {
-        nav_text.lines.push(Line::from(Span::styled("  (no nav)", Style::default().fg(Color::DarkGray))));
+        nav_text.lines.push(Line::from(Span::styled("  ···", Style::default().fg(Color::Rgb(0x44, 0x44, 0x55)))));
+        nav_text.lines.push(Line::from(Span::styled("  No headings yet", Style::default().fg(Color::DarkGray))));
     }
-    let nav_para = Paragraph::new(nav_text)
-        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
+    let nav_para = Paragraph::new(nav_text).block(
+        Block::default()
+            .title(block_title)
+            .borders(Borders::ALL)
+            .border_style(nav_border)
+            .style(Style::default().bg(Color::Black)),
+    );
     f.render_widget(nav_para, area);
 }
 
-pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState) {
+pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &mut crate::wiki_browser::WikiBrowser) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -2144,52 +2112,26 @@ pub fn draw_wiki_viewer(f: &mut Frame, area: Rect, viewer: &crate::app_state::Wi
     content_text.lines.push(Line::from(""));
 
     let md = if viewer.content.is_empty() {
-        "(empty wiki file)".to_string()
+        "🪶 Empty page — the agent will populate this as it works".to_string()
     } else {
         viewer.content.clone()
     };
-    let mut md_text = wiki_render_markdown(&md);
-
-    // Extract search text from active nav item for content highlighting
     let active_item = viewer.nav_items.get(sel);
-    let search = match active_item.map(|it| &it.kind) {
-        Some(crate::app_state::NavItemKind::Header) => {
-            // Strip leading indent + # markers to get bare heading text
-            active_item.map(|it| it.label.trim().trim_start_matches('#').trim().to_string()).unwrap_or_default()
-        }
-        Some(crate::app_state::NavItemKind::Link) => {
-            // Strip "→ " prefix
-            active_item.map(|it| it.label.trim_start_matches("→ ").trim().to_string()).unwrap_or_default()
-        }
-        _ => String::new(),
-    };
-
-    // Post-style: highlight matching text or the line near scroll start for the selected nav target
-    let start = viewer.scroll;
+    let search = active_item
+        .map(|it| nav_highlight_search(it.kind, &it.label))
+        .unwrap_or_default();
+    let content_width = crate::code_highlight::markdown_content_width(content_area);
     let max = (content_area.height as usize).saturating_sub(4);
-    for (src_idx, line) in md_text.lines.iter_mut().enumerate().skip(start).take(max) {
-        let is_active_region = if !search.is_empty() {
-            line.spans.iter().any(|s| s.content.contains(&search))
-        } else {
-            // fallback: highlight around current scroll position
-            src_idx == start || src_idx == start.saturating_add(1)
-        };
-        for span in &mut line.spans {
-            let matches = !search.is_empty() && span.content.contains(&search);
-            if matches || is_active_region {
-                // Subtle highlight for active nav target (heading or link) in wiki content,
-                // matching the style used for selected items in nav/tree panes.
-                let mut st = span.style;
-                st = st
-                    .fg(Color::White)
-                    .bg(Color::Rgb(0x20, 0x50, 0x80))
-                    .add_modifier(Modifier::BOLD);
-                span.style = st;
-            }
-        }
-    }
-
-    for line in md_text.lines.into_iter().skip(start).take(max) {
+    let content_lines = crate::markdown_pane::markdown_line_count(&md, content_width);
+    viewer.scroll_metrics = crate::wiki_browser::WikiScrollMetrics {
+        content_visible: max.max(1) as u16,
+        nav_visible: (nav_area.height as usize).saturating_sub(2).max(1) as u16,
+        content_lines,
+    };
+    let start = viewer.scroll;
+    let mut md_text = markdown_viewport(&md, start, max, content_width);
+    highlight_markdown_viewport(&mut md_text, &search, 0, max);
+    for line in md_text.lines {
         content_text.lines.push(line);
     }
 
@@ -2209,17 +2151,18 @@ pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
         .split(area);
 
     draw_picker_tree(f, cols[0], data.picker_items, data.selected_item, data.focus == crate::app_state::PickerFocus::Tree);
-    draw_session_summary(f, cols[1], data.summary, data.summary_scroll, data.focus == crate::app_state::PickerFocus::Summary, data.wiki_links, data.active_link_idx, data.summary_action);
+    draw_session_summary(
+        f,
+        cols[1],
+        data.summary,
+        data.summary_scroll,
+        data.focus == crate::app_state::PickerFocus::Summary,
+        data.wiki_links,
+        data.active_link_idx,
+        data.summary_action,
+        data.summary_is_markdown,
+    );
 
-    // subtle hint line at bottom of area if space
-    if area.height > 4 {
-        let hint = "↑↓ Tree  ←→ focus  w: wiki  Enter: launch  (right on summary -> full wiki)";
-        let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
-        f.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
-            hint_area,
-        );
-    }
 }
 
 fn draw_picker_tree(
@@ -2234,7 +2177,9 @@ fn draw_picker_tree(
     let mut text = Text::default();
 
     if items.is_empty() {
-        text.lines.push(Line::from(Span::styled("  (no workspaces)", Style::default().fg(Color::DarkGray))));
+        text.lines.push(Line::from(Span::styled("  🪶", Style::default().fg(Color::Rgb(0x55, 0x55, 0x66)))));
+        text.lines.push(Line::from(Span::styled("  No workspaces yet", Style::default().fg(Color::DarkGray))));
+        text.lines.push(Line::from(Span::styled("  Start a conversation below", Style::default().fg(Color::Rgb(0x44, 0x44, 0x55)))));
     } else {
         // Compute usable width from the rendered pane area (borders on each side).
         // We subtract a small margin so text doesn't butt against the right border.
@@ -2253,22 +2198,16 @@ fn draw_picker_tree(
             };
             let indent = "  ".repeat(item.depth);
             let style = if is_sel {
-                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-            } else if focused {
-                Style::default().fg(Color::White)
+                list_selection_style()
             } else {
-                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+                list_unselected_style(focused)
             };
             let label = format!("{}{}{}", prefix, indent, item.label);
             text.lines.push(Line::from(Span::styled(truncate_str(&label, maxw), style)));
         }
     }
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let border_style = list_focus_border_style(focused);
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -2310,11 +2249,9 @@ fn draw_workspace_column(
             let is_sel = i == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-            } else if focused {
-                Style::default().fg(Color::White)
+                list_selection_style()
             } else {
-                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+                list_unselected_style(focused)
             };
             let label = format!(
                 "{}{} ({} sess)",
@@ -2326,11 +2263,7 @@ fn draw_workspace_column(
         }
     }
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let border_style = list_focus_border_style(focused);
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -2364,17 +2297,15 @@ fn draw_sessions_column(
     text.lines.push(Line::from(""));
 
     if sessions.is_empty() {
-        text.lines.push(Line::from(Span::styled("  (no sessions)", Style::default().fg(Color::DarkGray))));
+        text.lines.push(Line::from(Span::styled("  🪶 No sessions yet", Style::default().fg(Color::DarkGray))));
     } else {
         for (i, s) in sessions.iter().enumerate().take(12) {
             let is_sel = i == selected;
             let prefix = if is_sel { "▶ " } else { "  " };
             let style = if is_sel {
-                Style::default().fg(Color::White).bg(Color::Rgb(0x20, 0x50, 0x80)).add_modifier(Modifier::BOLD)
-            } else if focused {
-                Style::default().fg(Color::White)
+                list_selection_style()
             } else {
-                Style::default().fg(Color::Rgb(0xaa, 0xaa, 0xaa))
+                list_unselected_style(focused)
             };
             let short_id = &s.session_id[..s.session_id.len().min(28)];
             let label = format!("{}{}  {}", prefix, short_id, &s.updated_at[..s.updated_at.len().min(16)]);
@@ -2382,11 +2313,7 @@ fn draw_sessions_column(
         }
     }
 
-    let border_style = if focused {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
-    };
+    let border_style = list_focus_border_style(focused);
     let para = Paragraph::new(text)
         .block(
             Block::default()
@@ -2429,28 +2356,31 @@ fn draw_session_summary(
     summary: &str,
     scroll: usize,
     focused: bool,
-    _wiki_links: &[crate::app_state::WikiLink],
+    _wiki_links: &[WikiLink],
     _active_link_idx: usize,
     _summary_action: crate::app_state::SummaryAction,
+    summary_is_markdown: bool,
 ) {
-    // Summary-only pane (full wiki is on the dedicated wiki viewer screen)
     let content_area = area;
-
-    let mut text = Text::default();
-
-    let start = scroll;
     let max_lines = (content_area.height as usize).saturating_sub(4);
 
-    let all_lines: Vec<String> = if summary.is_empty() {
-        vec!["  (no session)".to_string()]
+    let text = if summary.is_empty() {
+        Text::from(vec![
+            Line::from(Span::styled("  🪶", Style::default().fg(Color::Rgb(0x55, 0x55, 0x66)))),
+            Line::from(Span::styled("  Select a session to preview", Style::default().fg(Color::DarkGray))),
+        ])
+    } else if summary_is_markdown {
+        markdown_viewport(summary, scroll, max_lines, crate::code_highlight::markdown_content_width(content_area))
     } else {
-        summary.lines().map(|l| l.to_string()).collect()
+        let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
+        let mut plain = Text::default();
+        for line in summary.lines().skip(scroll).take(max_lines) {
+            plain
+                .lines
+                .push(Line::from(Span::styled(line.to_string(), base_style)));
+        }
+        plain
     };
-
-    let base_style = Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd));
-    for line in all_lines.iter().skip(start).take(max_lines) {
-        text.lines.push(Line::from(Span::styled(line.to_string(), base_style)));
-    }
 
     let border_style = if focused {
         Style::default().fg(Color::Cyan)
@@ -2494,129 +2424,142 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
     render_splash_content(buf, inner, data);
 }
 
+fn render_left_aligned_text_block(buf: &mut Buffer, area: Rect, text: &Text<'static>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    for (y, line) in (area.y..).zip(text.lines.iter()) {
+        if y >= area.y + area.height {
+            break;
+        }
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .render(
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                buf,
+            );
+    }
+}
+
+/// Left margin for the splash intro + diagram block (~25% of magenta pane width).
+fn splash_chunk_indent(pane_width: u16) -> u16 {
+    if pane_width == 0 {
+        return 0;
+    }
+    let indent = pane_width.saturating_mul(25) / 100;
+    // Keep a minimum content width for the diagram.
+    indent.min(pane_width.saturating_sub(24).max(1))
+}
+
+/// Vertically centered, left-aligned text block.
+fn render_middle_left_text_block(buf: &mut Buffer, area: Rect, text: &Text<'static>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let content_h = text.lines.len() as u16;
+    let start_y = area.y + (area.height.saturating_sub(content_h)) / 2;
+    for (y, line) in (start_y..).zip(text.lines.iter()) {
+        if y >= area.y + area.height {
+            break;
+        }
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .render(
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                buf,
+            );
+    }
+}
+
+fn raven_art_width(art: &str) -> u16 {
+    art.lines()
+        .map(char_count)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1) as u16
+}
+
+fn splash_top_height(raven_art: &str, tip_text: &Text<'static>) -> u16 {
+    let raven_lines = raven_art.lines().count() as u16;
+    let tip_lines = tip_text.lines.len() as u16;
+    raven_lines.max(tip_lines).saturating_add(1)
+}
+
+fn render_splash_chunk_buf(buf: &mut Buffer, area: Rect, chunk: &str) {
+    if area.width == 0 || area.height == 0 || chunk.trim().is_empty() {
+        return;
+    }
+    let indent = splash_chunk_indent(area.width);
+    let inner_width = area.width.saturating_sub(indent).max(1);
+    let inner_area = Rect {
+        x: area.x.saturating_add(indent),
+        y: area.y,
+        width: inner_width,
+        height: area.height,
+    };
+    let text = crate::splash_chunk::build_splash_chunk_display(chunk, inner_width);
+    render_middle_left_text_block(buf, inner_area, &text);
+}
+
 fn render_splash_content(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) {
     if area.width < 8 || area.height < 6 {
         return;
     }
 
+    let tip_width = area.width.saturating_sub(raven_art_width(data.raven_art)) as usize;
+    let tip_text = crate::splash_tips::build_splash_tip_text(
+        data.splash_tip,
+        tip_width.max(16),
+        data.splash_tip_fade,
+    );
+    let top_h = splash_top_height(data.raven_art, &tip_text).min(area.height);
+
+    let top_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: top_h,
+    };
+    let body_area = Rect {
+        x: area.x,
+        y: area.y.saturating_add(top_h),
+        width: area.width,
+        height: area.height.saturating_sub(top_h),
+    };
+
+    // Intro + Mermaid diagram: left-aligned, vertically centered in the pane body.
+    render_splash_chunk_buf(buf, body_area, data.splash_chunk);
+
+    let art_w = raven_art_width(data.raven_art).min(top_area.width.saturating_sub(4));
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(area);
+        .constraints([Constraint::Length(art_w), Constraint::Min(0)])
+        .split(top_area);
 
-    let art_style = Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff));
-    // Add extra padding above and to the left of the ASCII raven art
-    let art_area = cols[0];
-    let padded_art = Rect {
-        x: art_area.x + 3,           // extra left padding
-        y: art_area.y + 2,           // extra top padding
-        width: art_area.width.saturating_sub(6),
-        height: art_area.height.saturating_sub(3),
+    let magenta_focused =
+        data.splash_focus == crate::app_state::SplashFocus::Magenta;
+    let art_style = if magenta_focused {
+        Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
     Paragraph::new(data.raven_art)
         .style(art_style)
+        .alignment(Alignment::Left)
         .wrap(Wrap { trim: false })
-        .render(padded_art, buf);
+        .render(cols[0], buf);
 
-    let hint = Style::default().fg(Color::DarkGray);
-    let accent = Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff));
-    let key = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-
-    let help = Text::from(vec![
-        Line::from(Span::styled(
-            "Local-first agentic coding harness",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("→", key),
-            Span::styled("  Right arrow", accent),
-            Span::styled("  workspace/session picker", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("←", key),
-            Span::styled("  Left arrow", accent),
-            Span::styled("  back from picker / panes", hint),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Navigation",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("Tab", key),
-            Span::styled("  cycle focus (Conv → Trace → Input)", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("↑↓", key),
-            Span::styled("  scroll pane  •  ", hint),
-            Span::styled("Ctrl+↑↓", key),
-            Span::styled("  input history", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("Ctrl+F", key),
-            Span::styled("  search  •  ", hint),
-            Span::styled("/help", key),
-            Span::styled("  slash commands", hint),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Copy / paste",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("Shift+drag", key),
-            Span::styled("  terminal selection  •  ", hint),
-            Span::styled("Ctrl+Insert", key),
-            Span::styled("  copy", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("Shift+Insert", key),
-            Span::styled("  paste  •  ", hint),
-            Span::styled("Ctrl+V", key),
-            Span::styled("  paste (when clipboard works)", hint),
-        ]),
-        Line::from(Span::styled(
-            "SSH/screen vary by emulator — bracketed paste and Ctrl+V are tried automatically",
-            hint,
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Session",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("endpoint: ", hint),
-            Span::styled(data.base_url, accent),
-        ]),
-        Line::from(vec![
-            Span::styled("model:    ", hint),
-            Span::styled(data.model, accent),
-        ]),
-        Line::from(vec![
-            Span::styled("workspace:", hint),
-            Span::styled(truncate_str(data.workspace, 48), accent),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Goals, repo cache, and summaries persist under ~/.raven-hotel/",
-            hint,
-        )),
-    ]);
-
-    Paragraph::new(help)
-        .wrap(Wrap { trim: true })
-        .render(cols[1], buf);
+    render_left_aligned_text_block(buf, cols[1], &tip_text);
 }
 
 fn render_workspace_to_buffer(buf: &mut Buffer, content_area: Rect, data: &WorkspaceDrawData<'_>) {
@@ -2788,126 +2731,8 @@ fn build_left_text(
     current_response: &str,
     highlight_line: Option<usize>,
 ) -> Text<'static> {
-    let mut left_text = Text::default();
-    let mut line_idx = 0usize;
-    let mut consecutive_blanks = 0usize;
-
-    for (i, entry) in left_committed.iter().enumerate() {
-        if is_plan_entry_confirm(entry) {
-            push_attention_entry(&mut left_text, entry, highlight_line, &mut line_idx, PLAN_ORANGE);
-        } else if entry.starts_with("You: ") || entry.starts_with("> ") || entry.starts_with("You (interject") {
-            let (prefix_style, body_style) = conversation_entry_styles(entry);
-            let lines_iter: Vec<&str> = entry.lines().collect();
-            for (li, line) in lines_iter.iter().enumerate() {
-                let is_blank = line.trim().is_empty();
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks > 2 {
-                        continue;
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                }
-                let style = if Some(line_idx) == highlight_line {
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD)
-                } else if li == 0 {
-                    prefix_style
-                } else {
-                    body_style
-                };
-                left_text
-                    .lines
-                    .push(Line::from(Span::styled(line.to_string(), style)));
-                line_idx += 1;
-            }
-        } else {
-            let md = wiki_render_markdown(entry);
-            for mut line in md.lines {
-                if Some(line_idx) == highlight_line {
-                    for sp in &mut line.spans {
-                        sp.style = sp.style
-                            .fg(Color::Black)
-                            .bg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD);
-                    }
-                }
-                let is_blank = line.spans.is_empty() || line.spans.iter().all(|s| s.content.trim().is_empty());
-                if is_blank {
-                    consecutive_blanks += 1;
-                    if consecutive_blanks <= 2 {
-                        left_text.lines.push(line);
-                    }
-                } else {
-                    consecutive_blanks = 0;
-                    left_text.lines.push(line);
-                }
-                line_idx += 1;
-            }
-        }
-        if i < left_committed.len() - 1 && consecutive_blanks < 2 {
-            left_text.lines.push(Line::from(""));
-            line_idx += 1;
-            consecutive_blanks += 1;
-        }
-    }
-
-    if !current_response.is_empty() {
-        left_text.lines.push(Line::from(Span::styled(
-            "Agent (streaming):",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        )));
-        line_idx += 1;
-
-        let lines: Vec<&str> = current_response.lines().collect();
-        let has_partial = !current_response.ends_with('\n');
-        let complete_count = if has_partial {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len()
-        };
-
-        for line in &lines[..complete_count] {
-            let is_blank = line.trim().is_empty();
-            if is_blank {
-                consecutive_blanks += 1;
-                if consecutive_blanks > 2 {
-                    continue;
-                }
-            } else {
-                consecutive_blanks = 0;
-            }
-            let style = if Some(line_idx) == highlight_line {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-            };
-            left_text
-                .lines
-                .push(Line::from(Span::styled(line.to_string(), style)));
-            line_idx += 1;
-        }
-
-        if has_partial {
-            if let Some(partial) = lines.last() {
-                left_text.lines.push(Line::from(Span::styled(
-                    partial.to_string(),
-                    Style::default()
-                        .fg(Color::Rgb(0xd0, 0xf0, 0xd0))
-                        .add_modifier(Modifier::ITALIC),
-                )));
-            }
-        }
-    }
-
-    left_text
+    let (text, _gutter_colors) = build_conversation_text(left_committed, current_response, highlight_line);
+    text
 }
 
 fn build_right_text(
@@ -2983,7 +2808,7 @@ fn render_scrollable_pane_buf(
         line_count,
         max_scroll,
         ..
-    } = pane_scroll_metrics(area, text, has_title);
+    } = pane_scroll_metrics(area, text, has_title, 1);
     *last_line_count = line_count;
     *scroll = (*scroll).min(max_scroll);
 

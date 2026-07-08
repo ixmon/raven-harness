@@ -46,6 +46,155 @@ use walkdir::WalkDir;
 const RAVEN_HOME: &str = ".raven-hotel";
 const SESSIONS_SUBDIR: &str = "sessions";
 
+/// A structured trace event for the trace_log.jsonl file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub ts: String,
+    pub kind: TraceKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// The display line as it would appear in the trace pane.
+    /// This makes restore trivial: just push this into trace_lines.
+    pub display: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceKind {
+    ToolStart,
+    ToolResult,
+    Thinking,
+    System,
+    Judge,
+    UserAction,
+}
+
+impl TraceEvent {
+    /// Create a ToolStart event.
+    pub fn tool_start(name: &str, args: &str, display: &str) -> Self {
+        Self {
+            ts: chrono::Utc::now().to_rfc3339(),
+            kind: TraceKind::ToolStart,
+            tool_name: Some(name.to_string()),
+            args: Some(args.to_string()), // full args, not truncated
+            summary: None,
+            content: None,
+            display: display.to_string(),
+        }
+    }
+
+    /// Create a ToolResult event.
+    pub fn tool_result(name: &str, summary: &str, display: &str) -> Self {
+        Self {
+            ts: chrono::Utc::now().to_rfc3339(),
+            kind: TraceKind::ToolResult,
+            tool_name: Some(name.to_string()),
+            args: None,
+            summary: Some(summary.to_string()),
+            content: None,
+            display: display.to_string(),
+        }
+    }
+
+    /// Create a Thinking event (settled thinking line).
+    pub fn thinking(display: &str) -> Self {
+        Self {
+            ts: chrono::Utc::now().to_rfc3339(),
+            kind: TraceKind::Thinking,
+            tool_name: None,
+            args: None,
+            summary: None,
+            content: None,
+            display: display.to_string(),
+        }
+    }
+
+    /// Create a system/judge/user-action event.
+    pub fn system(display: &str) -> Self {
+        Self {
+            ts: chrono::Utc::now().to_rfc3339(),
+            kind: TraceKind::System,
+            tool_name: None,
+            args: None,
+            summary: None,
+            content: None,
+            display: display.to_string(),
+        }
+    }
+}
+
+/// `~/.raven-hotel`
+pub fn raven_home() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    PathBuf::from(home).join(RAVEN_HOME)
+}
+
+/// `~/.raven-hotel/sessions`
+pub fn sessions_root() -> PathBuf {
+    raven_home().join(SESSIONS_SUBDIR)
+}
+
+/// `~/.raven-hotel/sessions/<session_id>`
+pub fn session_dir(session_id: &str) -> PathBuf {
+    sessions_root().join(session_id)
+}
+
+/// `~/.raven-hotel/sessions/<session_id>/wiki`
+pub fn session_wiki_dir(session_id: &str) -> PathBuf {
+    session_dir(session_id).join("wiki")
+}
+
+/// Read a wiki markdown file for a session by relative path (e.g. `index.md`, `research/notes.md`).
+pub fn read_session_wiki_file(session_id: &str, rel: &str) -> Option<String> {
+    let r = Session::strip_wiki_prefix(rel);
+    let clean_rel = if r.is_empty() || r == "." || r == "/" {
+        "index.md".to_string()
+    } else {
+        r
+    };
+    fs::read_to_string(session_wiki_dir(session_id).join(&clean_rel)).ok()
+}
+
+/// Recursively list `.md` files under a session wiki dir, relative to `wiki/`.
+/// Ensures at least `index.md` is returned when the dir is empty.
+pub fn collect_session_wiki_md_files(session_id: &str) -> Vec<String> {
+    let wiki_dir = session_wiki_dir(session_id);
+    let mut files = Vec::new();
+    collect_wiki_md_recursive(&wiki_dir, &wiki_dir, &mut files);
+    files.sort();
+    if files.is_empty() {
+        files.push("index.md".to_string());
+    } else if let Some(pos) = files
+        .iter()
+        .position(|f| f == "index.md" || f.ends_with("/index.md"))
+    {
+        let f = files.remove(pos);
+        files.insert(0, f);
+    }
+    files
+}
+
+fn collect_wiki_md_recursive(dir: &Path, base: &Path, out: &mut Vec<String>) {
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                collect_wiki_md_recursive(&p, base, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("md") {
+                if let Ok(rel) = p.strip_prefix(base) {
+                    out.push(rel.display().to_string());
+                }
+            }
+        }
+    }
+}
+
 /// Limits for safe discovery (tunable).
 const MAX_FILE_SIZE_FOR_INDEX: u64 = 1024 * 1024; // 1 MiB
 const MAX_DIR_ENTRIES: usize = 350; // if a dir has more immediate children, don't descend
@@ -184,9 +333,7 @@ impl Session {
     /// specific session (including named ones) rather than the workspace's
     /// default id.
     pub fn open(session_id: &str) -> Result<Self> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let base = PathBuf::from(home).join(RAVEN_HOME).join(SESSIONS_SUBDIR);
-        let dir = base.join(session_id);
+        let dir = session_dir(session_id);
         if !dir.is_dir() {
             anyhow::bail!("session not found: {}", session_id);
         }
@@ -356,6 +503,52 @@ impl Session {
             }
         }
         None
+    }
+
+    // ── Trace log (separate from full_log — for TUI trace pane restore) ──
+
+    fn trace_log_path(&self) -> PathBuf {
+        self.dir.join("trace_log.jsonl")
+    }
+
+    /// Append a trace event to trace_log.jsonl.
+    pub fn append_trace(&self, event: &TraceEvent) -> Result<()> {
+        let path = self.trace_log_path();
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let json = serde_json::to_string(event)?;
+        writeln!(f, "{}", json)?;
+        Ok(())
+    }
+
+    /// Load recent trace events for display restoration.
+    /// Returns events in chronological order (oldest first), capped at max_events.
+    pub fn load_recent_trace(&self, max_events: usize) -> Vec<TraceEvent> {
+        let path = self.trace_log_path();
+        let data = match fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return vec![],
+        };
+
+        let mut events: Vec<TraceEvent> = data
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty() {
+                    return None;
+                }
+                serde_json::from_str(line).ok()
+            })
+            .collect();
+
+        // Keep only the last N
+        if events.len() > max_events {
+            let start = events.len() - max_events;
+            events.drain(0..start);
+        }
+        events
     }
 
     /// Return the block that should be injected into the system prompt / early context.
@@ -1228,6 +1421,65 @@ mod tests {
         let p2 = PathBuf::from("/tmp/myproj");
         assert_eq!(make_session_id(&p1), make_session_id(&p2));
     }
+
+    #[test]
+    fn trace_log_round_trip() {
+        // Create a temp session
+        let sess_dir = std::env::temp_dir().join(format!("raven_trace_test_{}", std::process::id()));
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let sess = Session {
+            id: "test-sess".to_string(),
+            dir: sess_dir.clone(),
+            meta_path: sess_dir.join("meta.json"),
+            log_path: sess_dir.join("full_log.jsonl"),
+            workspace: std::env::temp_dir(),
+            meta: SessionMeta::default(),
+        };
+
+        // Append events
+        let e1 = TraceEvent::tool_start("exec", "cargo test --lib", "🔧 exec(cargo test --lib)");
+        let e2 = TraceEvent::tool_result("exec", "150 passed", "   ↳ ✅ 150 passed");
+        let e3 = TraceEvent::thinking("🧠 All tests pass");
+        sess.append_trace(&e1).unwrap();
+        sess.append_trace(&e2).unwrap();
+        sess.append_trace(&e3).unwrap();
+
+        // Load back
+        let loaded = sess.load_recent_trace(10);
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].display, "🔧 exec(cargo test --lib)");
+        assert_eq!(loaded[1].display, "   ↳ ✅ 150 passed");
+        assert_eq!(loaded[2].display, "🧠 All tests pass");
+
+        // Check full args are stored
+        assert_eq!(loaded[0].args.as_deref(), Some("cargo test --lib"));
+    }
+
+    #[test]
+    fn trace_log_truncates_to_max() {
+        let sess_dir = std::env::temp_dir().join(format!("raven_trace_test2_{}", std::process::id()));
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let sess = Session {
+            id: "test-sess2".to_string(),
+            dir: sess_dir.clone(),
+            meta_path: sess_dir.join("meta.json"),
+            log_path: sess_dir.join("full_log.jsonl"),
+            workspace: std::env::temp_dir(),
+            meta: SessionMeta::default(),
+        };
+
+        // Append 5 events
+        for i in 0..5 {
+            let e = TraceEvent::system(&format!("event {}", i));
+            sess.append_trace(&e).unwrap();
+        }
+
+        // Load only last 3
+        let loaded = sess.load_recent_trace(3);
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].display, "event 2");
+        assert_eq!(loaded[2].display, "event 4");
+    }
 }
 
 /// Info about a previously-used workspace (dir where the harness ran).
@@ -1303,14 +1555,7 @@ pub fn list_sessions_for(workspace: &Path) -> Result<Vec<SessionMeta>> {
 /// Small preview of the session's wiki/index.md (first few lines) for the picker summary pane.
 /// Returns None if the file does not exist or cannot be read.
 pub fn wiki_preview_for_session(session_id: &str, max_lines: usize) -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let base = PathBuf::from(home)
-        .join(RAVEN_HOME)
-        .join(SESSIONS_SUBDIR)
-        .join(session_id)
-        .join("wiki")
-        .join("index.md");
-    let content = fs::read_to_string(&base).ok()?;
+    let content = read_session_wiki_file(session_id, "index.md")?;
     let lines: Vec<&str> = content.lines().take(max_lines).collect();
     if lines.is_empty() {
         return None;

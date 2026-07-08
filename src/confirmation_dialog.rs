@@ -31,9 +31,16 @@ impl ConfirmationDialog {
                 let (kind, detail) = description
                     .split_once(": ")
                     .unwrap_or(("action", description.as_str()));
+                let border_color = if kind.starts_with("write") || kind.starts_with("patch") {
+                    Color::Rgb(0xff, 0x60, 0x60) // red — destructive filesystem op
+                } else if kind.starts_with("exec") || kind.starts_with("Install") {
+                    Color::Yellow // yellow — command execution
+                } else {
+                    Color::Cyan // informational (update_goal, etc.)
+                };
                 ConfirmationModalView {
                     title: " Action Approval ",
-                    border_color: Color::Yellow,
+                    border_color,
                     headline: kind.to_string(),
                     headline_suffix: " — sandbox approval needed",
                     detail: detail.to_string(),

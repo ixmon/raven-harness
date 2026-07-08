@@ -283,7 +283,15 @@ pub fn format_proposal_for_user(p: &PlanProposal) -> String {
                 .as_deref()
                 .or(st.prompt.as_deref())
                 .unwrap_or("");
-            lines.push(format!("  {}. {} [{}: {verify}]", i + 1, st.description, tier));
+            let weak = crate::plan_verification::is_weak_verification(verify, Some(tier))
+                .then_some(" ⚠");
+            lines.push(format!(
+                "  {}. {} [{}: {verify}]{}",
+                i + 1,
+                st.description,
+                tier,
+                weak.unwrap_or_default()
+            ));
         }
     }
     lines.push(String::new());

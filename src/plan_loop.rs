@@ -8,6 +8,11 @@ use crate::plan_protocol::{
     text_for_plan_json_parse, PlanModelPayload, PlanQaEntry, PlanQuestion,
     PlanQuestionOption,
 };
+use crate::plan_verification::{
+    format_adversarial_critique_nudge, format_project_workdir_prompt_section,
+    format_validation_retry_nudge, improve_proposal, resolve_project_workdir,
+    resolve_project_workdir_from_context,
+};
 use crate::runtime::RuntimeFlags;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -153,22 +158,54 @@ const PROPOSAL_SYSTEM: &str = r#"You are the planning engine for a coding-agent 
 Emit the final plan:
 {"type":"proposal","goal":"...","success_criteria":"...","verification":["runnable command",...],"rollback":"...","constraints":"...","steps":[{"description":"...","tier":"exec|check|attested|observe","verification":"...","prompt":"...","note":"..."}]}
 
-Rules:
-- Keep JSON compact: short strings, max 10 steps, omit optional fields when empty
-- verification: concrete runnable commands where possible
-- if the deliverable lives in a workspace subdirectory, prefix verification with `cd <dir> &&` (harness also auto-detects common subdirs)
-- every step needs tier + verification or observe prompt
-- include package-install steps as plan steps if user chose agent install"#;
+Verification rules (critical):
+- Verification PROVES the step outcome — never replay how you would create files.
+- NEVER use as verification: `cat >`, `echo >`, `tee`, `touch`, bare `mkdir` / `mkdir -p`.
+- File scaffold → tier `check`, verification `file_exists:<path>` (path relative to project root).
+- Directory scaffold → tier `exec`, verification `test -d <path>`.
+- Code/content step → tier `check`, verification `grep:<symbol>:<path>`.
+- Build/compile → tier `exec`, verification `cmake --build …`, `cargo check`, `make`, etc.
+- Run/smoke test → tier `exec` with timeout-safe command (not an infinite game loop).
+- `attested` only when no practical check exists — require `note` explaining why.
+- `observe` for human-only checks — put question in `prompt`, explain in `note`.
 
-fn clarify_user_prompt(initial_request: &str, history_text: &str, workspace: &str) -> String {
+Example steps for a C++ game in subdirectory `galaga/`:
+{"description":"Create CMakeLists.txt","tier":"check","verification":"file_exists:CMakeLists.txt"}
+{"description":"Implement Player class","tier":"check","verification":"grep:class Player:src/Player.cpp"}
+{"description":"Compile project","tier":"exec","verification":"cmake --build build"}
+
+Other rules:
+- Keep JSON compact: short strings, max 10 steps, omit optional fields when empty
+- When the user names a project subdirectory (e.g. `./galaga/`), that directory IS the project root — all files and verifications are relative to it (`src/foo.cpp`, not workspace-root paths)
+- If a **User-specified project directory** block appears below, follow it exactly and record it in `constraints`
+- Every step needs tier + verification (or `prompt` for observe)
+- Include package-install steps if user chose agent install"#;
+
+fn clarify_user_prompt(
+    initial_request: &str,
+    history_text: &str,
+    workspace: &str,
+    project_workdir: Option<&str>,
+) -> String {
+    let workdir_section = project_workdir
+        .map(format_project_workdir_prompt_section)
+        .unwrap_or_default();
     format!(
-        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nPrior clarifications:\n{history_text}\n\nEmit the next JSON response."
+        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nPrior clarifications:\n{history_text}{workdir_section}\n\nEmit the next JSON response."
     )
 }
 
-fn proposal_user_prompt(initial_request: &str, history_text: &str, workspace: &str) -> String {
+fn proposal_user_prompt(
+    initial_request: &str,
+    history_text: &str,
+    workspace: &str,
+    project_workdir: Option<&str>,
+) -> String {
+    let workdir_section = project_workdir
+        .map(format_project_workdir_prompt_section)
+        .unwrap_or_default();
     format!(
-        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nClarifications resolved:\n{history_text}\n\nEmit the full proposal JSON."
+        "Workspace: {workspace}\n\nInitial user request:\n{initial_request}\n\nClarifications resolved:\n{history_text}{workdir_section}\n\nEmit the full proposal JSON."
     )
 }
 
@@ -187,7 +224,13 @@ pub async fn fetch_clarification(
         }
     }
     let history_text = format_qa_history_for_prompt(history);
-    let user = clarify_user_prompt(initial_request, &history_text, workspace);
+    let workdir_hint = resolve_project_workdir_from_context(initial_request, history);
+    let user = clarify_user_prompt(
+        initial_request,
+        &history_text,
+        workspace,
+        workdir_hint.as_deref(),
+    );
     match fetch_plan_payload(
         backend,
         CLARIFY_SYSTEM,
@@ -205,6 +248,20 @@ pub async fn fetch_clarification(
     }
 }
 
+async fn fetch_proposal_payload(
+    backend: &Arc<Mutex<ChatBackend>>,
+    user: &str,
+) -> Result<PlanModelPayload, String> {
+    fetch_plan_payload(
+        backend,
+        PROPOSAL_SYSTEM,
+        user,
+        PROPOSAL_MAX_TOKENS,
+        Some(PROPOSAL_CONCISE_NUDGE),
+    )
+    .await
+}
+
 /// Ask the model for the final plan proposal JSON.
 pub async fn fetch_proposal(
     backend: &Arc<Mutex<ChatBackend>>,
@@ -220,13 +277,66 @@ pub async fn fetch_proposal(
         }
     }
     let history_text = format_qa_history_for_prompt(history);
-    let user = proposal_user_prompt(initial_request, &history_text, workspace);
-    fetch_plan_payload(
-        backend,
-        PROPOSAL_SYSTEM,
-        &user,
-        PROPOSAL_MAX_TOKENS,
-        Some(PROPOSAL_CONCISE_NUDGE),
-    )
-    .await
+    let workdir_hint = resolve_project_workdir_from_context(initial_request, history);
+    let user = proposal_user_prompt(
+        initial_request,
+        &history_text,
+        workspace,
+        workdir_hint.as_deref(),
+    );
+    let payload = fetch_proposal_payload(backend, &user).await?;
+    let PlanModelPayload::Proposal(mut proposal) = payload else {
+        return Ok(payload);
+    };
+
+    let workdir = resolve_project_workdir(initial_request, history, &proposal.steps);
+    let first_report = improve_proposal(&mut proposal, workdir.as_deref());
+
+    // Case 1: blocking errors → retry with structural rules nudge.
+    if !first_report.errors.is_empty() {
+        let nudge = format_validation_retry_nudge(&first_report.errors);
+        let retry_user = format!("{user}{nudge}");
+        return Ok(match fetch_proposal_payload(backend, &retry_user).await {
+            Ok(PlanModelPayload::Proposal(mut retry)) => {
+                let retry_workdir =
+                    resolve_project_workdir(initial_request, history, &retry.steps);
+                let retry_report = improve_proposal(&mut retry, retry_workdir.as_deref());
+                if retry_report.errors.len() <= first_report.errors.len() {
+                    PlanModelPayload::Proposal(retry)
+                } else {
+                    PlanModelPayload::Proposal(proposal)
+                }
+            }
+            Ok(other) => other,
+            Err(_) => PlanModelPayload::Proposal(proposal),
+        });
+    }
+
+    // Case 2: no errors but warnings → adversarial critique nudge. The
+    // hardcoded lints are language-specific seeds (download/empty-dir,
+    // grep-in-cpp, pipe-masking); this asks the model to harden its own
+    // verifications using its knowledge of THIS project's stack, so the fix
+    // generalizes to languages/platforms the harness has no rules for.
+    if !first_report.warnings.is_empty() {
+        let nudge = format_adversarial_critique_nudge(&first_report.warnings);
+        let retry_user = format!("{user}{nudge}");
+        if let Ok(PlanModelPayload::Proposal(mut retry)) =
+            fetch_proposal_payload(backend, &retry_user).await
+        {
+            let retry_workdir =
+                resolve_project_workdir(initial_request, history, &retry.steps);
+            let retry_report = improve_proposal(&mut retry, retry_workdir.as_deref());
+            // Accept the hardened proposal only if it introduced no errors and
+            // reduced (or at least did not increase) the warnings.
+            if retry_report.errors.is_empty()
+                && retry_report.warnings.len() <= first_report.warnings.len()
+            {
+                return Ok(PlanModelPayload::Proposal(retry));
+            }
+        }
+        // Otherwise keep the original; warnings are non-blocking and will be
+        // surfaced to the user in the proposal recap.
+    }
+
+    Ok(PlanModelPayload::Proposal(proposal))
 }

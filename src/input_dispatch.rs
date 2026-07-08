@@ -67,7 +67,42 @@ pub fn filtered_slash_commands<'a>(
         .collect()
 }
 
+const PROCESSING_SAFE_SLASH: &[&str] = &[
+    "approval-mode", "run-mode", "status", "settings", "search", "help", "?",
+];
+
+fn slash_name_allowed_while_processing(name: &str) -> bool {
+    PROCESSING_SAFE_SLASH.contains(&name)
+}
+
+/// Resolve the slash command name from input + menu selection (same rules as dispatch).
+pub fn resolve_slash_command_name(
+    commands: &[SlashCommand],
+    prompt: &str,
+    slash_selected: usize,
+) -> Option<String> {
+    if !prompt.starts_with('/') {
+        return None;
+    }
+    let filtered = filtered_slash_commands(commands, prompt);
+    if !filtered.is_empty() {
+        let idx = slash_selected.min(filtered.len().saturating_sub(1));
+        return Some(filtered[idx].name.to_string());
+    }
+    let name = prompt
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()?
+        .to_lowercase();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// Slash commands safe to run while the agent turn is in flight (UI/meta only).
+#[allow(dead_code)]
 pub fn slash_ok_while_processing(prompt: &str) -> bool {
     if !prompt.starts_with('/') {
         return false;
@@ -77,10 +112,17 @@ pub fn slash_ok_while_processing(prompt: &str) -> bool {
         return false;
     }
     let cmd = parts[0].trim_start_matches('/');
-    matches!(
-        cmd,
-        "approval-mode" | "run-mode" | "status" | "settings" | "search" | "help" | "?"
-    )
+    slash_name_allowed_while_processing(cmd)
+}
+
+/// Like [`slash_ok_while_processing`], but honors ↑/↓ selection in the slash menu.
+pub fn slash_ok_while_processing_resolved(
+    commands: &[SlashCommand],
+    prompt: &str,
+    slash_selected: usize,
+) -> bool {
+    resolve_slash_command_name(commands, prompt, slash_selected)
+        .is_some_and(|name| slash_name_allowed_while_processing(&name))
 }
 
 /// Dispatch a `/command` prompt. Returns `AgentPrompt` if the text should go to the model.
@@ -557,5 +599,14 @@ mod tests {
         assert!(slash_ok_while_processing("/run-mode work"));
         assert!(!slash_ok_while_processing("/plan cancel"));
         assert!(!slash_ok_while_processing("hello"));
+    }
+
+    #[test]
+    fn slash_ok_while_processing_resolves_menu_selection() {
+        let cmds = super::default_slash_commands();
+        assert!(!slash_ok_while_processing("/approval"));
+        assert!(slash_ok_while_processing_resolved(&cmds, "/approval", 0));
+        let idx = cmds.iter().position(|c| c.name == "approval-mode").unwrap();
+        assert!(slash_ok_while_processing_resolved(&cmds, "/approval", idx));
     }
 }

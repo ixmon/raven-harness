@@ -1,0 +1,29 @@
+Open source local-first agentic coding harness
+
+You can use Raven with any inference source that speaks the OpenAI API —
+local or cloud: Ollama, llama.cpp, OpenRouter, and more.
+
+When using a cloud endpoint, your token balance ($) appears in the status bar.
+
+Transparent caching keeps cloud inference as cheap and efficient as possible.
+
+
+
+
+Local means private
+
+Sessions live under ~/.raven-hotel/. A workspace is created for whichever
+directory you launch from, and each workspace can hold many sessions.
+
+Cloud credentials you add are encrypted and stored locally in ~/.raven-hotel/.
+
+Point at a cloud model and assume what you send is no longer private.
+
+
+
+
+You can use this code to improve this code…
+
+PRs are welcome:
+
+https://github.com/ixmon/raven-harness

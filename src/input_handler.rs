@@ -19,10 +19,9 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex as TokioMutex;
 
 use crate::plan_flow::{
-    dispatch_plan_slash, format_plan_execution_user_prompt,
+    dismiss_plan_pane_if_pending, dispatch_plan_slash, start_plan_execution,
     plan_loop_active, route_plan_entry_intent, spawn_plan_answer_submit,
-    reconcile_plan_execution, spawn_proceed_feedback_work, submit_plan_loop_input,
-    sync_plan_from_agent, sync_plan_to_agent,
+    spawn_proceed_feedback_work, submit_plan_loop_input,
     PlanInputRouting, PlanLoopUserOutcome,
 };
 
@@ -77,35 +76,7 @@ pub async fn handle_key_event(
             app.needs_redraw = true;
         }
         Event::Mouse(me) => {
-            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = me.kind {
-                let col = me.column;
-                let row = me.row;
-                if app.desktop.showing_picker() {
-                    app.picker.focus = crate::app_state::PickerFocus::Tree;
-                    app.needs_redraw = true;
-                    handled = true;
-                } else if matches!(app.desktop.active, ActiveDesktop::Workspace) {
-                    // Use last rendered areas to decide which pane was clicked
-                    let in_left = app.last_left_area.x <= col && col < app.last_left_area.x + app.last_left_area.width
-                        && app.last_left_area.y <= row && row < app.last_left_area.y + app.last_left_area.height;
-                    let in_right = app.last_right_area.x <= col && col < app.last_right_area.x + app.last_right_area.width
-                        && app.last_right_area.y <= row && row < app.last_right_area.y + app.last_right_area.height;
-                    if in_left {
-                        app.focused_pane = crate::app_state::Pane::Left;
-                        app.needs_redraw = true;
-                        handled = true;
-                    } else if in_right {
-                        app.focused_pane = crate::app_state::Pane::Right;
-                        app.needs_redraw = true;
-                        handled = true;
-                    } else {
-                        app.focused_pane = crate::app_state::Pane::Input;
-                        app.needs_redraw = true;
-                        handled = true;
-                    }
-                }
-            }
-            // other mouse events (wheel, up, drag) ignored for now
+            handled = crate::mouse_handler::handle_mouse(app, me, agent);
         }
         _ => {}
     }
@@ -367,10 +338,10 @@ async fn handle_input_key(
                         if !app.picker.loaded {
                             app.refresh_picker();
                         }
-                        if app.browser_nav_items.is_empty() {
+                        if app.overview_browser.nav_items.is_empty() {
                             let sid = app.picker.sessions.get(app.picker.selected_session).map(|m| m.session_id.clone());
                             if let Some(sid) = sid {
-                                app.rebuild_browser_nav_for_session(&sid);
+                                app.overview_browser.open_overview_session(&sid);
                             }
                         }
                         app.needs_redraw = true;
@@ -408,6 +379,47 @@ async fn handle_input_key(
             KeyCode::Down | KeyCode::Char('j') => {
                 app.scroll_focused_line(1);
                 app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::PageUp => {
+                let page = app.pane_page_lines(app.focused_pane);
+                app.scroll_focused_page(-1, page);
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::PageDown => {
+                let page = app.pane_page_lines(app.focused_pane);
+                app.scroll_focused_page(1, page);
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::Home => {
+                app.scroll_focused_home();
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::End => {
+                app.scroll_focused_end();
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            _ => {}
+        }
+    }
+
+    // Trace pane fold/unfold: Enter/Space toggles block under cursor, z toggles all
+    if app.focused_pane == crate::app_state::Pane::Right {
+        match key.code {
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if !app.trace_cursor_active {
+                    app.activate_trace_cursor_in_viewport();
+                }
+                app.toggle_trace_fold();
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            KeyCode::Char('z') => {
+                app.toggle_trace_fold_all();
                 return Ok(true);
             }
             _ => {}
@@ -484,7 +496,11 @@ async fn handle_input_key(
             if app.is_processing {
                 let prompt = app.input.trim().to_string();
                 if !prompt.is_empty()
-                    && crate::input_dispatch::slash_ok_while_processing(&prompt)
+                    && crate::input_dispatch::slash_ok_while_processing_resolved(
+                        &app.slash_commands,
+                        &prompt,
+                        app.slash_selected,
+                    )
                 {
                     match dispatch_slash_input(
                         app,
@@ -512,16 +528,18 @@ async fn handle_input_key(
                         crate::input_dispatch::SlashDispatch::AgentPrompt(()) => {}
                     }
                 }
-                // Submit queued interject or instant interject
-                if is_ctrl {
-                    app.submit_instant_interject(
-                        app.input.clone(),
-                        queued_interject,
-                        instant_interject,
-                        stop,
-                    );
-                } else {
-                    app.submit_queued_interject(app.input.clone(), queued_interject);
+                // Submit queued interject or instant interject (not slash menu attempts)
+                if !prompt.starts_with('/') {
+                    if is_ctrl {
+                        app.submit_instant_interject(
+                            app.input.clone(),
+                            queued_interject,
+                            instant_interject,
+                            stop,
+                        );
+                    } else {
+                        app.submit_queued_interject(app.input.clone(), queued_interject);
+                    }
                 }
             } else {
                 // Picker add workspace: Enter accepts the path and starts trust confirm
@@ -564,10 +582,14 @@ async fn handle_input_key(
                     return Ok(true);
                 }
 
+                if app.plan.pending_observe_prompt.is_none() {
+                    dismiss_plan_pane_if_pending(app);
+                }
+
                 if app.plan.pending_observe_prompt.is_some() {
                     if let Ok(mut ag) = agent.try_lock() {
                         if let Some(msg) = ag.apply_user_observation(&prompt) {
-                            sync_plan_from_agent(&mut app.plan, &ag);
+                            crate::plan_sync::sync_plan_from_agent(&mut app.plan, &ag);
                             app.left_committed.push(format!("> {}", prompt));
                             app.left_committed.push(msg.clone());
                             ag.push_message(
@@ -619,12 +641,8 @@ async fn handle_input_key(
                             return Ok(true);
                         }
                         PlanLoopUserOutcome::StartExecution => {
-                            app.left_committed
-                                .push("▶ Plan approved — starting execution.".to_string());
-                            agent_prompt = format_plan_execution_user_prompt(
-                                &app.plan,
-                                &config.workspace,
-                            );
+                            agent_prompt =
+                                start_plan_execution(app, agent, &config.workspace);
                         }
                         PlanLoopUserOutcome::Consumed => {
                             return Ok(true);
@@ -640,10 +658,7 @@ async fn handle_input_key(
                     PlanInputRouting::Continue | PlanInputRouting::Pass => {}
                 }
 
-                if agent_prompt.starts_with("Execute the approved plan.") {
-                    app.left_committed
-                        .push("▶ Plan approved — starting execution.".to_string());
-                } else {
+                if !agent_prompt.starts_with("Execute the approved plan.") {
                     app.left_committed.push(format!("> {}", agent_prompt));
                 }
                 app.clear_input();
@@ -684,6 +699,20 @@ async fn handle_input_key(
             Ok(true)
         }
         KeyCode::Esc => {
+            if app.mode_menu_active {
+                app.mode_menu_active = false;
+                app.clear_input();
+                app.selected_mode_idx = 0;
+                app.needs_redraw = true;
+                return Ok(true);
+            }
+            if app.agent_mode_menu_active {
+                app.agent_mode_menu_active = false;
+                app.clear_input();
+                app.selected_agent_mode_idx = 0;
+                app.needs_redraw = true;
+                return Ok(true);
+            }
             if app.is_processing {
                 // Signal the running drive_turn (via TuiObserver) to stop at the next
                 // safe point. We intentionally do NOT clear is_processing here: the
@@ -709,6 +738,8 @@ async fn handle_input_key(
             } else if app.desktop.showing_picker() && app.picker.adding_workspace {
                 app.picker.adding_workspace = false;
                 app.clear_input();
+            } else if app.trace_cursor_active {
+                app.deactivate_trace_cursor();
             } else if !app.input.is_empty() {
                 app.clear_input();
             }
@@ -823,8 +854,8 @@ pub fn spawn_agent_turn(
             .session()
             .as_ref()
             .and_then(|s| s.read_wiki_file_raw("plan.md").ok());
-        reconcile_plan_execution(&mut app.plan, &ag, wiki.as_deref());
-        sync_plan_to_agent(&mut ag, &app.plan, &workspace);
+        crate::plan_sync::reconcile_plan_execution(&mut app.plan, &ag, wiki.as_deref());
+        crate::plan_sync::sync_plan_to_agent(&mut ag, &app.plan, &workspace);
     }
 
     tokio::spawn(async move {

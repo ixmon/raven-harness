@@ -17,14 +17,34 @@ mod eval_scenarios;
 mod input_dispatch;
 mod input_handler;
 mod plan_flow;
+mod plan_sync;
+mod plan_prompts;
+mod plan_state;
+mod plan_pane_render;
+mod code_highlight;
+mod md_render;
+mod wiki_doc;
+mod markdown_pane;
+mod conversation_display;
+mod conversation_pane;
+mod list_pane;
+mod mouse_regions;
+mod mouse_handler;
+mod wiki_browser;
+mod two_pane_keys;
+mod wiki_handlers;
+mod picker_handlers;
 mod key_edit;
 mod event_loop;
 mod keystore;
 mod palette;
 mod search;
 mod settings_modal;
+mod splash_chunk;
+mod splash_tips;
 mod tui_app;
 mod tui_render;
+mod trace_fold;
 
 #[derive(Parser, Debug)]
 #[command(
