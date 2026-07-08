@@ -210,6 +210,8 @@ pub struct App {
     pub last_right_line_count: u16,
     pub last_left_area: ratatui::layout::Rect,
     pub last_right_area: ratatui::layout::Rect,
+    /// Click targets for the current frame (updated during render).
+    pub mouse_regions: crate::mouse_regions::MouseRegions,
 
     // Input history for up/down recall (glm.md UX)
     #[allow(dead_code)]
@@ -332,6 +334,7 @@ impl App {
             last_right_line_count: 0,
             last_left_area: ratatui::layout::Rect::default(),
             last_right_area: ratatui::layout::Rect::default(),
+            mouse_regions: crate::mouse_regions::MouseRegions::default(),
             input_history: vec![],
             history_index: None,
             search: SearchState::default(),

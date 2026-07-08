@@ -76,35 +76,7 @@ pub async fn handle_key_event(
             app.needs_redraw = true;
         }
         Event::Mouse(me) => {
-            if let crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) = me.kind {
-                let col = me.column;
-                let row = me.row;
-                if app.desktop.showing_picker() {
-                    app.picker.focus = crate::app_state::PickerFocus::Tree;
-                    app.needs_redraw = true;
-                    handled = true;
-                } else if matches!(app.desktop.active, ActiveDesktop::Workspace) {
-                    // Use last rendered areas to decide which pane was clicked
-                    let in_left = app.last_left_area.x <= col && col < app.last_left_area.x + app.last_left_area.width
-                        && app.last_left_area.y <= row && row < app.last_left_area.y + app.last_left_area.height;
-                    let in_right = app.last_right_area.x <= col && col < app.last_right_area.x + app.last_right_area.width
-                        && app.last_right_area.y <= row && row < app.last_right_area.y + app.last_right_area.height;
-                    if in_left {
-                        app.focused_pane = crate::app_state::Pane::Left;
-                        app.needs_redraw = true;
-                        handled = true;
-                    } else if in_right {
-                        app.focused_pane = crate::app_state::Pane::Right;
-                        app.needs_redraw = true;
-                        handled = true;
-                    } else {
-                        app.focused_pane = crate::app_state::Pane::Input;
-                        app.needs_redraw = true;
-                        handled = true;
-                    }
-                }
-            }
-            // other mouse events (wheel, up, drag) ignored for now
+            handled = crate::mouse_handler::handle_mouse(app, me, agent);
         }
         _ => {}
     }

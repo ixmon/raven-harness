@@ -837,6 +837,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let content_area = vertical[2];
                 let gauge_area = vertical[3];
                 let input_area = vertical[4];
+                crate::mouse_handler::update_mouse_regions(&mut app, content_area, input_area);
 
                 tui_render::draw_breadcrumb_bar(
                     f,

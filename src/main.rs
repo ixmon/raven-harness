@@ -28,6 +28,8 @@ mod markdown_pane;
 mod conversation_display;
 mod conversation_pane;
 mod list_pane;
+mod mouse_regions;
+mod mouse_handler;
 mod wiki_browser;
 mod two_pane_keys;
 mod wiki_handlers;
