@@ -5,6 +5,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MouseRegions {
+    pub breadcrumb_bar: Rect,
     pub splash_magenta: Rect,
     pub splash_picker: Rect,
     pub picker_tree: Rect,

@@ -12,13 +12,22 @@ use raven_tui::agent::Agent;
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
 
-pub fn update_mouse_regions(app: &mut App, content_area: ratatui::layout::Rect, input_area: ratatui::layout::Rect) {
+pub fn update_mouse_regions(
+    app: &mut App,
+    content_area: ratatui::layout::Rect,
+    input_area: ratatui::layout::Rect,
+    breadcrumb_area: ratatui::layout::Rect,
+    breadcrumb_data: &crate::tui_render::BreadcrumbData,
+) {
     app.mouse_regions = compute_mouse_regions(
         app.desktop.active,
         content_area,
         app.desktop.showing_wiki_viewer(),
     );
     app.mouse_regions.input = input_area;
+    app.mouse_regions.breadcrumb_bar = breadcrumb_area;
+    app.breadcrumb_segments =
+        crate::tui_render::breadcrumb_click_segments(breadcrumb_area, breadcrumb_data);
 }
 
 pub fn handle_mouse(app: &mut App, me: MouseEvent, agent: &Arc<TokioMutex<Agent>>) -> bool {
@@ -145,6 +154,16 @@ fn wheel_picker_tree(app: &mut App, delta: i16) {
 
 fn handle_click(app: &mut App, col: u16, row: u16, agent: &Arc<TokioMutex<Agent>>) -> bool {
     let regions = app.mouse_regions;
+
+    if let Some(target) = crate::tui_render::breadcrumb_target_at(
+        regions.breadcrumb_bar,
+        &app.breadcrumb_segments,
+        col,
+        row,
+    ) {
+        app.navigate_to_breadcrumb(target, agent);
+        return true;
+    }
 
     if point_in(regions.input, col, row) {
         app.focused_pane = Pane::Input;

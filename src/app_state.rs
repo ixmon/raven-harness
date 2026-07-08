@@ -212,6 +212,7 @@ pub struct App {
     pub last_right_area: ratatui::layout::Rect,
     /// Click targets for the current frame (updated during render).
     pub mouse_regions: crate::mouse_regions::MouseRegions,
+    pub breadcrumb_segments: Vec<crate::tui_render::BreadcrumbClickSegment>,
 
     // Input history for up/down recall (glm.md UX)
     #[allow(dead_code)]
@@ -335,6 +336,7 @@ impl App {
             last_left_area: ratatui::layout::Rect::default(),
             last_right_area: ratatui::layout::Rect::default(),
             mouse_regions: crate::mouse_regions::MouseRegions::default(),
+            breadcrumb_segments: Vec::new(),
             input_history: vec![],
             history_index: None,
             search: SearchState::default(),
@@ -1154,7 +1156,92 @@ impl App {
         }
     }
 
-    fn align_picker_to_wiki_session(&mut self) {
+    /// Jump to a breadcrumb desktop (trail step or nav-hint destination).
+    pub fn navigate_to_breadcrumb(
+        &mut self,
+        target: crate::desktop::ActiveDesktop,
+        agent: &std::sync::Arc<tokio::sync::Mutex<Agent>>,
+    ) {
+        if self.desktop.is_animating() {
+            return;
+        }
+
+        use crate::desktop::ActiveDesktop;
+        use crate::wiki_doc::NavItemKind;
+
+        match target {
+            ActiveDesktop::Splash => {
+                self.desktop.jump_to_splash();
+                self.splash_focus = SplashFocus::Magenta;
+                if !self.picker.loaded {
+                    self.refresh_picker();
+                }
+            }
+            ActiveDesktop::Picker => match self.desktop.active {
+                ActiveDesktop::Splash => {
+                    self.splash_focus = SplashFocus::Picker;
+                    self.picker.focus = PickerFocus::Tree;
+                }
+                ActiveDesktop::Picker => {
+                    self.picker.focus = PickerFocus::Tree;
+                }
+                ActiveDesktop::Overview => {
+                    self.view_focus = ViewFocus::Picker;
+                }
+                ActiveDesktop::Workspace | ActiveDesktop::WikiViewer => {
+                    if !self.picker.loaded {
+                        self.refresh_picker();
+                    }
+                    self.prepare_overview_for_session(agent);
+                    self.desktop.set_overview();
+                    self.view_focus = ViewFocus::Picker;
+                }
+            },
+            ActiveDesktop::Overview => {
+                if !self.picker.loaded {
+                    self.refresh_picker();
+                }
+                if self.desktop.active == ActiveDesktop::WikiViewer {
+                    self.desktop.set_overview();
+                    self.view_focus = ViewFocus::Nav;
+                    if self.overview_browser.nav_items.is_empty() {
+                        let sid = self.wiki_viewer.session_id.clone();
+                        if !sid.is_empty() {
+                            self.overview_browser.open_overview_session(&sid);
+                        }
+                    }
+                    self.align_picker_to_wiki_session();
+                } else {
+                    self.prepare_overview_for_session(agent);
+                    self.desktop.set_overview();
+                    self.view_focus = ViewFocus::Nav;
+                }
+            }
+            ActiveDesktop::Workspace => {
+                if let Some(pos) = self
+                    .overview_browser
+                    .nav_items
+                    .iter()
+                    .position(|it| it.kind == NavItemKind::Harness)
+                {
+                    self.overview_browser.selected_nav = pos;
+                }
+                self.activate_overview_harness_session(agent);
+            }
+            ActiveDesktop::WikiViewer => {
+                if self.desktop.active == ActiveDesktop::Overview
+                    && !self.overview_browser.selected_is_harness()
+                {
+                    self.enter_wiki_from_overview_content();
+                } else {
+                    self.enter_wiki_viewer();
+                }
+            }
+        }
+        self.needs_redraw = true;
+    }
+
+    pub(crate) fn align_picker_to_wiki_session(&mut self) {
         let want = self.wiki_viewer.session_id.clone();
         // find in current sessions list
         if let Some(pos) = self.picker.sessions.iter().position(|m| m.session_id == want) {

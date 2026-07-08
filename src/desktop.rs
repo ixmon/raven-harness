@@ -177,6 +177,12 @@ impl DesktopState {
         self.active = ActiveDesktop::Splash;
     }
 
+    /// Cancel any slide animation and jump directly to splash.
+    pub fn jump_to_splash(&mut self) {
+        self.slide = None;
+        self.active = ActiveDesktop::Splash;
+    }
+
     /// Advance the slide by one frame. Returns `true` while animation continues.
     /// Inserts a 250ms pause when reaching the halfway frame so the split view
     /// is briefly visible before the transition completes automatically.

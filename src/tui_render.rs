@@ -190,6 +190,123 @@ pub fn draw_breadcrumb_bar(f: &mut Frame, area: Rect, data: &BreadcrumbData) {
     }
 }
 
+/// Clickable segment within the breadcrumb row (trail step or nav-hint label).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BreadcrumbClickSegment {
+    pub x_start: u16,
+    pub x_end: u16,
+    pub target: ActiveDesktop,
+}
+
+fn hint_label_to_desktop(label: &str) -> Option<ActiveDesktop> {
+    match label {
+        "Workspaces" => Some(ActiveDesktop::Picker),
+        "Browser" => Some(ActiveDesktop::Overview),
+        "Harness" => Some(ActiveDesktop::Workspace),
+        "Wiki" => Some(ActiveDesktop::WikiViewer),
+        _ => None,
+    }
+}
+
+fn breadcrumb_trail_hint_split(
+    area: Rect,
+    data: &BreadcrumbData,
+) -> (Rect, Option<(Rect, &'static str)>) {
+    let hint = breadcrumb_nav_hint(data);
+    if let Some(hint_text) = hint {
+        let hint_len = hint_text.chars().count() as u16 + 1;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(12),
+                Constraint::Length(hint_len.min(area.width.saturating_sub(12))),
+            ])
+            .split(area);
+        (cols[0], Some((cols[1], hint_text)))
+    } else {
+        (area, None)
+    }
+}
+
+/// Column ranges for each breadcrumb trail step and nav-hint destination.
+pub fn breadcrumb_click_segments(area: Rect, data: &BreadcrumbData) -> Vec<BreadcrumbClickSegment> {
+    if area.height == 0 || area.width == 0 {
+        return Vec::new();
+    }
+
+    let highlighted = resolve_breadcrumb_active(data);
+    let (trail_area, hint_area) = breadcrumb_trail_hint_split(area, data);
+    let mut segments = Vec::new();
+    let mut x = trail_area.x;
+
+    if data.compact {
+        let label = breadcrumb_steps()
+            .iter()
+            .find(|(d, _)| *d == highlighted)
+            .map(|(_, l)| *l)
+            .unwrap_or("?");
+        let text = format!("◉ {label}");
+        let width = text.chars().count() as u16;
+        segments.push(BreadcrumbClickSegment {
+            x_start: x,
+            x_end: x.saturating_add(width),
+            target: highlighted,
+        });
+    } else {
+        for (i, (desktop, label)) in breadcrumb_steps().iter().enumerate() {
+            if i > 0 {
+                x = x.saturating_add(3);
+            }
+            let marker = if *desktop == highlighted { '◉' } else { '○' };
+            let text = format!("{marker} {label}");
+            let width = text.chars().count() as u16;
+            segments.push(BreadcrumbClickSegment {
+                x_start: x,
+                x_end: x.saturating_add(width),
+                target: *desktop,
+            });
+            x = x.saturating_add(width);
+        }
+    }
+
+    if let Some((hint_rect, hint_text)) = hint_area {
+        let parts: Vec<&str> = hint_text.split(" → ").collect();
+        let mut hx = hint_rect.x;
+        for (i, part) in parts.iter().enumerate() {
+            let label = part.trim_start_matches('→').trim();
+            if let Some(target) = hint_label_to_desktop(label) {
+                let width = label.chars().count() as u16;
+                segments.push(BreadcrumbClickSegment {
+                    x_start: hx,
+                    x_end: hx.saturating_add(width),
+                    target,
+                });
+                hx = hx.saturating_add(width);
+            }
+            if i + 1 < parts.len() {
+                hx = hx.saturating_add(3);
+            }
+        }
+    }
+
+    segments
+}
+
+pub fn breadcrumb_target_at(
+    bar: Rect,
+    segments: &[BreadcrumbClickSegment],
+    col: u16,
+    row: u16,
+) -> Option<ActiveDesktop> {
+    if bar.height == 0 || row != bar.y || col < bar.x || col >= bar.x + bar.width {
+        return None;
+    }
+    segments
+        .iter()
+        .find(|s| col >= s.x_start && col < s.x_end)
+        .map(|s| s.target)
+}
+
 pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
     let ctx = data.budget;
     let mut spans = vec![
@@ -1217,6 +1334,41 @@ mod breadcrumb_tests {
             false,
         );
         assert_eq!(breadcrumb_nav_hint(&data), Some("Workspaces → Browser"));
+    }
+
+    #[test]
+    fn breadcrumb_click_maps_trail_and_hint() {
+        use super::{breadcrumb_click_segments, breadcrumb_target_at};
+        use ratatui::layout::Rect;
+
+        let data = breadcrumb_data(
+            ActiveDesktop::Splash,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        let bar = Rect::new(0, 0, 80, 1);
+        let segments = breadcrumb_click_segments(bar, &data);
+        assert!(segments.iter().any(|s| s.target == ActiveDesktop::Splash));
+        assert!(segments.iter().any(|s| s.target == ActiveDesktop::Picker));
+
+        let overview_data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        let segs = breadcrumb_click_segments(bar, &overview_data);
+        assert!(segs.iter().any(|s| s.target == ActiveDesktop::Overview));
+
+        let first = segments
+            .iter()
+            .find(|s| s.target == ActiveDesktop::Splash)
+            .unwrap();
+        assert_eq!(
+            breadcrumb_target_at(bar, &segments, first.x_start, 0),
+            Some(ActiveDesktop::Splash)
+        );
     }
 
     #[test]

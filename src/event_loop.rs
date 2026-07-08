@@ -837,19 +837,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                 let content_area = vertical[2];
                 let gauge_area = vertical[3];
                 let input_area = vertical[4];
-                crate::mouse_handler::update_mouse_regions(&mut app, content_area, input_area);
-
-                tui_render::draw_breadcrumb_bar(
-                    f,
+                let breadcrumb_data = tui_render::BreadcrumbData {
+                    active: app.desktop.active,
+                    splash_focus: app.splash_focus,
+                    view_focus: app.view_focus,
+                    browser_harness_selected: app.browser_selected_is_harness(),
+                    compact: size.width < 80,
+                };
+                crate::mouse_handler::update_mouse_regions(
+                    &mut app,
+                    content_area,
+                    input_area,
                     breadcrumb_area,
-                    &tui_render::BreadcrumbData {
-                        active: app.desktop.active,
-                        splash_focus: app.splash_focus,
-                        view_focus: app.view_focus,
-                        browser_harness_selected: app.browser_selected_is_harness(),
-                        compact: size.width < 80,
-                    },
+                    &breadcrumb_data,
                 );
+
+                tui_render::draw_breadcrumb_bar(f, breadcrumb_area, &breadcrumb_data);
 
                 if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
                     app.picker.last_summary_height = content_area.height.saturating_sub(4).max(10);
