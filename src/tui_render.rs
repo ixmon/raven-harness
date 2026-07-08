@@ -2428,8 +2428,7 @@ fn render_left_aligned_text_block(buf: &mut Buffer, area: Rect, text: &Text<'sta
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let mut y = area.y;
-    for line in &text.lines {
+    for (y, line) in (area.y..).zip(text.lines.iter()) {
         if y >= area.y + area.height {
             break;
         }
@@ -2444,7 +2443,6 @@ fn render_left_aligned_text_block(buf: &mut Buffer, area: Rect, text: &Text<'sta
                 },
                 buf,
             );
-        y += 1;
     }
 }
 
@@ -2464,8 +2462,8 @@ fn render_middle_left_text_block(buf: &mut Buffer, area: Rect, text: &Text<'stat
         return;
     }
     let content_h = text.lines.len() as u16;
-    let mut y = area.y + (area.height.saturating_sub(content_h)) / 2;
-    for line in &text.lines {
+    let start_y = area.y + (area.height.saturating_sub(content_h)) / 2;
+    for (y, line) in (start_y..).zip(text.lines.iter()) {
         if y >= area.y + area.height {
             break;
         }
@@ -2480,7 +2478,6 @@ fn render_middle_left_text_block(buf: &mut Buffer, area: Rect, text: &Text<'stat
                 },
                 buf,
             );
-        y += 1;
     }
 }
 

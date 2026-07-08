@@ -203,14 +203,14 @@ pub fn visible_index_for_cursor(
     for (i, v) in visible.iter().enumerate() {
         match v {
             VisibleLine::Original(idx) if *idx == trace_cursor => return i,
-            VisibleLine::FoldSummary { header_idx, .. } => {
+            VisibleLine::FoldSummary { header_idx, .. }
                 if blocks.iter().any(|b| {
                     b.header_idx == *header_idx
                         && trace_cursor >= b.header_idx
                         && trace_cursor < b.end_idx
-                }) {
-                    return i;
-                }
+                }) =>
+            {
+                return i;
             }
             _ => {}
         }

@@ -116,21 +116,13 @@ pub fn handle_fast_scroll(
 /// Left from Content → Nav. Right from Nav → Content. Returns `true` when handled.
 pub fn handle_horizontal_focus(browser: &mut WikiBrowser, key: KeyCode) -> bool {
     match key {
-        KeyCode::Left | KeyCode::Char('h') => {
-            if browser.focus == WikiFocus::Content {
-                browser.focus = WikiFocus::Nav;
-                true
-            } else {
-                false
-            }
+        KeyCode::Left | KeyCode::Char('h') if browser.focus == WikiFocus::Content => {
+            browser.focus = WikiFocus::Nav;
+            true
         }
-        KeyCode::Right | KeyCode::Char('l') => {
-            if browser.focus == WikiFocus::Nav {
-                browser.focus = WikiFocus::Content;
-                true
-            } else {
-                false
-            }
+        KeyCode::Right | KeyCode::Char('l') if browser.focus == WikiFocus::Nav => {
+            browser.focus = WikiFocus::Content;
+            true
         }
         _ => false,
     }
