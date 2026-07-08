@@ -12,6 +12,16 @@ fn overview_browser_preview(app: &mut App) {
     app.needs_redraw = true;
 }
 
+/// Leave the overview content preview for the full harness or wiki screen.
+fn advance_from_overview_content(app: &mut App, agent: &Arc<Mutex<Agent>>) {
+    if app.overview_browser.selected_is_harness() {
+        app.reset_left_pane_for_harness();
+        app.activate_overview_harness_session(agent);
+    } else {
+        app.enter_wiki_from_overview_content();
+    }
+}
+
 pub fn handle_key(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> bool {
     if !is_picker_key_active(app) {
         return false;
@@ -187,11 +197,7 @@ fn handle_overview(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> bo
                         app.focus_overview_to_content();
                     }
                     ViewFocus::Content => {
-                        if app.overview_browser.selected_is_harness() {
-                            app.activate_overview_harness_session(agent);
-                        } else {
-                            app.enter_wiki_from_overview_content();
-                        }
+                        advance_from_overview_content(app, agent);
                     }
                 }
                 app.needs_redraw = true;
@@ -220,13 +226,16 @@ fn handle_overview(app: &mut App, key: KeyCode, agent: &Arc<Mutex<Agent>>) -> bo
                 true
             }
             KeyCode::Tab => {
-                app.view_focus = match app.view_focus {
-                    ViewFocus::Picker => ViewFocus::Nav,
-                    ViewFocus::Nav => ViewFocus::Content,
-                    ViewFocus::Content => ViewFocus::Picker,
-                };
-                if app.view_focus == ViewFocus::Content && app.overview_browser.selected_is_harness() {
-                    app.reset_left_pane_for_harness();
+                match app.view_focus {
+                    ViewFocus::Picker => {
+                        app.view_focus = ViewFocus::Nav;
+                    }
+                    ViewFocus::Nav => {
+                        app.focus_overview_to_content();
+                    }
+                    ViewFocus::Content => {
+                        advance_from_overview_content(app, agent);
+                    }
                 }
                 app.needs_redraw = true;
                 true

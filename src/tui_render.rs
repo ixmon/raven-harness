@@ -45,6 +45,151 @@ pub struct StatusBarData<'a> {
     pub tps: f64,
 }
 
+const BREADCRUMB_MAGENTA: Color = Color::Rgb(0xc0, 0x80, 0xff);
+const BREADCRUMB_DIM: Color = Color::Rgb(0x55, 0x55, 0x66);
+const BREADCRUMB_SEP: Color = Color::Rgb(0x45, 0x45, 0x52);
+
+pub struct BreadcrumbData {
+    pub active: ActiveDesktop,
+    /// Splash split-pane focus (magenta vs workspace picker).
+    pub splash_focus: crate::app_state::SplashFocus,
+    /// Overview 3-column focus (workspaces picker vs browser nav vs content).
+    pub view_focus: crate::app_state::ViewFocus,
+    /// Overview browser nav: Coding Harness selected vs wiki subtree.
+    pub browser_harness_selected: bool,
+    /// When true (narrow terminal), show only the current desktop name.
+    pub compact: bool,
+}
+
+/// Which breadcrumb step is highlighted (may differ from `active` when a sub-pane has focus).
+fn resolve_breadcrumb_active(data: &BreadcrumbData) -> ActiveDesktop {
+    match data.active {
+        ActiveDesktop::Splash if data.splash_focus == crate::app_state::SplashFocus::Picker => {
+            ActiveDesktop::Picker
+        }
+        ActiveDesktop::Overview if data.view_focus == crate::app_state::ViewFocus::Picker => {
+            ActiveDesktop::Picker
+        }
+        other => other,
+    }
+}
+
+fn breadcrumb_steps() -> &'static [(ActiveDesktop, &'static str)] {
+    &[
+        (ActiveDesktop::Splash, "Main"),
+        (ActiveDesktop::Picker, "Workspaces"),
+        (ActiveDesktop::Overview, "Browser"),
+        (ActiveDesktop::Workspace, "Harness"),
+        (ActiveDesktop::WikiViewer, "Wiki"),
+    ]
+}
+
+fn breadcrumb_nav_hint(data: &BreadcrumbData) -> Option<&'static str> {
+    use crate::app_state::{SplashFocus, ViewFocus};
+
+    match data.active {
+        ActiveDesktop::Splash if data.splash_focus == SplashFocus::Magenta => {
+            Some("→ Workspaces")
+        }
+        ActiveDesktop::Splash if data.splash_focus == SplashFocus::Picker => {
+            Some("Workspaces → Browser")
+        }
+        ActiveDesktop::Picker => Some("Workspaces → Browser"),
+        ActiveDesktop::Overview if data.view_focus == ViewFocus::Picker => {
+            Some("Workspaces → Browser")
+        }
+        ActiveDesktop::Overview
+            if data.view_focus == ViewFocus::Nav || data.view_focus == ViewFocus::Content =>
+        {
+            if data.browser_harness_selected {
+                Some("Browser → Harness")
+            } else {
+                Some("Browser → Wiki")
+            }
+        }
+        ActiveDesktop::WikiViewer => Some("←→ nav/content · Esc: back"),
+        ActiveDesktop::Workspace => None,
+        _ => None,
+    }
+}
+
+fn breadcrumb_trail_spans(active: ActiveDesktop) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, (desktop, label)) in breadcrumb_steps().iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(BREADCRUMB_SEP)));
+        }
+        let is_active = *desktop == active;
+        let marker = if is_active { '◉' } else { '○' };
+        let style = if is_active {
+            Style::default()
+                .fg(BREADCRUMB_MAGENTA)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(BREADCRUMB_DIM)
+        };
+        spans.push(Span::styled(format!("{marker} {label}"), style));
+    }
+    spans
+}
+
+/// One-row desktop trail (Main → Workspaces → Browser → Harness → Wiki).
+pub fn draw_breadcrumb_bar(f: &mut Frame, area: Rect, data: &BreadcrumbData) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let highlighted = resolve_breadcrumb_active(data);
+    let hint = breadcrumb_nav_hint(data);
+    let (trail_area, hint_area) = if let Some(hint_text) = hint {
+        let hint_len = hint_text.chars().count() as u16 + 1;
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(12),
+                Constraint::Length(hint_len.min(area.width.saturating_sub(12))),
+            ])
+            .split(area);
+        (cols[0], Some((cols[1], hint_text)))
+    } else {
+        (area, None)
+    };
+
+    let trail_spans = if data.compact {
+        let label = breadcrumb_steps()
+            .iter()
+            .find(|(d, _)| *d == highlighted)
+            .map(|(_, l)| *l)
+            .unwrap_or("?");
+        vec![
+            Span::styled(
+                format!("◉ {label}"),
+                Style::default()
+                    .fg(BREADCRUMB_MAGENTA)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]
+    } else {
+        breadcrumb_trail_spans(highlighted)
+    };
+
+    f.render_widget(
+        Paragraph::new(Line::from(trail_spans)).style(Style::default().bg(Color::Black)),
+        trail_area,
+    );
+
+    if let Some((hint_rect, hint_text)) = hint_area {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                hint_text,
+                Style::default().fg(Color::DarkGray),
+            ))
+            .alignment(Alignment::Right),
+            hint_rect,
+        );
+    }
+}
+
 pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
     let ctx = data.budget;
     let mut spans = vec![
@@ -937,6 +1082,197 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     format!("{}…", truncated)
 }
 
+/// Vertical space reserved for the overview harness input strip inside the Harness frame.
+pub const OVERVIEW_HARNESS_INPUT_H: u16 = 3;
+
+/// Inner area of the overview harness preview column (inside the Harness border).
+pub fn overview_harness_block_inner(harness_column: Rect) -> Rect {
+    Block::default()
+        .borders(Borders::ALL)
+        .inner(harness_column)
+}
+
+/// Status, conversation, and input areas inside an overview harness frame.
+pub fn overview_harness_split(inner: Rect) -> (Rect, Rect, Rect) {
+    let vparts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(6),
+            Constraint::Length(OVERVIEW_HARNESS_INPUT_H),
+        ])
+        .split(inner);
+    (vparts[0], vparts[1], vparts[2])
+}
+
+/// Locate the overview harness preview column and its inner sub-areas.
+pub fn overview_harness_areas(content_area: Rect) -> (Rect, Rect, Rect, Rect) {
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+        ])
+        .split(content_area);
+    let harness_column = cols[2];
+    let inner = overview_harness_block_inner(harness_column);
+    let (status, conv, input) = overview_harness_split(inner);
+    (harness_column, status, conv, input)
+}
+
+#[cfg(test)]
+mod breadcrumb_tests {
+    use super::{breadcrumb_nav_hint, breadcrumb_trail_spans, resolve_breadcrumb_active, BreadcrumbData};
+    use crate::app_state::{SplashFocus, ViewFocus};
+    use crate::desktop::ActiveDesktop;
+
+    fn breadcrumb_data(
+        active: ActiveDesktop,
+        splash_focus: SplashFocus,
+        view_focus: ViewFocus,
+        browser_harness_selected: bool,
+    ) -> BreadcrumbData {
+        BreadcrumbData {
+            active,
+            splash_focus,
+            view_focus,
+            browser_harness_selected,
+            compact: false,
+        }
+    }
+
+    #[test]
+    fn trail_marks_active_desktop() {
+        let spans = breadcrumb_trail_spans(ActiveDesktop::Picker);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains('◉'));
+        assert!(text.contains("Workspaces"));
+        assert!(text.contains('○'));
+        assert!(text.contains("Main"));
+    }
+
+    #[test]
+    fn splash_picker_focus_highlights_workspaces() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Splash,
+            SplashFocus::Picker,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(resolve_breadcrumb_active(&data), ActiveDesktop::Picker);
+    }
+
+    #[test]
+    fn overview_nav_focus_highlights_browser() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Nav,
+            false,
+        );
+        assert_eq!(resolve_breadcrumb_active(&data), ActiveDesktop::Overview);
+    }
+
+    #[test]
+    fn overview_picker_focus_highlights_workspaces() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(resolve_breadcrumb_active(&data), ActiveDesktop::Picker);
+    }
+
+    #[test]
+    fn workspace_has_no_nav_hint() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Workspace,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert!(breadcrumb_nav_hint(&data).is_none());
+    }
+
+    #[test]
+    fn main_pane_hints_workspaces() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Splash,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(breadcrumb_nav_hint(&data), Some("→ Workspaces"));
+    }
+
+    #[test]
+    fn workspaces_pane_hints_browser() {
+        let data = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Picker,
+            false,
+        );
+        assert_eq!(breadcrumb_nav_hint(&data), Some("Workspaces → Browser"));
+    }
+
+    #[test]
+    fn browser_pane_hints_wiki_or_harness() {
+        let wiki = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Nav,
+            false,
+        );
+        assert_eq!(breadcrumb_nav_hint(&wiki), Some("Browser → Wiki"));
+
+        let harness = breadcrumb_data(
+            ActiveDesktop::Overview,
+            SplashFocus::Magenta,
+            ViewFocus::Nav,
+            true,
+        );
+        assert_eq!(breadcrumb_nav_hint(&harness), Some("Browser → Harness"));
+    }
+}
+
+#[cfg(test)]
+mod splash_help_tests {
+    use super::SplashData;
+    use crate::app_state::SplashFocus;
+    use crate::desktop::load_splash_chunk;
+
+    #[test]
+    fn splash_chunk_describes_frame_navigation() {
+        let chunk = load_splash_chunk();
+        assert!(chunk.contains("Workspaces"));
+        assert!(chunk.contains("Harness"));
+        assert!(chunk.contains("Browser"));
+    }
+
+    #[test]
+    fn splash_data_carries_chunk_field() {
+        let chunk = load_splash_chunk();
+        let data = SplashData {
+            raven_art: "",
+            splash_chunk: &chunk,
+            splash_tip: "tip",
+            splash_tip_fade: 0,
+            splash_focus: SplashFocus::Magenta,
+        };
+        assert!(!data.splash_chunk.is_empty());
+    }
+
+    #[test]
+    fn splash_chunk_indent_is_twenty_five_percent() {
+        assert_eq!(super::splash_chunk_indent(100), 25);
+        assert_eq!(super::splash_chunk_indent(60), 15);
+        assert_eq!(super::splash_chunk_indent(40), 10);
+    }
+}
+
 #[cfg(test)]
 mod truncate_str_tests {
     use super::truncate_str;
@@ -1162,9 +1498,12 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub struct SplashData<'a> {
     pub raven_art: &'a str,
-    pub base_url: &'a str,
-    pub model: &'a str,
-    pub workspace: &'a str,
+    /// Layout diagram + frame navigation blurb (from `/tmp/chunk` or default).
+    pub splash_chunk: &'a str,
+    /// Current cycling tip for the upper-right of the magenta pane.
+    pub splash_tip: &'a str,
+    /// Tip fade level (0 = full brightness, 10 = invisible).
+    pub splash_tip_fade: u8,
     /// Which side of the first screen is highlighted (default Magenta).
     pub splash_focus: crate::app_state::SplashFocus,
 }
@@ -1268,7 +1607,7 @@ pub fn draw_content_desktop(
 
     match desktop.active {
         ActiveDesktop::Splash => {
-            // Horizontal split: left = magenta pane with raven + help, right = workspace picker (full height, outside magenta)
+            // Horizontal split: left = magenta pane (raven, help, layout chunk), right = workspace picker.
             let cols = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -1354,7 +1693,6 @@ pub fn draw_content_desktop(
             draw_nav_pane_for_browser(
                 f,
                 nav_area,
-                " Nav ",
                 &picker.overview_browser.nav_items,
                 picker.overview_browser.selected_nav,
                 nav_focused,
@@ -1362,14 +1700,31 @@ pub fn draw_content_desktop(
 
             // Content column: either wiki content or harness (status + conv + input)
             if is_harness {
-                // Allocate space at top of content col for real upper status bar (drawn in event_loop overlay for alignment)
-                // then conv, then input space at bottom.
-                let vparts = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(1), Constraint::Min(6), Constraint::Length(3)])
-                    .split(content_area);
+                let harness_border = if content_focused {
+                    Color::Cyan
+                } else {
+                    Color::Rgb(0x55, 0x55, 0x66)
+                };
+                let harness_block = Block::default()
+                    .title(Span::styled(
+                        " Harness ",
+                        Style::default()
+                            .fg(if content_focused {
+                                Color::Cyan
+                            } else {
+                                Color::DarkGray
+                            })
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(harness_border))
+                    .style(Style::default().bg(Color::Black));
+                let harness_inner = harness_block.inner(content_area);
+                f.render_widget(harness_block, content_area);
 
-                // Conversation content directly (no extra pane frame for embedded Screen 2 view)
+                let (_status_area, conv_area, _input_area) =
+                    overview_harness_split(harness_inner);
+
                 let mut dummy_last = Rect::default();
                 let mut dummy_cnt = 0u16;
                 let conv_pane_focus = if content_focused { Pane::Left } else { Pane::Right };
@@ -1377,19 +1732,16 @@ pub fn draw_content_desktop(
                     f,
                     workspace.left_committed,
                     workspace.current_response,
-                    vparts[1],
+                    conv_area,
                     &mut dummy_last,
                     &mut dummy_cnt,
-                    false,  // don't auto-follow, allow manual scroll with up/down
+                    false,
                     left_scroll,
                     conv_pane_focus,
                     workspace.scroll_flash_timer,
                     workspace.left_highlight,
-                    true,  // draw the Conversation frame with label
+                    false,
                 );
-
-                // Bottom space for input box (drawn as overlay in event_loop)
-                // (no block here to let real input bar appear)
             } else {
                 // Wiki content pane -- use browser content + custom markdown like full wiki
                 let wiki_border = if content_focused { Color::Cyan } else { Color::Rgb(0x55,0x55,0x66) };
@@ -1490,19 +1842,48 @@ pub fn draw_content_desktop(
     }
 }
 
-/// Draw only the wiki Nav pane (used by full WikiViewer and by the splash Overview 3-col).
+/// Draw only the wiki browser pane (full WikiViewer and Overview 3-col).
 pub fn draw_wiki_nav_pane(f: &mut Frame, area: Rect, viewer: &crate::app_state::WikiViewerState, focused: bool) {
-    draw_nav_list(f, area, &format!(" {} ", viewer.current_file), &viewer.nav_items, viewer.selected_nav, focused || viewer.focus == crate::app_state::WikiFocus::Nav);
+    draw_nav_list(
+        f,
+        area,
+        " Browser ",
+        None,
+        &viewer.nav_items,
+        viewer.selected_nav,
+        focused || viewer.focus == crate::app_state::WikiFocus::Nav,
+    );
 }
 
-pub fn draw_nav_pane_for_browser(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], selected: usize, focused: bool) {
-    draw_nav_list(f, area, title, items, selected, focused);
+pub fn draw_nav_pane_for_browser(
+    f: &mut Frame,
+    area: Rect,
+    items: &[WikiNavItem],
+    selected: usize,
+    focused: bool,
+) {
+    draw_nav_list(f, area, " Browser ", None, items, selected, focused);
 }
 
-fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], selected: usize, focused: bool) {
+fn draw_nav_list(
+    f: &mut Frame,
+    area: Rect,
+    block_title: &str,
+    inner_label: Option<&str>,
+    items: &[WikiNavItem],
+    selected: usize,
+    focused: bool,
+) {
     let nav_border = list_focus_border_style(focused);
     let mut nav_text = Text::default();
-    nav_text.lines.push(Line::from(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    if let Some(label) = inner_label {
+        nav_text.lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+    } else {
+        nav_text.lines.push(Line::from(""));
+    }
     let sel = selected;
     let nitems = items.len();
     let nav_vis = (area.height as usize).saturating_sub(2).max(1);
@@ -1527,8 +1908,13 @@ fn draw_nav_list(f: &mut Frame, area: Rect, title: &str, items: &[WikiNavItem], 
         nav_text.lines.push(Line::from(Span::styled("  ···", Style::default().fg(Color::Rgb(0x44, 0x44, 0x55)))));
         nav_text.lines.push(Line::from(Span::styled("  No headings yet", Style::default().fg(Color::DarkGray))));
     }
-    let nav_para = Paragraph::new(nav_text)
-        .block(Block::default().title(" Nav ").borders(Borders::ALL).border_style(nav_border).style(Style::default().bg(Color::Black)));
+    let nav_para = Paragraph::new(nav_text).block(
+        Block::default()
+            .title(block_title)
+            .borders(Borders::ALL)
+            .border_style(nav_border)
+            .style(Style::default().bg(Color::Black)),
+    );
     f.render_widget(nav_para, area);
 }
 
@@ -1603,15 +1989,6 @@ pub fn draw_picker(f: &mut Frame, area: Rect, data: &PickerDrawData<'_>) {
         data.summary_is_markdown,
     );
 
-    // subtle hint line at bottom of area if space
-    if area.height > 4 {
-        let hint = "↑↓ Tree  ←→ focus  w: wiki  Enter: launch  (right on summary -> full wiki)";
-        let hint_area = Rect { y: area.y + area.height - 1, height: 1, ..area };
-        f.render_widget(
-            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
-            hint_area,
-        );
-    }
 }
 
 fn draw_picker_tree(
@@ -1873,129 +2250,145 @@ fn render_splash_to_buffer(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) 
     render_splash_content(buf, inner, data);
 }
 
+fn render_left_aligned_text_block(buf: &mut Buffer, area: Rect, text: &Text<'static>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let mut y = area.y;
+    for line in &text.lines {
+        if y >= area.y + area.height {
+            break;
+        }
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .render(
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                buf,
+            );
+        y += 1;
+    }
+}
+
+/// Left margin for the splash intro + diagram block (~25% of magenta pane width).
+fn splash_chunk_indent(pane_width: u16) -> u16 {
+    if pane_width == 0 {
+        return 0;
+    }
+    let indent = pane_width.saturating_mul(25) / 100;
+    // Keep a minimum content width for the diagram.
+    indent.min(pane_width.saturating_sub(24).max(1))
+}
+
+/// Vertically centered, left-aligned text block.
+fn render_middle_left_text_block(buf: &mut Buffer, area: Rect, text: &Text<'static>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let content_h = text.lines.len() as u16;
+    let mut y = area.y + (area.height.saturating_sub(content_h)) / 2;
+    for line in &text.lines {
+        if y >= area.y + area.height {
+            break;
+        }
+        Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .render(
+                Rect {
+                    x: area.x,
+                    y,
+                    width: area.width,
+                    height: 1,
+                },
+                buf,
+            );
+        y += 1;
+    }
+}
+
+fn raven_art_width(art: &str) -> u16 {
+    art.lines()
+        .map(char_count)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1) as u16
+}
+
+fn splash_top_height(raven_art: &str, tip_text: &Text<'static>) -> u16 {
+    let raven_lines = raven_art.lines().count() as u16;
+    let tip_lines = tip_text.lines.len() as u16;
+    raven_lines.max(tip_lines).saturating_add(1)
+}
+
+fn render_splash_chunk_buf(buf: &mut Buffer, area: Rect, chunk: &str) {
+    if area.width == 0 || area.height == 0 || chunk.trim().is_empty() {
+        return;
+    }
+    let indent = splash_chunk_indent(area.width);
+    let inner_width = area.width.saturating_sub(indent).max(1);
+    let inner_area = Rect {
+        x: area.x.saturating_add(indent),
+        y: area.y,
+        width: inner_width,
+        height: area.height,
+    };
+    let text = crate::splash_chunk::build_splash_chunk_display(chunk, inner_width);
+    render_middle_left_text_block(buf, inner_area, &text);
+}
+
 fn render_splash_content(buf: &mut Buffer, area: Rect, data: &SplashData<'_>) {
     if area.width < 8 || area.height < 6 {
         return;
     }
 
+    let tip_width = area.width.saturating_sub(raven_art_width(data.raven_art)) as usize;
+    let tip_text = crate::splash_tips::build_splash_tip_text(
+        data.splash_tip,
+        tip_width.max(16),
+        data.splash_tip_fade,
+    );
+    let top_h = splash_top_height(data.raven_art, &tip_text).min(area.height);
+
+    let top_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: top_h,
+    };
+    let body_area = Rect {
+        x: area.x,
+        y: area.y.saturating_add(top_h),
+        width: area.width,
+        height: area.height.saturating_sub(top_h),
+    };
+
+    // Intro + Mermaid diagram: left-aligned, vertically centered in the pane body.
+    render_splash_chunk_buf(buf, body_area, data.splash_chunk);
+
+    let art_w = raven_art_width(data.raven_art).min(top_area.width.saturating_sub(4));
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-        .split(area);
+        .constraints([Constraint::Length(art_w), Constraint::Min(0)])
+        .split(top_area);
 
-    let art_style = Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff));
-    // Add extra padding above and to the left of the ASCII raven art
-    let art_area = cols[0];
-    let padded_art = Rect {
-        x: art_area.x + 3,           // extra left padding
-        y: art_area.y + 2,           // extra top padding
-        width: art_area.width.saturating_sub(6),
-        height: art_area.height.saturating_sub(3),
+    let magenta_focused =
+        data.splash_focus == crate::app_state::SplashFocus::Magenta;
+    let art_style = if magenta_focused {
+        Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))
+    } else {
+        Style::default().fg(Color::Rgb(0x55, 0x55, 0x66))
     };
     Paragraph::new(data.raven_art)
         .style(art_style)
+        .alignment(Alignment::Left)
         .wrap(Wrap { trim: false })
-        .render(padded_art, buf);
+        .render(cols[0], buf);
 
-    let hint = Style::default().fg(Color::DarkGray);
-    let accent = Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff));
-    let key = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-
-    let help = Text::from(vec![
-        Line::from(Span::styled(
-            "Local-first agentic coding harness",
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("→", key),
-            Span::styled("  Right arrow", accent),
-            Span::styled("  workspace/session picker", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("←", key),
-            Span::styled("  Left arrow", accent),
-            Span::styled("  back from picker / panes", hint),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Navigation",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("Tab", key),
-            Span::styled("  cycle focus (Conv → Trace → Input)", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("↑↓", key),
-            Span::styled("  scroll pane  •  ", hint),
-            Span::styled("Ctrl+↑↓", key),
-            Span::styled("  input history", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("Ctrl+F", key),
-            Span::styled("  search  •  ", hint),
-            Span::styled("/help", key),
-            Span::styled("  slash commands", hint),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Copy / paste",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("Shift+drag", key),
-            Span::styled("  terminal selection  •  ", hint),
-            Span::styled("Ctrl+Insert", key),
-            Span::styled("  copy", hint),
-        ]),
-        Line::from(vec![
-            Span::styled("Shift+Insert", key),
-            Span::styled("  paste  •  ", hint),
-            Span::styled("Ctrl+V", key),
-            Span::styled("  paste (when clipboard works)", hint),
-        ]),
-        Line::from(Span::styled(
-            "SSH/screen vary by emulator — bracketed paste and Ctrl+V are tried automatically",
-            hint,
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Session",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(vec![
-            Span::styled("endpoint: ", hint),
-            Span::styled(data.base_url, accent),
-        ]),
-        Line::from(vec![
-            Span::styled("model:    ", hint),
-            Span::styled(data.model, accent),
-        ]),
-        Line::from(vec![
-            Span::styled("workspace:", hint),
-            Span::styled(truncate_str(data.workspace, 48), accent),
-        ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Goals, repo cache, and summaries persist under ~/.raven-hotel/",
-            hint,
-        )),
-    ]);
-
-    Paragraph::new(help)
-        .wrap(Wrap { trim: true })
-        .render(cols[1], buf);
+    render_left_aligned_text_block(buf, cols[1], &tip_text);
 }
 
 fn render_workspace_to_buffer(buf: &mut Buffer, content_area: Rect, data: &WorkspaceDrawData<'_>) {

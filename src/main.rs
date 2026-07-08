@@ -37,6 +37,8 @@ mod keystore;
 mod palette;
 mod search;
 mod settings_modal;
+mod splash_chunk;
+mod splash_tips;
 mod tui_app;
 mod tui_render;
 mod trace_fold;

@@ -681,6 +681,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash)
+            && app.splash_focus == crate::app_state::SplashFocus::Magenta
+            && app.splash_tips.should_animate()
+            && app.splash_tips.tick()
+        {
+            app.needs_redraw = true;
+        }
+
         if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
@@ -772,7 +780,7 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
-        let workspace_display = config.workspace.display().to_string();
+
         let show_gauge = app.is_processing && !stop_signal.load(Ordering::SeqCst);
         let gauge_h = if show_gauge { 1 } else { 0 };
         let overview_harness = matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview)
@@ -801,12 +809,7 @@ async fn run_app<B: ratatui::backend::Backend>(
         if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 || app.desktop.is_animating() {
             app.needs_redraw = false;
 
-            let search_label = match app.desktop.active {
-                crate::desktop::ActiveDesktop::Splash => "→ picker".to_string(),
-                crate::desktop::ActiveDesktop::Picker => "← splash".to_string(),
-                crate::desktop::ActiveDesktop::Overview => "← splash / nav".to_string(),
-                _ => app.search.status_label(),
-            };
+            let search_label = app.search.status_label();
 
             terminal.draw(|f| {
                 let size = f.area();
@@ -817,15 +820,35 @@ async fn run_app<B: ratatui::backend::Backend>(
                         .style(ratatui::style::Style::default().bg(ratatui::style::Color::Black)),
                     size,
                 );
+                const BREADCRUMB_H: u16 = 1;
                 let vertical = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(status_h), Constraint::Min(6), Constraint::Length(gauge_h), Constraint::Length(input_h)])
+                    .constraints([
+                        Constraint::Length(BREADCRUMB_H),
+                        Constraint::Length(status_h),
+                        Constraint::Min(6),
+                        Constraint::Length(gauge_h),
+                        Constraint::Length(input_h),
+                    ])
                     .split(size);
 
-                let status_area = vertical[0];
-                let content_area = vertical[1];
-                let gauge_area = vertical[2];
-                let input_area = vertical[3];
+                let breadcrumb_area = vertical[0];
+                let status_area = vertical[1];
+                let content_area = vertical[2];
+                let gauge_area = vertical[3];
+                let input_area = vertical[4];
+
+                tui_render::draw_breadcrumb_bar(
+                    f,
+                    breadcrumb_area,
+                    &tui_render::BreadcrumbData {
+                        active: app.desktop.active,
+                        splash_focus: app.splash_focus,
+                        view_focus: app.view_focus,
+                        browser_harness_selected: app.browser_selected_is_harness(),
+                        compact: size.width < 80,
+                    },
+                );
 
                 if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker) {
                     app.picker.last_summary_height = content_area.height.saturating_sub(4).max(10);
@@ -907,8 +930,10 @@ async fn run_app<B: ratatui::backend::Backend>(
                         trace_expanded: &app.trace_expanded,
                     },
                     &tui_render::SplashData {
-                        raven_art: &app.raven_art, base_url: &config.base_url,
-                        model: &app.display_model, workspace: &workspace_display,
+                        raven_art: &app.raven_art,
+                        splash_chunk: &app.splash_chunk,
+                        splash_tip: app.splash_tips.current(),
+                        splash_tip_fade: app.splash_tips.fade_level(),
                         splash_focus: app.splash_focus,
                     },
                     &tui_render::PickerDrawData {
@@ -933,14 +958,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
 
                 if matches!(app.desktop.active, crate::desktop::ActiveDesktop::Overview) && overview_harness {
-                    // Draw real upper status bar and input inside the right "content" column of Screen 2
-                    // so it appears as the "upper status bar" above conversation when Coding Harness selected.
-                    let hcols = Layout::default()
-                        .direction(Direction::Horizontal)
-                        .constraints([Constraint::Percentage(30), Constraint::Percentage(30), Constraint::Percentage(40)])
-                        .split(content_area);
-                    let right_col = hcols[2];
-                    let srect = ratatui::layout::Rect { x: right_col.x, y: content_area.y, width: right_col.width, height: 1 };
+                    let (_harness_col, srect, _conv, irect) =
+                        tui_render::overview_harness_areas(content_area);
                     tui_render::draw_status_bar(f, srect, &tui_render::StatusBarData {
                         display_model: &app.display_model,
                         balance_label: &app.balance_label,
@@ -952,13 +971,6 @@ async fn run_app<B: ratatui::backend::Backend>(
                         search_label: &search_label,
                         tps: app.api_tps,
                     });
-                    let i_h = 3u16;
-                    let irect = ratatui::layout::Rect {
-                        x: right_col.x,
-                        y: content_area.y + content_area.height.saturating_sub(i_h),
-                        width: right_col.width,
-                        height: i_h,
-                    };
                     let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, irect, &tui_render::InputBarData {
                         input: &app.input, is_processing: app.is_processing,

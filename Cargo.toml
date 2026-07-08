@@ -36,6 +36,7 @@ argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
 rpassword = "7"
+mermaid-text = "0.56.0"
 
 [features]
 default = ["clipboard"]

@@ -1,12 +1,8 @@
 //! Shared helpers for scrollable markdown panes (wiki viewer, picker summary, overview).
 
+use crate::list_pane::list_selection_style;
 use crate::md_render;
-use ratatui::{
-    style::{Color, Modifier},
-    text::Text,
-};
-
-const NAV_HIGHLIGHT_BG: Color = Color::Rgb(0x20, 0x50, 0x80);
+use ratatui::text::Text;
 
 /// Render markdown and return a viewport slice `[scroll, scroll + max_lines)`.
 pub fn markdown_viewport(md: &str, scroll: usize, max_lines: usize) -> Text<'static> {
@@ -43,11 +39,7 @@ pub fn highlight_markdown_viewport(
         for span in &mut line.spans {
             let matches = !search.is_empty() && span.content.contains(search);
             if matches || is_active_region {
-                span.style = span
-                    .style
-                    .fg(Color::White)
-                    .bg(NAV_HIGHLIGHT_BG)
-                    .add_modifier(Modifier::BOLD);
+                span.style = list_selection_style();
             }
         }
     }

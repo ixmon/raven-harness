@@ -1,15 +1,29 @@
 //! Shared styling and scroll math for selectable list panes (nav, picker tree).
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 
-pub const LIST_SELECTION_BG: Color = Color::Rgb(0x20, 0x50, 0x80);
+use crate::palette::ColorDepth;
 
-/// Bold white-on-blue style for the currently selected list row.
+/// Shared background for selected list rows and markdown nav highlights (24-bit).
+pub const LIST_SELECTION_BG: Color = Color::Rgb(0x2a, 0x2a, 0x34);
+
+const LIST_SELECTION_FG: Color = Color::Rgb(0xde, 0xde, 0xe6);
+
+/// xterm grayscale ramp indices for restricted terminals (see `palette::gray_rgb`).
+const LIST_SELECTION_BG_256: u8 = 236; // rgb(48, 48, 48)
+const LIST_SELECTION_FG_256: u8 = 254; // rgb(228, 228, 228)
+
+/// Soft highlighted row / inline match (dark gray bg, light text).
 pub fn list_selection_style() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .bg(LIST_SELECTION_BG)
-        .add_modifier(Modifier::BOLD)
+    match crate::palette::depth() {
+        ColorDepth::True => Style::default().fg(LIST_SELECTION_FG).bg(LIST_SELECTION_BG),
+        ColorDepth::Indexed256 => Style::default()
+            .fg(Color::Indexed(LIST_SELECTION_FG_256))
+            .bg(Color::Indexed(LIST_SELECTION_BG_256)),
+        ColorDepth::Ansi16 | ColorDepth::None => Style::default()
+            .fg(Color::White)
+            .bg(Color::DarkGray),
+    }
 }
 
 /// Scroll offset so `selected` stays near the vertical center of a fixed-height viewport.

@@ -235,6 +235,18 @@ pub fn load_raven_art() -> String {
     include_str!("../assets/raven.txt").to_string()
 }
 
+/// Load splash layout chunk: prefer `/tmp/chunk2`, then `/tmp/chunk`, then bundled default.
+pub fn load_splash_chunk() -> String {
+    for path in ["/tmp/chunk2", "/tmp/chunk"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            if !s.trim().is_empty() {
+                return s;
+            }
+        }
+    }
+    crate::splash_chunk::default_splash_chunk()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

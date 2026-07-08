@@ -228,6 +228,10 @@ pub struct App {
     // Multi-desktop: workspace ↔ splash (left/right arrow slide)
     pub desktop: DesktopState,
     pub raven_art: String,
+    /// Splash layout diagram loaded from `/tmp/chunk2` (or `/tmp/chunk`, or default).
+    pub splash_chunk: String,
+    /// Cycling tips for the upper-right of the splash magenta pane.
+    pub splash_tips: crate::splash_tips::SplashTipsState,
 
     /// Focus on the splash (first) screen: magenta pane (default) or workspace picker.
     pub splash_focus: SplashFocus,
@@ -337,6 +341,8 @@ impl App {
             cached_agent_mode: "talk".into(),
             desktop: DesktopState::new(),
             raven_art: crate::desktop::load_raven_art(),
+            splash_chunk: crate::desktop::load_splash_chunk(),
+            splash_tips: crate::splash_tips::SplashTipsState::new(crate::splash_tips::load_splash_tips()),
             splash_focus: SplashFocus::Magenta,
             view_focus: ViewFocus::Picker,
             overview_browser: WikiBrowser::default(),
