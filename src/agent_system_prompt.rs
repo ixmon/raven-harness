@@ -228,6 +228,12 @@ Use `update_goal` (when intent shifts) and `record_discovery` for high-value fac
         )
     };
 
+    let calib_suffix = std::env::var("RAVEN_CALIB_PROMPT_SUFFIX")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| format!("\n\n## Calibration overlay (eval only)\n{s}"))
+        .unwrap_or_default();
+
     let sys = format!(
         r#"You are a sharp, practical coding agent running in a terminal-based agentic environment.
 
@@ -273,7 +279,7 @@ A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important
 {}
 
 ## Execution Style (critical — read carefully)
-{}{}
+{}{}{}
 "#,
         workspace.display(),
         plan_mode_section,
@@ -285,7 +291,8 @@ A rich, compact "SESSION CONTEXT" block (repo tree with sizes + ranked important
         tools_list,
         workspace_access,
         anti_narration,
-        execution_style
+        execution_style,
+        calib_suffix
     );
 
     Message {

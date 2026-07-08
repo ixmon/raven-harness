@@ -272,11 +272,31 @@ pub fn patch_file(
     };
 
     let changed = new_content != original;
+    let strict_errors = std::env::var("RAVEN_PATCH_STRICT_ERRORS")
+        .ok()
+        .is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
     match fs::write(&path, &new_content) {
         Ok(_) => {
             if changed {
                 format!("✅ Patched {}", path.display())
+            } else if search == replace {
+                if strict_errors {
+                    format!(
+                        "⚠️ Patch had no effect on {}: search and replace are identical. Set replace to the NEW text you want.",
+                        path.display()
+                    )
+                } else {
+                    format!(
+                        "✅ Patched {} (no net change — search and replace are identical; set replace to the NEW text)",
+                        path.display()
+                    )
+                }
+            } else if strict_errors {
+                format!(
+                    "⚠️ Patch had no effect on {}: replacement produced identical file content. Re-read and fix replace.",
+                    path.display()
+                )
             } else {
                 format!(
                     "✅ Patched {} (no net change — the content after the edit was identical to before)",
