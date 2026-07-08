@@ -141,7 +141,7 @@ When the user specifies a subdirectory (e.g. "everything in `./galaga/`):
 
 When `plan_execution_incomplete()` and `agent_mode == "work"`, the harness injects a **plan-execution nudge** *before* the criteria judge or define-done reminder. This prevents mid-step pauses when the agent narrates "I should call `complete_plan_step`" but does not call it.
 
-**Remaining gap:** the nudge encourages the tool call; it does not force it. Agents can still stop after writes without calling `complete_plan_step` (observed in Galaga sessions).
+**Escalation (implemented):** consecutive text-only stops while plan execution is incomplete escalate after the first soft stall, immediately if the model *narrates* `complete_plan_step` without calling it, or after any tool use without the gate. Escalated messages demand a real `complete_plan_step` tool call and include the current step description/verification. Agents can still refuse after budget exhaustion (turn ends); the user can continue or `/plan done`.
 
 ---
 
@@ -190,8 +190,8 @@ Documented in `/help` via `input_dispatch.rs`.
 - [x] No per-tool / per-turn auto-advance
 - [x] Execution log appended to `wiki/plan.md` on exec/attested/observe
 - [x] `plan_sync::reconcile_plan_execution` — wiki log + agent state, no regression
-- [ ] Hard-block proceed when proposal has validation errors
-- [ ] `/plan done` to force whole-plan completion
+- [x] Hard-block proceed when proposal has validation errors
+- [x] `/plan done` to force whole-plan completion
 
 ### Phase 5 — UX polish (partial)
 
@@ -209,7 +209,7 @@ Documented in `/help` via `input_dispatch.rs`.
 - [x] Per-step grep/C++ convention lints
 - [x] Adversarial critique retry on warnings
 - [ ] Richer `check` tier (`line_count:`, lint integration)
-- [ ] Escalation when agent skips `complete_plan_step` for N turns
+- [x] Escalation when agent skips `complete_plan_step` for N turns
 
 ---
 

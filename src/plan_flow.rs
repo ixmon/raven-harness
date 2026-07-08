@@ -176,6 +176,7 @@ pub fn reset_plan_for_new_request(plan: &mut PlanState) {
     plan.qa_history.clear();
     plan.pending_question = None;
     plan.pending_proposal = None;
+    plan.pending_proposal_errors.clear();
 }
 
 fn start_json_plan_loop(plan: &mut PlanState, initial_request: &str) {
@@ -184,9 +185,35 @@ fn start_json_plan_loop(plan: &mut PlanState, initial_request: &str) {
     plan.qa_history.clear();
     plan.pending_question = None;
     plan.pending_proposal = None;
+    plan.pending_proposal_errors.clear();
     plan.recap_offered = false;
     plan.steps.clear();
     plan.loop_phase = PlanLoopPhase::FetchingQuestion;
+}
+
+/// Message when the user tries to proceed while verification errors remain.
+pub fn format_proceed_blocked_message(plan: &PlanState) -> String {
+    let mut lines = vec![
+        "❌ Cannot proceed: the proposal still has blocking verification issues."
+            .to_string(),
+        "Revise the plan (describe the fixes) or ask the agent to re-propose before proceed."
+            .to_string(),
+    ];
+    for err in plan.pending_proposal_errors.iter().take(8) {
+        lines.push(format!("  • {err}"));
+    }
+    if plan.pending_proposal_errors.len() > 8 {
+        lines.push(format!(
+            "  … and {} more",
+            plan.pending_proposal_errors.len() - 8
+        ));
+    }
+    lines.join("\n")
+}
+
+/// True when proceed must be refused for the current pending proposal.
+pub fn should_block_proceed(plan: &PlanState) -> bool {
+    plan.proposal_blocks_proceed()
 }
 
 /// True when assistant text invited the user to approve the plan for execution.
@@ -588,6 +615,7 @@ fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal:
     let report = improve_proposal(&mut proposal, workdir.as_deref());
     apply_proposal_to_plan(&mut app.plan, &proposal);
     app.plan.pending_proposal = Some(proposal.clone());
+    app.plan.pending_proposal_errors = report.errors.clone();
     app.plan.recap_offered = true;
     app.plan.loop_phase = PlanLoopPhase::AwaitingProceedConsent;
     let mut recap = format_proposal_for_user(&proposal);
@@ -601,10 +629,15 @@ fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal:
         }
     }
     if !report.errors.is_empty() {
-        recap.push_str("\n\n⚠ Remaining verification issues (please revise before proceed):\n");
+        recap.push_str(
+            "\n\n🚫 Blocking verification issues — proceed is disabled until these are fixed:\n",
+        );
         for err in &report.errors {
             recap.push_str(&format!("  • {err}\n"));
         }
+        recap.push_str(
+            "\nDescribe the fixes or ask for a revised proposal. Saying \"proceed\" will be refused.\n",
+        );
     }
     if !report.warnings.is_empty() {
         recap.push_str("\n\n💡 Verification advisories (non-blocking, review before proceed):\n");
@@ -834,6 +867,12 @@ pub fn submit_plan_loop_input(
         PlanLoopPhase::AwaitingProceedConsent => {
             app.left_committed.push(format!("> {}", user_input));
             if is_explicit_proceed_approval(user_input) {
+                if should_block_proceed(&app.plan) {
+                    app.left_committed
+                        .push(format_proceed_blocked_message(&app.plan));
+                    app.needs_redraw = true;
+                    return PlanLoopUserOutcome::Consumed;
+                }
                 app.needs_redraw = true;
                 return PlanLoopUserOutcome::StartExecution;
             }
@@ -860,6 +899,8 @@ pub fn spawn_proceed_feedback_work(
         "📋 Plan: interpreting feedback…",
     );
     app.plan.pending_proposal = None;
+    // Keep pending_proposal_errors until a new proposal lands (or cancel).
+    // Classified Proceed is re-checked against the stored errors in the event loop.
     app.plan.recap_offered = false;
     let initial = app.plan.initial_request.clone();
     let base_history = app.plan.qa_history.clone();
@@ -989,12 +1030,48 @@ pub fn cancel_plan_mode(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
         app.plan.loop_phase = PlanLoopPhase::Idle;
         app.plan.pending_question = None;
         app.plan.pending_proposal = None;
+        app.plan.pending_proposal_errors.clear();
     }
     app.left_committed.push(msg);
     app.needs_redraw = true;
 }
 
-/// Handle `/plan`, `/plan status`, `/plan cancel`, and `/plan <goal...>`.
+/// Force whole-plan completion (`/plan done`) without requiring remaining step gates.
+pub fn force_plan_done(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
+    if !app.plan.active || app.plan.steps.is_empty() {
+        app.left_committed.push(
+            "No active plan execution to complete. Use /plan status, or /plan cancel."
+                .to_string(),
+        );
+        app.needs_redraw = true;
+        return;
+    }
+    if app.plan.is_execution_complete() {
+        maybe_finalize_plan_execution(app, agent);
+        app.left_committed
+            .push("Plan was already complete.".to_string());
+        app.needs_redraw = true;
+        return;
+    }
+    app.plan.complete();
+    if let Ok(mut ag) = agent.try_lock() {
+        let mut exec = ag.plan_execution().clone();
+        for step in &mut exec.steps {
+            step.status = "done".to_string();
+        }
+        exec.current_step = exec.steps.len();
+        exec.pending_observe_prompt = None;
+        exec.pending_observe_step = None;
+        ag.set_plan_execution(exec);
+    }
+    app.left_committed.push(
+        "✓ /plan done — marked all steps complete (forced by user).".to_string(),
+    );
+    maybe_finalize_plan_execution(app, agent);
+    app.needs_redraw = true;
+}
+
+/// Handle `/plan`, `/plan status`, `/plan cancel`, `/plan done`, and `/plan <goal...>`.
 pub fn dispatch_plan_slash(
     prompt: &str,
     app: &mut App,
@@ -1022,6 +1099,10 @@ pub fn dispatch_plan_slash(
         }
         Some("cancel") => {
             cancel_plan_mode(app, agent);
+            true
+        }
+        Some("done") => {
+            force_plan_done(app, agent);
             true
         }
         _ => {
@@ -1095,6 +1176,9 @@ pub fn dismiss_plan_pane_if_pending(app: &mut App) {
 }
 
 /// User approved the plan — switch to work mode, populate steps, return execution prompt.
+///
+/// Callers must check [`should_block_proceed`] first when consent comes from the
+/// proposal gate. This function clears pending proposal state on success.
 pub fn start_plan_execution(
     app: &mut App,
     agent: &Arc<TokioMutex<Agent>>,
@@ -1103,6 +1187,7 @@ pub fn start_plan_execution(
     approve_plan_for_execution(app, agent);
     app.plan.loop_phase = PlanLoopPhase::Idle;
     app.plan.pending_proposal = None;
+    app.plan.pending_proposal_errors.clear();
     app.plan.recap_offered = false;
     app.left_committed
         .push("▶ Plan approved — starting execution.".to_string());
@@ -1226,6 +1311,18 @@ mod tests {
         assert!(is_proceed_confirmation("start executing"));
         assert!(!is_proceed_confirmation("maybe"));
         assert!(!is_proceed_confirmation("sounds good"));
+    }
+
+    #[test]
+    fn should_block_proceed_when_proposal_has_errors() {
+        let mut plan = PlanState::default();
+        assert!(!should_block_proceed(&plan));
+        plan.pending_proposal_errors
+            .push("Step 1: observe without prompt".into());
+        assert!(should_block_proceed(&plan));
+        let msg = format_proceed_blocked_message(&plan);
+        assert!(msg.contains("Cannot proceed"));
+        assert!(msg.contains("observe without prompt"));
     }
 
     #[test]

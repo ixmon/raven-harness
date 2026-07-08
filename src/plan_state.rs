@@ -100,11 +100,18 @@ pub struct PlanState {
     pub qa_history: Vec<raven_tui::plan_protocol::PlanQaEntry>,
     pub pending_question: Option<raven_tui::plan_protocol::PlanQuestion>,
     pub pending_proposal: Option<raven_tui::plan_protocol::PlanProposal>,
+    /// Blocking verification errors from the latest proposal (hard-block proceed).
+    pub pending_proposal_errors: Vec<String>,
     /// Plan execution finished; hide the pane on the user's next message.
     pub dismiss_pane_on_next_input: bool,
 }
 
 impl PlanState {
+    /// True when the latest proposal still has validation errors that block proceed.
+    pub fn proposal_blocks_proceed(&self) -> bool {
+        !self.pending_proposal_errors.is_empty()
+    }
+
     /// True when every approved step has been completed (`current_step` past the last step).
     pub fn is_execution_complete(&self) -> bool {
         !self.steps.is_empty() && self.current_step >= self.steps.len()
@@ -234,5 +241,16 @@ mod tests {
         p.complete_on_work_complete_signal("⭐⭐ JUDGE: WORK_COMPLETE: criteria satisfied");
         assert_eq!(p.current_step, 3);
         assert!(p.steps.iter().all(|s| matches!(s.status, PlanStepStatus::Done)));
+    }
+
+    #[test]
+    fn proposal_blocks_proceed_when_errors_present() {
+        let mut p = PlanState::default();
+        assert!(!p.proposal_blocks_proceed());
+        p.pending_proposal_errors
+            .push("Step 1: missing verification".into());
+        assert!(p.proposal_blocks_proceed());
+        p.pending_proposal_errors.clear();
+        assert!(!p.proposal_blocks_proceed());
     }
 }

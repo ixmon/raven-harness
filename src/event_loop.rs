@@ -619,13 +619,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                 UiUpdate::PlanLoopProceedClassified(intent) => {
                     match intent {
                         raven_tui::plan_intent::PlanProceedIntent::Proceed => {
-                            app.deferred_agent_prompt = Some(
-                                crate::plan_flow::start_plan_execution(
-                                    &mut app,
-                                    &agent,
-                                    &config.workspace,
-                                ),
-                            );
+                            if crate::plan_flow::should_block_proceed(&app.plan) {
+                                app.left_committed.push(
+                                    crate::plan_flow::format_proceed_blocked_message(&app.plan),
+                                );
+                                app.plan.loop_phase =
+                                    crate::plan_state::PlanLoopPhase::AwaitingProceedConsent;
+                                app.plan.recap_offered = true;
+                            } else {
+                                app.deferred_agent_prompt = Some(
+                                    crate::plan_flow::start_plan_execution(
+                                        &mut app,
+                                        &agent,
+                                        &config.workspace,
+                                    ),
+                                );
+                            }
                         }
                         raven_tui::plan_intent::PlanProceedIntent::Cancel => {
                             crate::plan_flow::cancel_plan_mode(&mut app, &agent);

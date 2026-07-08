@@ -718,6 +718,11 @@ fn build_round_context(
     let agent_mode = agent.current_agent_mode();
     let exec = agent.plan_execution();
     let plan_executing = exec.active && !exec.steps.is_empty();
+    let (plan_step_description, plan_step_verification) = exec
+        .steps
+        .get(exec.current_step)
+        .map(|s| (Some(s.description.clone()), s.verification.clone()))
+        .unwrap_or((None, None));
 
     RoundContext {
         effective_text: effective_text.to_string(),
@@ -734,6 +739,8 @@ fn build_round_context(
         plan_current_step: exec.current_step,
         plan_total_steps: exec.steps.len(),
         plan_pending_observe: exec.pending_observe_prompt.is_some(),
+        plan_step_description,
+        plan_step_verification,
     }
 }
 

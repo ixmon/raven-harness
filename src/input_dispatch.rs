@@ -395,7 +395,7 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
         },
         SlashCommand {
             name: "plan",
-            desc: "Enter plan mode (/plan status, /plan cancel)",
+            desc: "Enter plan mode (/plan status, /plan cancel, /plan done)",
         },
         SlashCommand {
             name: "run-mode",
@@ -445,6 +445,7 @@ Available commands:
 /plan          Enter plan mode (optional goal text after /plan)
 /plan status   Show current plan goal, steps, and progress
 /plan cancel   Exit plan mode and clear pending entry
+/plan done     Force-complete the executing plan (user override)
 /run-mode      Set run mode (talk, think, research, work, dream, plan)
 /settings      Manage inference endpoints (add/switch/edit/delete)
 /search        Search conversation or trace (or Ctrl-F)
