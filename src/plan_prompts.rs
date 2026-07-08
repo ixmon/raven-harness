@@ -74,6 +74,20 @@ pub fn format_plan_status(plan: &PlanState, agent_mode: &str) -> String {
     if !plan.goal.is_empty() {
         lines.push(format!("  Goal: {}", plan.goal));
     }
+    match plan
+        .project_workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty() && *w != ".")
+    {
+        Some(wd) => lines.push(format!(
+            "  Deliverables: {}/ (isolated under workspace)",
+            wd.trim_end_matches('/')
+        )),
+        None => lines.push(
+            "  Deliverables: workspace root (not confined to a subdir)".to_string(),
+        ),
+    }
     if !plan.success_criteria.is_empty() {
         lines.push(format!("  Success criteria: {}", plan.success_criteria));
     }
