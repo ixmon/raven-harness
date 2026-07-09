@@ -276,23 +276,11 @@ impl SteeringState {
             };
         }
 
-        // 2b. Active plan execution: nudge before judge/define_done (criteria must not end the turn mid-step)
-        if plan_execution_incomplete(ctx)
-            && ctx.agent_mode == "work"
-            && self.has_round_budget()
-        {
-            self.plan_exec_stalls += 1;
-            self.text_nudges += 1;
-            let escalate = should_escalate_plan_execution(self, ctx);
-            let (message, detail) = plan_execution_nudge_message(ctx, self.plan_exec_stalls, escalate);
-            return SteeringDecision::Nudge {
-                message,
-                use_continuation_nudge: true,
-                nudge_count: self.plan_exec_stalls,
-                nudge_max: MAX_TEXT_NUDGES.saturating_add(PLAN_EXEC_SOFT_STALLS),
-                log_event: "nudge".into(),
-                log_detail: detail,
-            };
+        // 2b. Active plan execution: nudge before judge/define_done (criteria must not end the turn mid-step).
+        // Always inject the real plan-execution message (do not use generic continuation nudge —
+        // that discarded escalate text and left the agent with a weak kick).
+        if plan_execution_incomplete(ctx) && ctx.agent_mode == "work" {
+            return self.plan_execution_nudge_decision(ctx);
         }
 
         // 3. Criteria-based judge
@@ -357,10 +345,12 @@ impl SteeringState {
 
         // 7. Plan narration detection
         // Skip during plan mode — the agent is *supposed* to describe and clarify the plan.
+        // Skip when plan-exec is active (handled in 2b with stronger messaging).
         if detect_plan_narration(&ctx.effective_text)
             && !ctx.is_llm_error
             && self.text_nudges < MAX_TEXT_NUDGES
             && ctx.agent_mode != "plan"
+            && !plan_execution_incomplete(ctx)
         {
             self.text_nudges += 1;
             return SteeringDecision::Nudge {
@@ -385,9 +375,36 @@ impl SteeringState {
             return self.decide_ambiguous_stop(ctx, recent);
         }
 
-        // 9. Natural completion
+        // 9. Never accept mid-plan: incomplete plan execution is not natural completion.
+        if plan_execution_incomplete(ctx) && ctx.agent_mode == "work" {
+            return self.plan_execution_nudge_decision(ctx);
+        }
+
+        // 10. Natural completion
         SteeringDecision::Accept {
             clear_criteria: false,
+        }
+    }
+
+    /// Build a plan-execution continuation nudge with the full escalate/soft message body.
+    fn plan_execution_nudge_decision(&mut self, ctx: &RoundContext) -> SteeringDecision {
+        self.plan_exec_stalls += 1;
+        self.text_nudges += 1;
+        // Force escalate when out of round budget so the agent gets the strongest kick
+        // before the turn loop may end.
+        let escalate =
+            should_escalate_plan_execution(self, ctx) || !self.has_round_budget();
+        let (message, detail) =
+            plan_execution_nudge_message(ctx, self.plan_exec_stalls, escalate);
+        SteeringDecision::Nudge {
+            message,
+            // Must be false: use_continuation_nudge discards `message` and injects a
+            // generic "do not narrate" line instead of the plan-execution escalate text.
+            use_continuation_nudge: false,
+            nudge_count: self.plan_exec_stalls,
+            nudge_max: MAX_TEXT_NUDGES.saturating_add(PLAN_EXEC_SOFT_STALLS),
+            log_event: "nudge".into(),
+            log_detail: detail,
         }
     }
 
@@ -449,6 +466,11 @@ impl SteeringState {
         ctx: &RoundContext,
         recent: &RecentActionsSummary,
     ) -> SteeringDecision {
+        // Incomplete plan is not an ambiguous natural stop — keep driving the gate.
+        if plan_execution_incomplete(ctx) && ctx.agent_mode == "work" {
+            return self.plan_execution_nudge_decision(ctx);
+        }
+
         let implies_run = ctx
             .last_user_request
             .as_deref()
@@ -914,11 +936,47 @@ mod tests {
         );
         let d = s.decide_no_tools(&ctx, &no_recent());
         match d {
-            SteeringDecision::Nudge { message, log_detail, .. } => {
-                assert!(message.contains("Plan execution"));
+            SteeringDecision::Nudge {
+                message,
+                log_detail,
+                use_continuation_nudge,
+                ..
+            } => {
+                assert!(message.contains("Plan execution") || message.contains("complete_plan_step"));
+                assert!(
+                    !use_continuation_nudge,
+                    "plan-execution must inject full message, not generic continuation"
+                );
                 assert!(log_detail.contains("soft"), "first stall is soft: {log_detail}");
             }
             other => panic!("expected soft plan-execution nudge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plan_execution_does_not_accept_when_budget_exhausted() {
+        let mut s = basic_state();
+        s.total_rounds = s.max_rounds; // no remaining round budget
+        let ctx = plan_exec_round("I think step 3 is done.", 2, 6);
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        match d {
+            SteeringDecision::Nudge {
+                message,
+                use_continuation_nudge,
+                log_detail,
+                ..
+            } => {
+                assert!(!use_continuation_nudge);
+                assert!(
+                    message.contains("REQUIRED TOOL CALL") || message.contains("complete_plan_step"),
+                    "budget-exhausted mid-plan should escalate, got: {message}"
+                );
+                assert!(
+                    log_detail.contains("ESCALATE"),
+                    "expected escalate when out of budget: {log_detail}"
+                );
+            }
+            other => panic!("must not Accept mid-plan when budget exhausted, got {other:?}"),
         }
     }
 
@@ -950,7 +1008,13 @@ mod tests {
         );
         let d = s.decide_no_tools(&ctx, &no_recent());
         match d {
-            SteeringDecision::Nudge { message, log_detail, .. } => {
+            SteeringDecision::Nudge {
+                message,
+                log_detail,
+                use_continuation_nudge,
+                ..
+            } => {
+                assert!(!use_continuation_nudge);
                 assert!(
                     message.contains("REQUIRED TOOL CALL") || message.contains("complete_plan_step"),
                     "escalated message: {message}"
