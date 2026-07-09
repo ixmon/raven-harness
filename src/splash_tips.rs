@@ -107,6 +107,15 @@ impl SplashTipsState {
     }
 }
 
+/// Tip shown on the splash screen when Brave Search is not available for web_search.
+pub const BRAVE_SEARCH_TIP: &str = "\
+Better web search with Brave
+
+web_search works without a key (DuckDuckGo scrape), but results are weaker.
+Add a free Brave Search API key under Settings → brave key for reliable results.
+
+https://brave.com/search/api/";
+
 /// Load tips from `/tmp/tips`, else bundled `assets/splash_tips.txt`.
 pub fn load_splash_tips() -> Vec<String> {
     if let Ok(s) = std::fs::read_to_string("/tmp/tips") {
@@ -116,6 +125,17 @@ pub fn load_splash_tips() -> Vec<String> {
         }
     }
     parse_tips(include_str!("../assets/splash_tips.txt"))
+}
+
+/// Prepend the Brave Search tip when a usable key is not loaded for this session.
+///
+/// Prefer `get_brave_key().is_some()` (decrypted / env) over `has_brave_key()` so a
+/// stored-but-not-unlocked blob still surfaces the hint until search actually works.
+pub fn apply_conditional_tips(mut tips: Vec<String>, brave_search_ready: bool) -> Vec<String> {
+    if !brave_search_ready {
+        tips.insert(0, BRAVE_SEARCH_TIP.to_string());
+    }
+    tips
 }
 
 /// Tips are separated by two or more blank lines in the source file.
@@ -405,6 +425,17 @@ mod tests {
         assert!(tips[1].contains("~/.raven-hotel"));
         assert!(tips[1].contains("encrypted"));
         assert!(tips[2].contains("raven-harness"));
+    }
+
+    #[test]
+    fn inserts_brave_tip_when_search_not_ready() {
+        let base = parse_tips(include_str!("../assets/splash_tips.txt"));
+        let with = apply_conditional_tips(base.clone(), false);
+        assert_eq!(with.len(), base.len() + 1);
+        assert!(with[0].contains("Brave"));
+        assert!(with[0].contains("Settings"));
+        let without = apply_conditional_tips(base, true);
+        assert!(!without[0].contains("Brave Search API"));
     }
 
     #[test]

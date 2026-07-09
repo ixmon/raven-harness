@@ -329,7 +329,12 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
         agent.lock().await.brave_key = brave_key;
     }
-    let mut app = App::new(&config);
+    let splash_tips = crate::splash_tips::apply_conditional_tips(
+        crate::splash_tips::load_splash_tips(),
+        // Tip when search will not use Brave this session (not merely "blob on disk").
+        keystore.get_brave_key().is_some(),
+    );
+    let mut app = App::new(&config, splash_tips);
 
     // On (re)start, prepopulate the conversation pane from the prebuilt/default
     // session's log so previous work is visible immediately in the UI panes.

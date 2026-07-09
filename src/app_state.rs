@@ -265,7 +265,10 @@ pub struct App {
 #[allow(dead_code)]
 impl App {
     /// Create a new App instance with default values.
-    pub fn new(config: &raven_tui::config::Config) -> Self {
+    ///
+    /// `splash_tips` is usually from [`crate::splash_tips::load_splash_tips`] plus
+    /// [`crate::splash_tips::apply_conditional_tips`] (e.g. Brave Search hint).
+    pub fn new(config: &raven_tui::config::Config, splash_tips: Vec<String>) -> Self {
         let banner = format!(
             "Raven Hotel - Agent Harness\n\n\
              Endpoint: {}\n\
@@ -353,7 +356,7 @@ impl App {
             desktop: DesktopState::new(),
             raven_art: crate::desktop::load_raven_art(),
             splash_chunk: crate::desktop::load_splash_chunk(),
-            splash_tips: crate::splash_tips::SplashTipsState::new(crate::splash_tips::load_splash_tips()),
+            splash_tips: crate::splash_tips::SplashTipsState::new(splash_tips),
             splash_focus: SplashFocus::Magenta,
             view_focus: ViewFocus::Picker,
             overview_browser: WikiBrowser::default(),
