@@ -316,6 +316,17 @@ async fn run_app<B: ratatui::backend::Backend>(
     // Set Brave Search API key from keystore (or BRAVE_API_KEY env var)
     {
         let brave_key = keystore.get_brave_key();
+        if brave_key.is_some() {
+            // Prefer stderr before TUI takes over; harmless if already in alt screen.
+            eprintln!("Brave Search: key loaded from vault/env");
+        } else if keystore.has_brave_key() {
+            eprintln!(
+                "Brave Search: keystore has a Brave key but it did not decrypt \
+                 (wrong password / unlock failed). Falling back to DuckDuckGo."
+            );
+        } else {
+            eprintln!("Brave Search: not configured (using DuckDuckGo HTML scrape)");
+        }
         agent.lock().await.brave_key = brave_key;
     }
     let mut app = App::new(&config);

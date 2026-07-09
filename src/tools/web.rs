@@ -161,15 +161,25 @@ pub fn web_search(query: &str, count: usize, brave_key: Option<&str>) -> String 
                 if e.contains("rate limited") {
                     return e;
                 }
-                // On other errors (network, parse), fall back to DDG
-                // Brave failed (network/key/rate/etc); fallback silently to DDG.
-                // (Direct prints would corrupt the TUI display.)
+                // Other errors (network, empty, parse): fall back to DDG but label clearly
+                // so we don't look like "Brave is on" when it isn't.
+                let ddg = ddg_search(query, count);
+                return format!(
+                    "⚠️ Brave Search failed ({e}); fell back to DuckDuckGo (weaker HTML scrape).\n\n{ddg}"
+                );
             }
         }
     }
 
-    // DuckDuckGo fallback
-    ddg_search(query, count)
+    // No key configured — DuckDuckGo only
+    let ddg = ddg_search(query, count);
+    if ddg.starts_with("🔍") {
+        format!(
+            "{ddg}\n(note: no Brave API key loaded — set one in Settings or BRAVE_API_KEY for better results)"
+        )
+    } else {
+        ddg
+    }
 }
 
 /// DuckDuckGo HTML scraper (no API key needed). Results are mediocre but free.
