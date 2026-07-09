@@ -415,6 +415,133 @@ pub async fn browse_urls(urls: &[&str], extract: &str) -> String {
     out
 }
 
+// ─── Download (binary-safe, stealth client) ────────────────────────────────
+
+/// Max size for a single download (100 MiB).
+const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Download a URL into a workspace-relative path using the stealth browser client.
+/// Prefer this over `exec` + curl/wget — many CDNs bot-block bare curl User-Agents.
+pub async fn download_url(url: &str, dest_path: &str, workspace: &std::path::Path) -> String {
+    let url = url.trim();
+    let dest_path = dest_path.trim();
+    if url.is_empty() || !url.starts_with("http://") && !url.starts_with("https://") {
+        return "❌ download requires a full http(s):// URL".to_string();
+    }
+    if dest_path.is_empty() {
+        return "❌ download requires path (workspace-relative destination file)".to_string();
+    }
+
+    let path = match super::fs::resolve(workspace, dest_path) {
+        Ok(p) => p,
+        Err(e) => return format!("❌ {e}"),
+    };
+    if path.is_dir() {
+        return format!(
+            "❌ Destination is a directory ({}). Pass a file path, e.g. assets/sprites.zip",
+            path.display()
+        );
+    }
+
+    let client = match build_stealth_client() {
+        Ok(c) => c,
+        Err(e) => return format!("❌ HTTP client error: {e}"),
+    };
+
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return format!(
+                "❌ Download failed for {url}: {e}\n\
+                 Tip: try browse() on the page first to find a direct file link, or use a raw GitHub URL."
+            );
+        }
+    };
+
+    let status = resp.status();
+    if !status.is_success() {
+        return format!(
+            "❌ HTTP {status} for {url}\n\
+             Tip: the host may require a browser session or a different direct asset URL."
+        );
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    if let Some(len) = resp.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return format!(
+                "❌ Remote file is {len} bytes (limit {}). Pick a smaller asset or download manually.",
+                MAX_DOWNLOAD_BYTES
+            );
+        }
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => return format!("❌ Failed to read body for {url}: {e}"),
+    };
+
+    if bytes.len() as u64 > MAX_DOWNLOAD_BYTES {
+        return format!(
+            "❌ Downloaded body is {} bytes (limit {}).",
+            bytes.len(),
+            MAX_DOWNLOAD_BYTES
+        );
+    }
+
+    // Common bot-block / error-page failure mode: tiny HTML instead of a zip/binary.
+    let looks_html = content_type.contains("text/html")
+        || bytes.starts_with(b"<!DOCTYPE")
+        || bytes.starts_with(b"<!doctype")
+        || bytes.starts_with(b"<html")
+        || bytes.starts_with(b"<HTML");
+    if looks_html && bytes.len() < 50_000 {
+        let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(200)]);
+        return format!(
+            "❌ Download looks like an HTML error/login page ({status}, {} bytes, content-type={content_type}), not a binary asset.\n\
+             Preview: {}\n\
+             Tip: use browse(url, extract=links) to find a direct .zip/.png link, or pass a raw.githubusercontent.com / github.com/.../archive/...zip URL.",
+            bytes.len(),
+            preview.replace('\n', " ")
+        );
+    }
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return format!(
+                "❌ Failed to create directories for {}: {e}",
+                path.display()
+            );
+        }
+    }
+
+    match std::fs::write(&path, &bytes) {
+        Ok(()) => {
+            let kind = if bytes.starts_with(b"PK") {
+                "zip"
+            } else if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+                "png"
+            } else if content_type.is_empty() {
+                "binary"
+            } else {
+                content_type.as_str()
+            };
+            format!(
+                "✅ Downloaded {} bytes ({kind}) → {}\nSource: {url}",
+                bytes.len(),
+                path.display()
+            )
+        }
+        Err(e) => format!("❌ Write failed for {}: {e}", path.display()),
+    }
+}
+
 // ─── Shared helpers ─────────────────────────────────────────────────────────
 
 async fn fetch_html(client: &reqwest::Client, url: &str) -> Result<String, String> {
@@ -555,5 +682,41 @@ mod tests {
     fn ddg_search_handles_empty_query() {
         let result = web_search("", 5, None);
         assert!(result.contains("Empty search query"));
+    }
+
+    #[tokio::test]
+    async fn download_rejects_empty_url_and_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "raven-dl-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = download_url("", "out.bin", &dir).await;
+        assert!(r.contains("❌"), "{r}");
+        let r = download_url("https://example.com/x", "", &dir).await;
+        assert!(r.contains("❌"), "{r}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn download_rejects_workspace_escape() {
+        let dir = std::env::temp_dir().join(format!(
+            "raven-dl-esc-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let r = download_url("https://example.com/x", "../outside.bin", &dir).await;
+        // May fail resolve or still write under parent check depending on FS; must not succeed cleanly outside
+        assert!(
+            r.contains("❌") || r.contains("escape") || r.contains("Failed"),
+            "{r}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

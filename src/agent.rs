@@ -423,8 +423,15 @@ impl Agent {
         if self.current_agent_mode() != "plan" {
             return None;
         }
-        if !matches!(tool_name, "write" | "patch") {
+        if !matches!(tool_name, "write" | "patch" | "download") {
             return None;
+        }
+        if tool_name == "download" {
+            return Some(
+                "❌ download denied while in Plan mode (clarification phase). \
+                 Wait for proceed, then download assets into the project workdir."
+                    .to_string(),
+            );
         }
         let args_val: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
         let mut is_wiki = false;

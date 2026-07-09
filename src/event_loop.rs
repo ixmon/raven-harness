@@ -191,7 +191,7 @@ impl TuiObserver {
                 return false;
             }
         }
-        let is_mutating = matches!(name, "write" | "patch" | "exec");
+        let is_mutating = matches!(name, "write" | "patch" | "exec" | "download");
         let is_outside = if name == "exec" {
             let cmd = serde_json::from_str::<serde_json::Value>(args).ok()
                 .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_owned()))
@@ -222,6 +222,12 @@ impl TuiObserver {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
                 let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                 format!("patch {}", path)
+            }
+            "download" => {
+                let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+                format!("download {} → {}", truncate(url, 48), path)
             }
             "exec" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();

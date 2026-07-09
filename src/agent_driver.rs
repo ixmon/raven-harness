@@ -360,7 +360,7 @@ pub async fn drive_turn_with_tools(
                 }
 
                 // Hard gate for Plan mode: never show babysitter approvals or execute
-                // mutating actions (write/patch/exec) until user explicitly says "proceed".
+                // mutating actions (write/patch/download) until user explicitly says "proceed".
                 // This prevents action approval popups from appearing alongside the
                 // "approve the plan?" question.
                 if let Some(denial) = agent.plan_mode_denial(&tc.function.name, &tc.function.arguments) {
