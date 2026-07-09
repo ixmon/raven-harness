@@ -83,6 +83,10 @@ On every proposal (and on LLM retry when errors remain):
 | Paths prefixed with project dir | Normalize to workdir-relative paths |
 | observe without prompt / attested without note | Blocking error → proposal retry |
 | creation commands as verification | Blocking error → proposal retry |
+| Create-file with bare `file_exists` | Recipe → `min_bytes:<path>:<N>` (extension floors) |
+| Binary `grep` on `build/*` | Recipe rewrite to build-only / source check; else block |
+
+**Recipe catalog** (`plan_recipes.rs`): table-driven match on step description (create file/dir, acquire, build, implement). Injected into the proposal system prompt and applied in `improve_proposal`.
 
 Recap surfaces three buckets:
 

@@ -307,7 +307,7 @@ pub async fn run_exec_verification(
     (passed, output)
 }
 
-/// Run a `check` tier spec (`file_exists:path` or `grep:pattern:path`).
+/// Run a `check` tier spec (`file_exists:path`, `min_bytes:path:N`, or `grep:pattern:path`).
 pub fn run_check_verification(
     spec: &str,
     workspace: &Path,
@@ -330,6 +330,37 @@ pub fn run_check_verification(
             },
         );
     }
+    if let Some(rest) = spec.strip_prefix("min_bytes:") {
+        // min_bytes:<path>:<N>
+        if let Some((path, n_str)) = rest.rsplit_once(':') {
+            let path = path.trim();
+            let min: u64 = n_str.trim().parse().unwrap_or(1);
+            let full = base.join(path);
+            if !full.is_file() {
+                return (false, format!("min_bytes:{path}:{min} — file not found"));
+            }
+            match std::fs::metadata(&full) {
+                Ok(meta) => {
+                    let len = meta.len();
+                    let ok = len >= min;
+                    return (
+                        ok,
+                        if ok {
+                            format!("min_bytes:{path}:{min} — size {len} >= {min}")
+                        } else {
+                            format!("min_bytes:{path}:{min} — size {len} < {min} (empty/stub?)")
+                        },
+                    );
+                }
+                Err(e) => {
+                    return (
+                        false,
+                        format!("min_bytes:{path}:{min} — metadata error: {e}"),
+                    );
+                }
+            }
+        }
+    }
     if let Some(rest) = spec.strip_prefix("grep:") {
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         if parts.len() == 2 {
@@ -350,7 +381,7 @@ pub fn run_check_verification(
     (
         false,
         format!(
-            "Unsupported check spec: {spec}. Use file_exists:path or grep:pattern:path"
+            "Unsupported check spec: {spec}. Use file_exists:path, min_bytes:path:N, or grep:pattern:path"
         ),
     )
 }
@@ -512,7 +543,8 @@ pub async fn complete_plan_step(
             let spec = step.verification.as_deref().unwrap_or("");
             if spec.is_empty() && !force {
                 return CompletePlanStepOutcome::Rejected {
-                    message: "check tier requires a verification spec (file_exists: or grep:).".to_string(),
+                    message: "check tier requires a verification spec (file_exists:, min_bytes:, or grep:)."
+                        .to_string(),
                 };
             }
             if force {
@@ -788,6 +820,32 @@ mod tests {
         let (ok, _) =
             run_check_verification("file_exists:definitely_missing_file_abc123", &dir, None);
         assert!(!ok);
+    }
+
+    #[test]
+    fn check_min_bytes() {
+        let dir = tempfile_dir();
+        let path = dir.join("stub.cpp");
+        fs::write(&path, "x").unwrap();
+        let (ok_small, msg) =
+            run_check_verification("min_bytes:stub.cpp:80", &dir, None);
+        assert!(!ok_small, "{msg}");
+        fs::write(&path, "x".repeat(100)).unwrap();
+        let (ok_big, msg) = run_check_verification("min_bytes:stub.cpp:80", &dir, None);
+        assert!(ok_big, "{msg}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "raven-check-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
