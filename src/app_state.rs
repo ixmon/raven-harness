@@ -189,6 +189,8 @@ pub struct App {
     pub approval_modes: [&'static str; 4],
     /// Live approval mode for in-flight agent turns (TuiObserver reads this).
     pub live_exec_mode: std::sync::Arc<std::sync::Mutex<raven_tui::session::ExecApprovalMode>>,
+    /// Mode chosen in UI while the agent mutex was busy; flushed when free.
+    pub pending_exec_approval_mode: Option<raven_tui::session::ExecApprovalMode>,
 
     // Run mode submenu for /run-mode (talk, think, ...)
     pub agent_mode_menu_active: bool,
@@ -321,6 +323,7 @@ impl App {
             live_exec_mode: std::sync::Arc::new(std::sync::Mutex::new(
                 raven_tui::session::ExecApprovalMode::Babysitter,
             )),
+            pending_exec_approval_mode: None,
             agent_mode_menu_active: false,
             selected_agent_mode_idx: 0,
             agent_modes: ["talk", "think", "research", "work", "dream", "plan"],
@@ -1060,6 +1063,66 @@ impl App {
         }
     }
 
+    /// Apply approval mode to live observer state, status bar cache, and (if possible) session meta.
+    ///
+    /// Returns `true` when session meta was updated immediately. If the agent mutex is held
+    /// (mid-turn), live mode still updates and the mode is queued in
+    /// [`Self::pending_exec_approval_mode`] until [`Self::try_flush_pending_exec_approval_mode`].
+    pub fn apply_exec_approval_mode(
+        &mut self,
+        agent: &Arc<tokio::sync::Mutex<Agent>>,
+        mode: raven_tui::session::ExecApprovalMode,
+    ) -> bool {
+        if let Ok(mut slot) = self.live_exec_mode.lock() {
+            *slot = mode;
+        }
+        self.cached_mode_label = mode.label().to_string();
+        self.selected_mode_idx = match mode {
+            raven_tui::session::ExecApprovalMode::Babysitter => 0,
+            raven_tui::session::ExecApprovalMode::SpringBreak => 1,
+            raven_tui::session::ExecApprovalMode::Vegas => 2,
+            raven_tui::session::ExecApprovalMode::Thunderdome => 3,
+        };
+        self.needs_redraw = true;
+
+        if let Ok(mut ag) = agent.try_lock() {
+            ag.set_exec_approval_mode(mode);
+            if let Some(s) = &mut ag.session_mut() {
+                let _ = s.save_meta();
+            }
+            self.pending_exec_approval_mode = None;
+            true
+        } else {
+            self.pending_exec_approval_mode = Some(mode);
+            false
+        }
+    }
+
+    /// Persist a queued approval mode once the agent mutex is free.
+    pub fn try_flush_pending_exec_approval_mode(
+        &mut self,
+        agent: &Arc<tokio::sync::Mutex<Agent>>,
+    ) -> bool {
+        let Some(mode) = self.pending_exec_approval_mode else {
+            return false;
+        };
+        if let Ok(mut ag) = agent.try_lock() {
+            ag.set_exec_approval_mode(mode);
+            if let Some(s) = &mut ag.session_mut() {
+                let _ = s.save_meta();
+            }
+            if let Ok(mut slot) = self.live_exec_mode.lock() {
+                *slot = mode;
+            }
+            self.cached_mode_label = mode.label().to_string();
+            self.pending_exec_approval_mode = None;
+            self.needs_redraw = true;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Handle a key when the /mode selection menu is open.
     /// Returns `true` if the key was consumed (caller should `continue`).
     pub async fn handle_mode_menu_key(
@@ -1084,12 +1147,6 @@ impl App {
                 self.needs_redraw = true;
             }
             KeyCode::Enter => {
-                let chosen = self.approval_modes[self.selected_mode_idx];
-                self.left_committed
-                    .push(format!("Approval mode set to: {}", chosen));
-                self.left_follow_output = true;
-                self.left_scroll = 10_000;
-
                 let mode = match self.selected_mode_idx {
                     0 => raven_tui::session::ExecApprovalMode::Babysitter,
                     1 => raven_tui::session::ExecApprovalMode::SpringBreak,
@@ -1097,18 +1154,21 @@ impl App {
                     3 => raven_tui::session::ExecApprovalMode::Thunderdome,
                     _ => return true,
                 };
-                if let Ok(mut ag) = agent.try_lock() {
-                    ag.set_exec_approval_mode(mode);
-                    if let Some(s) = &mut ag.session_mut() {
-                        let _ = s.save_meta();
-                    }
+                let applied = self.apply_exec_approval_mode(agent, mode);
+                let chosen = mode.label();
+                if applied {
+                    self.left_committed
+                        .push(format!("Approval mode set to: {chosen} (saved to session)"));
+                } else {
+                    self.left_committed.push(format!(
+                        "Approval mode set to: {chosen} (applying when agent is free; session meta pending)"
+                    ));
                 }
-                if let Ok(mut slot) = self.live_exec_mode.lock() {
-                    *slot = mode;
-                }
+                self.left_follow_output = true;
+                self.left_scroll = 10_000;
                 self.mode_menu_active = false;
                 self.clear_input();
-                self.selected_mode_idx = 0;
+                // Keep selected_mode_idx aligned with the chosen mode for next open.
                 self.needs_redraw = true;
             }
             KeyCode::Esc => {

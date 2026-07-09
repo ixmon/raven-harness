@@ -58,6 +58,11 @@ pub trait TurnObserver: Send {
     async fn approve_tool(&mut self, _tc: &ToolCall) -> bool {
         true
     }
+    /// Optional custom denial text when [`approve_tool`] returns false.
+    /// Used so Super Judge denials are not attributed to the human user.
+    fn tool_denial_message(&self, _tc: &ToolCall) -> Option<String> {
+        None
+    }
     /// Model paused to narrate — we're pushing a continuation nudge.
     fn on_nudge(&mut self, _count: u32, _max: u32) {}
     /// Hit round limit; auto-continuing (or exhausted if `exhausted` is true).
@@ -159,6 +164,17 @@ pub async fn drive_turn(
     prompt: &str,
     observer: &mut dyn TurnObserver,
 ) -> Result<TurnResult> {
+    drive_turn_with_tools(agent, prompt, observer, None).await
+}
+
+/// Like [`drive_turn`], but with an optional tool-schema override (e.g. Super Judge
+/// review-only tools without write/patch).
+pub async fn drive_turn_with_tools(
+    agent: &mut Agent,
+    prompt: &str,
+    observer: &mut dyn TurnObserver,
+    tools_override: Option<Vec<crate::llm::ToolDef>>,
+) -> Result<TurnResult> {
     // Record the user prompt.
     if !prompt.trim().is_empty() {
         agent.on_new_user_input(prompt);
@@ -167,11 +183,13 @@ pub async fn drive_turn(
     let cfg = agent.current_config();
     let max_duration_secs = cfg.flags.max_duration_secs;
 
-    let tools_schema = tools::tools_for_agent(
-        &agent.current_agent_mode(),
-        &cfg.flags,
-        agent.plan_tool_context(),
-    );
+    let tools_schema = tools_override.unwrap_or_else(|| {
+        tools::tools_for_agent(
+            &agent.current_agent_mode(),
+            &cfg.flags,
+            agent.plan_tool_context(),
+        )
+    });
     let tools_for_request = cfg.tools_enabled.then(|| tools_schema.clone());
 
     let mut steering = SteeringState::new(
@@ -365,8 +383,11 @@ pub async fn drive_turn(
                     observer.on_tool_start(&tc.function.name, &tc.function.arguments);
                     to_execute.push(tc.clone());
                 } else {
-                    let deny = if tc.function.name == "exec" {
-                        let cmd = serde_json::from_str::<serde_json::Value>(&tc.function.arguments)
+                    let deny = observer.tool_denial_message(tc).unwrap_or_else(|| {
+                        if tc.function.name == "exec" {
+                            let cmd = serde_json::from_str::<serde_json::Value>(
+                                &tc.function.arguments,
+                            )
                             .ok()
                             .and_then(|v| {
                                 v.get("command")
@@ -374,31 +395,32 @@ pub async fn drive_turn(
                                     .map(|s| s.to_string())
                             })
                             .unwrap_or_default();
-                        if crate::tools::is_privileged_package_install(&cmd)
-                            || crate::tools::command_uses_sudo(&cmd)
-                        {
-                            format!(
-                                "DENIED: The user refused this privileged exec (`{cmd}`). \
-                                 Do NOT retry sudo or package installs. \
-                                 First re-check whether the dependency is already available \
-                                 (dpkg -l, pkg-config --modversion, which, ldconfig -p, g++ --version). \
-                                 If something is still missing, give the user the exact command to run \
-                                 in their own terminal — the TUI cannot enter a sudo password."
-                            )
+                            if crate::tools::is_privileged_package_install(&cmd)
+                                || crate::tools::command_uses_sudo(&cmd)
+                            {
+                                format!(
+                                    "DENIED: The user refused this privileged exec (`{cmd}`). \
+                                     Do NOT retry sudo or package installs. \
+                                     First re-check whether the dependency is already available \
+                                     (dpkg -l, pkg-config --modversion, which, ldconfig -p, g++ --version). \
+                                     If something is still missing, give the user the exact command to run \
+                                     in their own terminal — the TUI cannot enter a sudo password."
+                                )
+                            } else {
+                                "DENIED: The user refused to approve this exec action. \
+                                 Do NOT retry the same command. Try a different approach or ask the user."
+                                    .to_string()
+                            }
                         } else {
-                            "DENIED: The user refused to approve this exec action. \
-                             Do NOT retry the same command. Try a different approach or ask the user."
-                                .to_string()
+                            format!(
+                                "DENIED: The user refused to approve this {} action. \
+                                 Do NOT retry the same action. \
+                                 Either try a different approach, ask the user what they want, \
+                                 or explain what you were trying to do and why.",
+                                tc.function.name
+                            )
                         }
-                    } else {
-                        format!(
-                            "DENIED: The user refused to approve this {} action. \
-                             Do NOT retry the same action. \
-                             Either try a different approach, ask the user what they want, \
-                             or explain what you were trying to do and why.",
-                            tc.function.name
-                        )
-                    };
+                    });
                     agent.record_tool_denial(tc, &deny);
                     if observer.should_stop() || observer.stop_tool_processing() {
                         break;

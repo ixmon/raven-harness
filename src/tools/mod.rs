@@ -553,6 +553,23 @@ pub fn tools_for_agent(
     }
 }
 
+/// Read/verify tools only — Super Judge must not edit the workspace.
+pub fn tools_for_super_judge(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
+    const ALLOWED: &[&str] = &[
+        "read",
+        "read_summary",
+        "list",
+        "grep",
+        "exec",
+        "web_search",
+        "browse",
+    ];
+    all_tools(flags)
+        .into_iter()
+        .filter(|t| ALLOWED.contains(&t.function.name.as_str()))
+        .collect()
+}
+
 /// Tool names exposed to the model for the current run mode.
 pub fn tools_list_for_prompt(
     agent_mode: &str,
@@ -649,6 +666,20 @@ mod tests {
         ));
         assert!(work_names.contains("complete_plan_step"));
         assert!(work_names.contains("revise_plan_step"));
+    }
+
+    #[test]
+    fn tools_for_super_judge_excludes_write_and_patch() {
+        let flags = plan_mode_test_flags();
+        let names: Vec<String> = super::tools_for_super_judge(&flags)
+            .into_iter()
+            .map(|t| t.function.name)
+            .collect();
+        assert!(names.contains(&"read".into()));
+        assert!(names.contains(&"exec".into()));
+        assert!(!names.iter().any(|n| n == "write"));
+        assert!(!names.iter().any(|n| n == "patch"));
+        assert!(!names.iter().any(|n| n == "complete_plan_step"));
     }
 
     #[test]

@@ -113,14 +113,23 @@ pub fn build_review_prompt(
         prompt.push('\n');
     }
 
+    prompt.push_str("## Tools available to you (Super Judge — review only)\n");
+    prompt.push_str(
+        "You have **read / list / grep / exec / web tools only**. \
+         You do **NOT** have `write` or `patch`. Do not attempt to edit files. \
+         If code must change, report NEEDS_WORK or DEATH_SPIRAL with instructions for the coding agent.\n\n",
+    );
     prompt.push_str("## Your task\n");
     prompt.push_str("1. Read the key files that were modified to verify the changes are correct.\n");
     prompt.push_str("2. If the request involves running something, use `exec` to verify.\n");
-    prompt.push_str("3. Stop on the FIRST real error.\n\n");
+    prompt.push_str("3. Stop on the FIRST real error.\n");
+    prompt.push_str(
+        "4. Never claim the user denied patches — you are Super Judge and cannot edit.\n\n",
+    );
     prompt.push_str("## Your decision (final message must contain EXACTLY ONE of these):\n");
     prompt.push_str("- **WORK_COMPLETE**: The work genuinely satisfies the request. Say exactly: \"WORK_COMPLETE: <brief reason>\"\n");
     prompt.push_str("- **NEEDS_WORK**: Something is wrong or missing. Say exactly: \"NEEDS_WORK: <what's wrong and what to do next>\"\n");
-    prompt.push_str("- **DEATH_SPIRAL**: The agent is repeating the same failing pattern. Say exactly: \"DEATH_SPIRAL: <pattern detected> | <suggested different approach>\"\n");
+    prompt.push_str("- **DEATH_SPIRAL**: The coding agent (not Super Judge) is repeating a failing pattern. Say exactly: \"DEATH_SPIRAL: <pattern detected> | <suggested different approach>\". Do NOT treat missing write/patch tools as a death spiral.\n");
 
     prompt
 }
@@ -183,6 +192,10 @@ pub fn detect_spiral_indicators(recent_actions: &[ActionRecord]) -> Vec<String> 
     indicators
 }
 
+fn super_judge_tools(agent: &Agent) -> Vec<crate::llm::ToolDef> {
+    crate::tools::tools_for_super_judge(&agent.current_config().flags)
+}
+
 /// Run the Super Judge review cycle using a headless observer.
 ///
 /// This is the simplest integration: builds the review prompt, calls
@@ -203,9 +216,11 @@ pub async fn run_super_judge(
 
     // Create a Super Judge observer
     let mut observer = SuperJudgeObserver::new();
+    let tools = super_judge_tools(agent);
 
-    // Run the Super Judge's own mini-turn
-    let result = agent_driver::drive_turn(agent, &review_prompt, &mut observer).await;
+    // Run the Super Judge's own mini-turn (no write/patch in schema)
+    let result =
+        agent_driver::drive_turn_with_tools(agent, &review_prompt, &mut observer, Some(tools)).await;
 
     match result {
         Ok(turn_result) => {
@@ -236,7 +251,9 @@ pub async fn run_super_judge_with_observer(
     let review_prompt = build_review_prompt(agent, last_text, recent_actions);
     agent.log_harness_event("super_judge", "Super Judge review started (TUI)");
 
-    let result = agent_driver::drive_turn(agent, &review_prompt, observer).await;
+    let tools = super_judge_tools(agent);
+    let result =
+        agent_driver::drive_turn_with_tools(agent, &review_prompt, observer, Some(tools)).await;
 
     match result {
         Ok(turn_result) => {
@@ -287,7 +304,7 @@ pub fn parse_verdict(response: &str) -> SuperJudgeVerdict {
         // Default: treat ambiguous response as "continue"
         SuperJudgeVerdict::Continue {
             feedback: format!(
-                "[Super Judge review (ambiguous verdict)]: {}",
+                "[🔍 SUPER JUDGE review (ambiguous verdict)]: {}",
                 truncate(response, 300)
             ),
         }
@@ -300,8 +317,8 @@ pub fn parse_verdict(response: &str) -> SuperJudgeVerdict {
 ///
 /// - Auto-approves read tools (list, read, read_summary, grep)
 /// - Auto-approves exec (for verification)
-/// - Denies write/patch (Super Judge shouldn't modify code)
-/// - Logs to stderr with 🔍 prefix
+/// - Denies write/patch if the model invents them (schema normally omits them)
+/// - Denial text is labeled Super Judge so the coding agent is not blamed
 pub struct SuperJudgeObserver;
 
 impl SuperJudgeObserver {
@@ -333,22 +350,28 @@ impl TurnObserver for SuperJudgeObserver {
 
     async fn approve_tool(&mut self, tc: &ToolCall) -> bool {
         let name = &tc.function.name;
-        // Allow wiki writes (private scratchpad)
+        // Allow wiki writes (private scratchpad) if ever exposed
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&tc.function.arguments) {
             if v.get("wiki").and_then(|w| w.as_bool()).unwrap_or(false) {
                 return true;
             }
         }
         // Allow read-only tools + exec (for verification)
-        // Deny workspace write/patch (Super Judge is a reviewer, not an editor)
+        // Deny workspace write/patch (belt-and-suspenders if model invents them)
         match name.as_str() {
-            "read" | "read_summary" | "list" | "grep" | "exec" => true,
-            "write" | "patch" => {
-                // Note: denial is communicated via the verdict / UI path, not raw stderr.
-                false
-            }
+            "read" | "read_summary" | "list" | "grep" | "exec" | "web_search" | "browse" => true,
+            "write" | "patch" => false,
             _ => true,
         }
+    }
+
+    fn tool_denial_message(&self, tc: &ToolCall) -> Option<String> {
+        Some(format!(
+            "DENIED by Super Judge (review-only harness): `{}` is not available during Super Judge review. \
+             This is NOT a human user denial and NOT approval-mode Babysitter. \
+             Super Judge cannot edit the workspace — report NEEDS_WORK with fix instructions for the coding agent.",
+            tc.function.name
+        ))
     }
 
     fn on_nudge(&mut self, _count: u32, _max: u32) {}
@@ -433,6 +456,23 @@ mod tests {
             !indicators.is_empty(),
             "Should detect repeated exec pattern"
         );
+    }
+
+    #[test]
+    fn super_judge_denial_message_not_user_attributed() {
+        let obs = SuperJudgeObserver::new();
+        let tc = ToolCall {
+            id: "1".into(),
+            r#type: "function".into(),
+            function: crate::llm::FunctionCall {
+                name: "patch".into(),
+                arguments: "{}".into(),
+            },
+        };
+        let msg = obs.tool_denial_message(&tc).expect("message");
+        assert!(msg.contains("Super Judge"), "{msg}");
+        assert!(msg.contains("NOT a human user denial"), "{msg}");
+        assert!(!msg.contains("The user refused"));
     }
 
     #[test]

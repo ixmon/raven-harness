@@ -845,10 +845,15 @@ pub fn spawn_agent_turn(
     let prompt_c = prompt;
     let exec_mode_c = app.live_exec_mode.clone();
 
+    // Flush any /approval-mode change that was queued while a prior turn held the lock.
+    let _ = app.try_flush_pending_exec_approval_mode(agent);
+
     if let Ok(mut ag) = agent.try_lock() {
+        // Session meta is source of truth once flushed; keep live in sync for TuiObserver.
         if let Ok(mut slot) = app.live_exec_mode.lock() {
             *slot = ag.current_exec_mode();
         }
+        app.cached_mode_label = ag.current_exec_mode().label().to_string();
         let workspace = ag.workspace().to_path_buf();
         let wiki = ag
             .session()

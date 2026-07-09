@@ -714,9 +714,23 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.refresh_picker();
         }
 
-        // Labels
+        // Persist approval mode queued while the agent was busy (mid-turn /mode).
+        let _ = app.try_flush_pending_exec_approval_mode(&agent);
+
+        // Labels — prefer live_exec_mode so the bar matches approvals even before meta flush.
+        let live_approval = app
+            .live_exec_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(raven_tui::session::ExecApprovalMode::Babysitter);
         let (approval_label, goal_text, agent_mode) = if let Ok(ag) = agent.try_lock() {
-            let approval = ag.current_exec_mode().label().to_string();
+            // Prefer session meta when it matches live (fully applied); else show live.
+            let session_mode = ag.current_exec_mode();
+            let approval = if app.pending_exec_approval_mode.is_some() {
+                live_approval.label().to_string()
+            } else {
+                session_mode.label().to_string()
+            };
             let goal = if config.flags.goal_tracking {
                 ag.session().as_ref().and_then(|s| {
                     let g = s.meta.current_goal.as_str();
@@ -726,7 +740,15 @@ async fn run_app<B: ratatui::backend::Backend>(
             let amode = ag.current_agent_mode();
             (approval, goal, amode)
         } else {
-            (app.cached_mode_label.clone(), app.cached_goal_text.clone(), app.cached_agent_mode.clone())
+            (
+                if !app.cached_mode_label.is_empty() {
+                    app.cached_mode_label.clone()
+                } else {
+                    live_approval.label().to_string()
+                },
+                app.cached_goal_text.clone(),
+                app.cached_agent_mode.clone(),
+            )
         };
         app.cached_mode_label = approval_label.clone();
         app.cached_goal_text = goal_text.clone();
