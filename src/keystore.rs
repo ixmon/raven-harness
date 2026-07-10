@@ -98,9 +98,9 @@ impl Keystore {
         })
     }
 
-    /// Returns true if any stored endpoint has an encrypted API key.
+    /// Returns true if any stored endpoint (or Brave key) has an encrypted API key.
     pub fn has_encrypted_keys(&self) -> bool {
-        self.file.endpoints.iter().any(|e| e.has_key)
+        self.file.endpoints.iter().any(|e| e.has_key) || self.file.brave_api_key.is_some()
     }
 
     /// Derive the AES-256 key from a password + the stored salt.
@@ -577,4 +577,7 @@ mod tests {
 
         cleanup(&path);
     }
+
+
 }
+

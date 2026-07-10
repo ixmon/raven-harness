@@ -256,7 +256,8 @@ fn click_splash(app: &mut App, col: u16, row: u16, regions: MouseRegions) -> boo
     if point_in(regions.splash_picker, col, row) {
         app.splash_focus = SplashFocus::Picker;
         app.picker.focus = PickerFocus::Tree;
-        if let Some(idx) = list_item_at_row(regions.splash_picker, row, 1, 0, app.picker.picker_items.len())
+        if let Some(idx) =
+            list_item_at_row(regions.splash_picker, row, 1, 0, app.picker.picker_items.len())
         {
             app.picker.selected_item = idx;
             app.sync_picker_selection();

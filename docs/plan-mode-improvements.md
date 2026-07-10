@@ -50,6 +50,15 @@ For every step the agent proposes a real check. Weaker tiers (`attested`, `obser
 
 The JSON-driven loop (`plan_loop.rs`) fetches clarify questions, then a proposal. Before the user sees the recap, `improve_proposal()` in `plan_verification.rs` runs harness-side fixes and validation.
 
+### Success criteria vs verification
+
+| Field | Role |
+|-------|------|
+| `success_criteria` | Product / acceptance outcomes (what must be true when done) |
+| `verification[]` / step `verification` | Runnable commands that prove as much as practical |
+
+The proposal system prompt teaches product-level `success_criteria` (cover capabilities named in the goal; do not put shell commands there). Truncation recovery keeps criteria under ~400 characters (not 100). Execution user prompt shows both fields separately. Session meta stores verification as `achievement_tests` and product criteria as `completion_criteria` so the plan pane is not overwritten with joined build commands.
+
 ### Verification tiers
 
 | Tier | Planning | On `complete_plan_step` (execution) |
@@ -83,6 +92,10 @@ On every proposal (and on LLM retry when errors remain):
 | Paths prefixed with project dir | Normalize to workdir-relative paths |
 | observe without prompt / attested without note | Blocking error → proposal retry |
 | creation commands as verification | Blocking error → proposal retry |
+| Create-file with bare `file_exists` | Recipe → `min_bytes:<path>:<N>` (extension floors) |
+| Binary `grep` on `build/*` | Recipe rewrite to build-only / source check; else block |
+
+**Recipe catalog** (`plan_recipes.rs`): table-driven match on step description (create file/dir, acquire, build, implement). Injected into the proposal system prompt and applied in `improve_proposal`.
 
 Recap surfaces three buckets:
 
@@ -141,7 +154,7 @@ When the user specifies a subdirectory (e.g. "everything in `./galaga/`):
 
 When `plan_execution_incomplete()` and `agent_mode == "work"`, the harness injects a **plan-execution nudge** *before* the criteria judge or define-done reminder. This prevents mid-step pauses when the agent narrates "I should call `complete_plan_step`" but does not call it.
 
-**Remaining gap:** the nudge encourages the tool call; it does not force it. Agents can still stop after writes without calling `complete_plan_step` (observed in Galaga sessions).
+**Escalation (implemented):** consecutive text-only stops while plan execution is incomplete escalate after the first soft stall, immediately if the model *narrates* `complete_plan_step` without calling it, or after any tool use without the gate. Escalated messages demand a real `complete_plan_step` tool call and include the current step description/verification. Agents can still refuse after budget exhaustion (turn ends); the user can continue or `/plan done`.
 
 ---
 
@@ -190,8 +203,8 @@ Documented in `/help` via `input_dispatch.rs`.
 - [x] No per-tool / per-turn auto-advance
 - [x] Execution log appended to `wiki/plan.md` on exec/attested/observe
 - [x] `plan_sync::reconcile_plan_execution` — wiki log + agent state, no regression
-- [ ] Hard-block proceed when proposal has validation errors
-- [ ] `/plan done` to force whole-plan completion
+- [x] Hard-block proceed when proposal has validation errors
+- [x] `/plan done` to force whole-plan completion
 
 ### Phase 5 — UX polish (partial)
 
@@ -209,7 +222,7 @@ Documented in `/help` via `input_dispatch.rs`.
 - [x] Per-step grep/C++ convention lints
 - [x] Adversarial critique retry on warnings
 - [ ] Richer `check` tier (`line_count:`, lint integration)
-- [ ] Escalation when agent skips `complete_plan_step` for N turns
+- [x] Escalation when agent skips `complete_plan_step` for N turns
 
 ---
 

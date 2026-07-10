@@ -7,8 +7,8 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use super::{
-    browse, browse_urls, exec, grep_files, list_dir, patch_file, read_file, safe_truncate, web_search,
-    write_file,
+    browse, browse_urls, download_url, exec, grep_files, list_dir, patch_file, read_file,
+    safe_truncate, web_search, write_file,
 };
 
 /// How tool calls are fulfilled (real side effects vs scripted eval responses).
@@ -250,6 +250,11 @@ async fn real_execute(
                 .and_then(|v| v.as_str())
                 .unwrap_or("text");
             Ok(browse(url, depth, extract).await)
+        }
+        "download" => {
+            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            Ok(download_url(url, path, workspace).await)
         }
         "browse_urls" => {
             let urls: Vec<String> = args

@@ -28,7 +28,9 @@ const PARSE_RETRY_NUDGE: &str = "\n\nYour previous reply was not valid JSON. Rep
 
 const CLARIFY_CONCISE_NUDGE: &str = "\n\nYour previous clarify JSON was truncated. Reply with ONLY compact JSON: question.prompt under 100 characters, at most 4 options with labels under 35 characters each. No examples in parentheses — use short labels like \"Minimal prototype\" / \"Full feature set\".";
 
-const PROPOSAL_CONCISE_NUDGE: &str = "\n\nYour previous proposal JSON was truncated (too long). Reply with ONLY one compact JSON object: keep goal and success_criteria under 100 characters each, at most 8 steps, step descriptions under 60 characters, short verification commands only. Omit rollback and constraints unless essential.";
+// Shrink steps/examples on truncation — keep success_criteria complete enough to
+// cover product outcomes (not crushed to a 100-char build-only line).
+const PROPOSAL_CONCISE_NUDGE: &str = "\n\nYour previous proposal JSON was truncated (too long). Reply with ONLY one compact JSON object: goal under 120 characters; success_criteria under 400 characters and still product-level (cover capabilities named in the goal, not only \"builds\"); at most 8 steps; step descriptions under 60 characters; short verification commands only. Omit rollback and constraints unless essential.";
 
 async fn plan_loop_chat(
     backend: &Arc<Mutex<ChatBackend>>,
@@ -153,33 +155,45 @@ Rules:
 - recommend must match an option id when options are present
 - If nothing important remains, use type ready"#;
 
-const PROPOSAL_SYSTEM: &str = r#"You are the planning engine for a coding-agent TUI. Reply with JSON ONLY — one object, no extra prose.
+fn proposal_system_prompt() -> String {
+    let recipes = crate::plan_recipes::format_recipe_card_for_prompt();
+    format!(
+        r#"You are the planning engine for a coding-agent TUI. Reply with JSON ONLY — one object, no extra prose.
 
 Emit the final plan:
-{"type":"proposal","goal":"...","success_criteria":"...","verification":["runnable command",...],"rollback":"...","constraints":"...","steps":[{"description":"...","tier":"exec|check|attested|observe","verification":"...","prompt":"...","note":"..."}]}
+{{"type":"proposal","goal":"...","success_criteria":"...","verification":["runnable command",...],"rollback":"...","constraints":"...","steps":[{{"description":"...","tier":"exec|check|attested|observe","verification":"...","prompt":"...","note":"..."}}]}}
+
+success_criteria vs verification (critical):
+- `success_criteria` = user-observable acceptance outcomes (what must be true when the work is done). NOT only "builds" / "compiles" / "runs".
+- Cover every major capability named in the goal or initial request (e.g. fire, collide, explode, API endpoint, UI panel). Prefer a short semicolon-separated list of testable claims.
+- Example: "Player can fire; bullets hit enemies; enemies explode; game builds and runs under 5s smoke"
+- Bad: "cmake --build build" or "Build and run" alone when the goal names features.
+- Keep success_criteria under ~400 characters; do not empty it to save space.
+- `verification` = separate runnable commands that prove as much of those outcomes as practical (build, tests, greps). Do not put shell commands in success_criteria; put them in verification / step.verification.
 
 Verification rules (critical):
 - Verification PROVES the step outcome — never replay how you would create files.
 - NEVER use as verification: `cat >`, `echo >`, `tee`, `touch`, bare `mkdir` / `mkdir -p`.
-- File scaffold → tier `check`, verification `file_exists:<path>` (path relative to project root).
-- Directory scaffold → tier `exec`, verification `test -d <path>`.
-- Code/content step → tier `check`, verification `grep:<symbol>:<path>`.
-- Build/compile → tier `exec`, verification `cmake --build …`, `cargo check`, `make`, etc.
+- Prefer the harness recipes below (paths relative to project root / project_workdir).
 - Run/smoke test → tier `exec` with timeout-safe command (not an infinite game loop).
 - `attested` only when no practical check exists — require `note` explaining why.
 - `observe` for human-only checks — put question in `prompt`, explain in `note`.
 
 Example steps for a C++ game in subdirectory `galaga/`:
-{"description":"Create CMakeLists.txt","tier":"check","verification":"file_exists:CMakeLists.txt"}
-{"description":"Implement Player class","tier":"check","verification":"grep:class Player:src/Player.cpp"}
-{"description":"Compile project","tier":"exec","verification":"cmake --build build"}
+{{"description":"Create CMakeLists.txt","tier":"check","verification":"min_bytes:CMakeLists.txt:40"}}
+{{"description":"Create src/player.cpp","tier":"check","verification":"min_bytes:src/player.cpp:80"}}
+{{"description":"Compile project","tier":"exec","verification":"cmake --build build"}}
+
+{recipes}
 
 Other rules:
-- Keep JSON compact: short strings, max 10 steps, omit optional fields when empty
+- Keep JSON compact: short step strings, max 10 steps, omit optional fields when empty — but never drop product outcomes from success_criteria
 - When the user names a project subdirectory (e.g. `./galaga/`), that directory IS the project root — all files and verifications are relative to it (`src/foo.cpp`, not workspace-root paths)
 - If a **User-specified project directory** block appears below, follow it exactly and record it in `constraints`
 - Every step needs tier + verification (or `prompt` for observe)
-- Include package-install steps if user chose agent install"#;
+- Include package-install steps if user chose agent install"#
+    )
+}
 
 fn clarify_user_prompt(
     initial_request: &str,
@@ -252,9 +266,10 @@ async fn fetch_proposal_payload(
     backend: &Arc<Mutex<ChatBackend>>,
     user: &str,
 ) -> Result<PlanModelPayload, String> {
+    let system = proposal_system_prompt();
     fetch_plan_payload(
         backend,
-        PROPOSAL_SYSTEM,
+        &system,
         user,
         PROPOSAL_MAX_TOKENS,
         Some(PROPOSAL_CONCISE_NUDGE),
@@ -339,4 +354,31 @@ pub async fn fetch_proposal(
     }
 
     Ok(PlanModelPayload::Proposal(proposal))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proposal_system_prompt_teaches_product_level_success_criteria() {
+        let p = proposal_system_prompt();
+        assert!(p.contains("success_criteria vs verification"));
+        assert!(p.contains("user-observable acceptance outcomes"));
+        assert!(
+            p.contains("Do not put shell commands in success_criteria"),
+            "must separate criteria prose from shell verification"
+        );
+        assert!(p.contains("~400 characters"));
+    }
+
+    #[test]
+    fn proposal_concise_nudge_preserves_room_for_criteria() {
+        assert!(PROPOSAL_CONCISE_NUDGE.contains("400 characters"));
+        assert!(
+            !PROPOSAL_CONCISE_NUDGE.contains("success_criteria under 100 characters"),
+            "100-char cap crushed product criteria"
+        );
+        assert!(PROPOSAL_CONCISE_NUDGE.contains("product-level"));
+    }
 }

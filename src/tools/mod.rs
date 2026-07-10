@@ -1,7 +1,7 @@
 //! Tool system for the agent.
 //!
 //! We deliberately keep the surface small and high-signal for agentic coding:
-//! exec, read, write, patch, grep, list, web_search, browse.
+//! exec, read, write, patch, grep, list, web_search, browse, download.
 //! There is **no** `edit` tool — use `patch` for search/replace edits.
 //!
 //! Tool schemas are the standard OpenAI function format so they work with
@@ -14,7 +14,11 @@ pub use self::exec::{
     command_uses_sudo, exec, exec_with_exit_code, is_privileged_package_install,
 };
 pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
-pub use self::web::{browse, browse_urls, web_search};
+pub use self::web::{
+    brave_auth_disabled, browse, browse_urls, download_url, reset_brave_auth_disabled,
+    take_brave_auth_ui_notice, web_search, web_search_reports_brave_auth_rejected,
+    BRAVE_AUTH_REJECTED_MARKER,
+};
 
 pub mod backend;
 
@@ -49,7 +53,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "exec".into(),
-                description: "Run a shell command in the workspace. Use for cargo check, git status, tests, etc. Before any package install, verify with non-sudo probes (dpkg -l, pkg-config, which). Avoid sudo — the TUI cannot enter passwords; ask the user to install system packages manually if needed.".into(),
+                description: "Run a shell command in the workspace. Use for cargo check, git status, tests, unzip, etc. For HTTP file downloads prefer the download tool (browser-like client) instead of curl/wget which often get bot-blocked. Before any package install, verify with non-sudo probes (dpkg -l, pkg-config, which). Avoid sudo — the TUI cannot enter passwords; ask the user to install system packages manually if needed.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -166,7 +170,7 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
             r#type: "function".into(),
             function: crate::llm::ToolFunction {
                 name: "browse".into(),
-                description: "Fetch and extract the main text content of a web page. depth > 0 follows links (spider mode).".into(),
+                description: "Fetch and extract the main text content of a web page. depth > 0 follows links (spider mode). Prefer extract=links when hunting for a direct .zip/.png URL.".into(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
@@ -191,6 +195,21 @@ pub fn all_tools(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
                         "extract": { "type": "string", "description": "text (default), links, or html" }
                     },
                     "required": ["urls"]
+                }),
+            },
+        },
+        ToolDef {
+            r#type: "function".into(),
+            function: crate::llm::ToolFunction {
+                name: "download".into(),
+                description: "Download a file from an http(s) URL into the workspace (binary-safe). Uses a browser-like client — prefer this over exec curl/wget which often get bot-blocked. Pass a direct asset URL (e.g. raw.githubusercontent.com, github.com/.../archive/....zip). After download, use exec to unzip if needed.".into(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "url": { "type": "string", "description": "Full http(s) URL of the file to download" },
+                        "path": { "type": "string", "description": "Workspace-relative destination file path (e.g. galaga/assets/sprites.zip)" }
+                    },
+                    "required": ["url", "path"]
                 }),
             },
         },
@@ -553,6 +572,24 @@ pub fn tools_for_agent(
     }
 }
 
+/// Read/verify tools only — Super Judge must not edit the workspace.
+pub fn tools_for_super_judge(flags: &crate::runtime::RuntimeFlags) -> Vec<ToolDef> {
+    const ALLOWED: &[&str] = &[
+        "read",
+        "read_summary",
+        "list",
+        "grep",
+        "exec",
+        "web_search",
+        "browse",
+        // no download — Super Judge is review-only (no workspace file writes)
+    ];
+    all_tools(flags)
+        .into_iter()
+        .filter(|t| ALLOWED.contains(&t.function.name.as_str()))
+        .collect()
+}
+
 /// Tool names exposed to the model for the current run mode.
 pub fn tools_list_for_prompt(
     agent_mode: &str,
@@ -649,6 +686,29 @@ mod tests {
         ));
         assert!(work_names.contains("complete_plan_step"));
         assert!(work_names.contains("revise_plan_step"));
+    }
+
+    #[test]
+    fn tools_for_super_judge_excludes_write_and_patch() {
+        let flags = plan_mode_test_flags();
+        let names: Vec<String> = super::tools_for_super_judge(&flags)
+            .into_iter()
+            .map(|t| t.function.name)
+            .collect();
+        assert!(names.contains(&"read".into()));
+        assert!(names.contains(&"exec".into()));
+        assert!(!names.iter().any(|n| n == "write"));
+        assert!(!names.iter().any(|n| n == "patch"));
+        assert!(!names.iter().any(|n| n == "download"));
+        assert!(!names.iter().any(|n| n == "complete_plan_step"));
+    }
+
+    #[test]
+    fn all_tools_includes_download() {
+        let flags = plan_mode_test_flags();
+        let names = super::format_tool_names(&super::all_tools(&flags));
+        assert!(names.contains("download"));
+        assert!(names.contains("browse"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 use crate::plan_execution::infer_project_workdir_from_steps;
 use crate::plan_md::PlanStepData;
 use crate::plan_protocol::{PlanProposal, PlanProposalStep, PlanQaEntry};
+use crate::plan_recipes;
 
 /// Result of harness-side proposal improvement (before user sees the recap).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -201,6 +202,12 @@ fn normalize_verification_paths(verification: &str, workdir: Option<&str>) -> St
         let path = strip_workdir_prefix(rest, wd);
         return format!("file_exists:{path}");
     }
+    if let Some(rest) = v.strip_prefix("min_bytes:") {
+        if let Some((path, n)) = rest.rsplit_once(':') {
+            let path = strip_workdir_prefix(path.trim(), wd);
+            return format!("min_bytes:{path}:{}", n.trim());
+        }
+    }
     if let Some(rest) = v.strip_prefix("grep:") {
         let parts: Vec<&str> = rest.splitn(2, ':').collect();
         if parts.len() == 2 {
@@ -362,9 +369,14 @@ fn validate_step(step: &PlanProposalStep, index: usize, errors: &mut Vec<String>
             } else if tier == "check"
                 && !verify.starts_with("file_exists:")
                 && !verify.starts_with("grep:")
+                && !verify.starts_with("min_bytes:")
             {
                 errors.push(format!(
-                    "Step {n}: check tier requires file_exists: or grep: (got `{verify}`)"
+                    "Step {n}: check tier requires file_exists:, min_bytes:, or grep: (got `{verify}`)"
+                ));
+            } else if plan_recipes::is_binary_path_grep(verify) {
+                errors.push(format!(
+                    "Step {n}: verification greps a build/binary path (`{verify}`) — C++ symbols are mangled; use min_bytes:/file_exists: on source or a real build command"
                 ));
             }
         }
@@ -379,10 +391,11 @@ pub fn format_validation_retry_nudge(errors: &[String]) -> String {
     let mut out = VERIFICATION_RETRY_NUDGE_HEADER.to_string();
     out.push_str("Rules:\n");
     out.push_str("- Verification proves the step worked — never replay creation (`cat >`, `echo >`, `tee`, bare `mkdir`).\n");
-    out.push_str("- File scaffold → tier `check`, verification `file_exists:<path>`.\n");
+    out.push_str("- File scaffold → tier `check`, verification `min_bytes:<path>:<N>` or `file_exists:<path>`.\n");
     out.push_str("- Directory scaffold → tier `exec`, verification `test -d <path>`.\n");
-    out.push_str("- Code/content → tier `check`, verification `grep:<symbol>:<path>`.\n");
+    out.push_str("- Download/assets → non-empty dir (`test -d … && test -n \"$(ls -A …)\"`).\n");
     out.push_str("- Build → tier `exec`, verification `cmake --build …` / `cargo check` / `make`.\n");
+    out.push_str("- Never grep symbols out of build/ binaries.\n");
     out.push_str("\nFix these issues:\n");
     for e in errors {
         out.push_str("- ");
@@ -489,6 +502,11 @@ pub fn improve_proposal(
             }
             step.verification = Some(normalized);
         }
+    }
+
+    // Recipe catalog: upgrade weak create-file / empty-dir / binary-grep checks.
+    for fix in plan_recipes::apply_recipes_to_proposal(&mut proposal.steps) {
+        report.fixes.push(fix);
     }
 
     for (i, v) in proposal.verification.iter_mut().enumerate() {
@@ -629,6 +647,13 @@ fn lint_step_verification(step: &PlanProposalStep, index: usize, warnings: &mut 
              `attested` with evidence."
         ));
     }
+
+    if plan_recipes::is_binary_path_grep(verify) {
+        warnings.push(format!(
+            "Step {n}: verification greps a build artifact (`{verify}`). Prefer min_bytes/file_exists \
+             on source plus a separate build step."
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -684,11 +709,38 @@ mod tests {
         let r = improve_proposal(&mut p, Some("galaga"));
         assert!(r.errors.is_empty(), "{:?}", r.errors);
         assert_eq!(p.steps[0].tier.as_deref(), Some("check"));
-        assert_eq!(
-            p.steps[0].verification.as_deref(),
-            Some("file_exists:CMakeLists.txt")
+        // Creation → file_exists, then recipe upgrades to min_bytes for known extensions.
+        let v = p.steps[0].verification.as_deref().unwrap_or("");
+        assert!(
+            v == "file_exists:CMakeLists.txt" || v.starts_with("min_bytes:CMakeLists.txt:"),
+            "unexpected verification {v}"
         );
         assert!(!r.fixes.is_empty());
+    }
+
+    #[test]
+    fn recipe_rewrites_binary_grep_on_implement_step() {
+        let mut p = sample_proposal(vec![PlanProposalStep {
+            description: "Implement player ship with movement and fire".into(),
+            tier: Some("exec".into()),
+            verification: Some(
+                "cmake --build build && grep -q 'Player::update' build/galaga".into(),
+            ),
+            prompt: None,
+            note: None,
+        }]);
+        let r = improve_proposal(&mut p, Some("Implement"));
+        let v = p.steps[0].verification.as_deref().unwrap_or("");
+        assert!(
+            !plan_recipes::is_binary_path_grep(v),
+            "binary grep should be gone: {v}; fixes={:?}",
+            r.fixes
+        );
+        assert!(
+            r.fixes.iter().any(|f| f.contains("recipe") || f.contains("binary") || f.contains("removed")),
+            "{:?}",
+            r.fixes
+        );
     }
 
     #[test]

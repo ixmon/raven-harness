@@ -42,6 +42,8 @@ mod search;
 mod settings_modal;
 mod splash_chunk;
 mod splash_tips;
+mod live_activity;
+mod toast;
 mod tui_app;
 mod tui_render;
 mod trace_fold;

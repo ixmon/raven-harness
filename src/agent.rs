@@ -393,6 +393,14 @@ impl Agent {
             .await
             .unwrap_or_else(|e| format!("❌ Tool error: {}", e));
 
+            // Brave key rejected: drop session key so we stop re-sending a dead token.
+            if tool_name == "web_search"
+                && (tools::brave_auth_disabled()
+                    || tools::web_search_reports_brave_auth_rejected(&output))
+            {
+                self.brave_key = None;
+            }
+
             let rec = self.record_tool_action(&tool_name, &raw_args, &output);
             let to_model = rec.output_to_model.clone();
             records.push(rec);
@@ -423,8 +431,15 @@ impl Agent {
         if self.current_agent_mode() != "plan" {
             return None;
         }
-        if !matches!(tool_name, "write" | "patch") {
+        if !matches!(tool_name, "write" | "patch" | "download") {
             return None;
+        }
+        if tool_name == "download" {
+            return Some(
+                "❌ download denied while in Plan mode (clarification phase). \
+                 Wait for proceed, then download assets into the project workdir."
+                    .to_string(),
+            );
         }
         let args_val: serde_json::Value = serde_json::from_str(arguments).unwrap_or_default();
         let mut is_wiki = false;

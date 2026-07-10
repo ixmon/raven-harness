@@ -64,6 +64,9 @@ pub fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &PlanState) {
             ),
         ]));
     }
+    // Project confinement — where files/verifications are scoped (agent already gets this
+    // in the execution prompt; surface it for the user too).
+    lines_top.push(deliverable_location_line(plan));
     if !plan.verification_steps.is_empty() {
         lines_top.push(Line::from(Span::styled(
             "Verification:",
@@ -254,5 +257,69 @@ pub fn draw_plan_pane(f: &mut Frame, area: Rect, plan: &PlanState) {
         lines.extend(lines_bottom);
         let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: true });
         f.render_widget(para, inner);
+    }
+}
+
+/// User-facing deliverable scope for the plan pane.
+fn deliverable_location_line(plan: &PlanState) -> Line<'static> {
+    match plan
+        .project_workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|w| !w.is_empty() && *w != ".")
+    {
+        Some(wd) => {
+            let dir = wd.trim_end_matches('/');
+            Line::from(vec![
+                Span::styled("Deliverables: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{dir}/"),
+                    Style::default()
+                        .fg(Color::Rgb(0x80, 0xdd, 0xff))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " (isolated under workspace)",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ])
+        }
+        None => Line::from(vec![
+            Span::styled("Deliverables: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                "workspace root",
+                Style::default().fg(Color::Rgb(0xcc, 0xcc, 0xdd)),
+            ),
+            Span::styled(
+                " (not confined to a subdir)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deliverable_line_isolated_when_workdir_set() {
+        let plan = PlanState {
+            project_workdir: Some("galaga".into()),
+            ..Default::default()
+        };
+        let line = deliverable_location_line(&plan);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("galaga/"), "{text}");
+        assert!(text.contains("isolated"), "{text}");
+    }
+
+    #[test]
+    fn deliverable_line_workspace_root_when_unset() {
+        let plan = PlanState::default();
+        let line = deliverable_location_line(&plan);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("workspace root"), "{text}");
+        assert!(text.contains("not confined"), "{text}");
     }
 }

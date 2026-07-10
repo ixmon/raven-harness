@@ -10,7 +10,7 @@ const MAX_READ_BYTES: u64 = 2 * 1024 * 1024;
 /// Enforces containment using canonicalization where possible.
 /// Rejects obvious escapes (../ outside, absolute paths outside workspace).
 /// Returns Err with message on escape (enforced per glm.md review).
-fn resolve(workspace: &Path, user_path: &str) -> Result<PathBuf, String> {
+pub(crate) fn resolve(workspace: &Path, user_path: &str) -> Result<PathBuf, String> {
     let p = Path::new(user_path);
     let candidate = if p.is_absolute() {
         p.to_path_buf()

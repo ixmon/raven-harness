@@ -117,6 +117,7 @@ pub async fn handle_key(
             &mut app.settings,
             agent,
             keystore,
+            &mut app.toasts,
         );
         if endpoint_switched {
             if let Ok(ag) = agent.try_lock() {
@@ -367,6 +368,7 @@ async fn handle_input_key(
                 // Note: splash focus cycling and overview slide are handled earlier via handle_picker_key for Splash/Overview.
                 if !app.try_slide_to_workspace() {
                     app.focused_pane = crate::app_state::Pane::Right;
+                    app.activate_trace_cursor_in_viewport();
                 }
                 app.needs_redraw = true;
                 return Ok(true);
@@ -845,10 +847,15 @@ pub fn spawn_agent_turn(
     let prompt_c = prompt;
     let exec_mode_c = app.live_exec_mode.clone();
 
+    // Flush any /approval-mode change that was queued while a prior turn held the lock.
+    let _ = app.try_flush_pending_exec_approval_mode(agent);
+
     if let Ok(mut ag) = agent.try_lock() {
+        // Session meta is source of truth once flushed; keep live in sync for TuiObserver.
         if let Ok(mut slot) = app.live_exec_mode.lock() {
             *slot = ag.current_exec_mode();
         }
+        app.cached_mode_label = ag.current_exec_mode().label().to_string();
         let workspace = ag.workspace().to_path_buf();
         let wiki = ag
             .session()

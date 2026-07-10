@@ -8,6 +8,7 @@ pub mod plan_intent;
 pub mod plan_loop;
 pub mod plan_md;
 pub mod plan_protocol;
+pub mod plan_recipes;
 pub mod plan_verification;
 pub mod chat_backend;
 pub mod config;

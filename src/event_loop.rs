@@ -73,10 +73,127 @@ pub enum UiUpdate {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else {
-        let mut end = max;
-        while end > 0 && !s.is_char_boundary(end) { end -= 1; }
-        format!("{}...", &s[..end])
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let t: String = s.chars().take(max).collect();
+        format!("{t}...")
+    }
+}
+
+/// Max body lines kept in the trace pane for a single tool result (expandable).
+const TRACE_RESULT_MAX_LINES: usize = 48;
+/// Soft wrap width for long result lines so they stay one-row tall (no pane wrap).
+const TRACE_RESULT_WRAP: usize = 96;
+
+/// Push a tool result into `trace_lines` as a multi-line block body.
+/// Returns the primary display line (for persistence / first-line summary).
+fn push_tool_result_lines(trace_lines: &mut Vec<String>, summary: &str) -> String {
+    let mut body_lines: Vec<String> = Vec::new();
+    for raw in summary.lines() {
+        let line = raw.trim_end();
+        if line.is_empty() {
+            if !body_lines.is_empty() {
+                body_lines.push(String::new());
+            }
+            continue;
+        }
+        // Soft-wrap long lines so the trace pane can disable wrap without clipping.
+        let mut rest = line;
+        while !rest.is_empty() {
+            let mut end = rest.len();
+            let mut count = 0usize;
+            for (i, _) in rest.char_indices() {
+                if count >= TRACE_RESULT_WRAP {
+                    end = i;
+                    break;
+                }
+                count += 1;
+            }
+            if count < TRACE_RESULT_WRAP {
+                end = rest.len();
+            }
+            // Prefer breaking on whitespace when possible.
+            if end < rest.len() {
+                if let Some(ws) = rest[..end].rfind(char::is_whitespace) {
+                    if ws > TRACE_RESULT_WRAP / 3 {
+                        end = ws + 1;
+                    }
+                }
+            }
+            body_lines.push(rest[..end].trim_end().to_string());
+            rest = rest[end..].trim_start();
+            if body_lines.len() >= TRACE_RESULT_MAX_LINES {
+                break;
+            }
+        }
+        if body_lines.len() >= TRACE_RESULT_MAX_LINES {
+            break;
+        }
+    }
+    if body_lines.is_empty() {
+        body_lines.push(summary.trim().to_string());
+    }
+    if body_lines.len() >= TRACE_RESULT_MAX_LINES {
+        body_lines.truncate(TRACE_RESULT_MAX_LINES);
+        body_lines.push("… (truncated)".to_string());
+    }
+
+    let first = body_lines.first().cloned().unwrap_or_default();
+    for (i, line) in body_lines.into_iter().enumerate() {
+        if i == 0 {
+            trace_lines.push(format!("   ↳ {line}"));
+        } else if line.is_empty() {
+            trace_lines.push(String::new());
+        } else {
+            trace_lines.push(format!("   {line}"));
+        }
+    }
+    format!("   ↳ {first}")
+}
+
+/// Auto-follow the trace only when the user is not navigating the cursor.
+fn maybe_follow_trace(app: &mut crate::app_state::App) {
+    if !app.trace_cursor_active {
+        app.right_follow_output = true;
+        app.right_scroll = 10_000;
+    }
+}
+
+/// Append soft-wrapped chunks of `text` into `out`, each prefixed with `prefix`.
+fn soft_wrap_into(out: &mut Vec<String>, text: &str, width: usize, prefix: &str) {
+    let text = text.trim_end();
+    if text.is_empty() {
+        out.push(String::new());
+        return;
+    }
+    let mut rest = text;
+    while !rest.is_empty() {
+        let mut end = rest.len();
+        let mut count = 0usize;
+        for (i, _) in rest.char_indices() {
+            if count >= width {
+                end = i;
+                break;
+            }
+            count += 1;
+        }
+        if count < width {
+            end = rest.len();
+        }
+        if end < rest.len() {
+            if let Some(ws) = rest[..end].rfind(char::is_whitespace) {
+                if ws > width / 3 {
+                    end = ws + 1;
+                }
+            }
+        }
+        out.push(format!("{prefix}{}", rest[..end].trim_end()));
+        rest = rest[end..].trim_start();
+        if out.len() >= TRACE_RESULT_MAX_LINES + 8 {
+            out.push(format!("{prefix}… (truncated)"));
+            break;
+        }
     }
 }
 
@@ -191,7 +308,7 @@ impl TuiObserver {
                 return false;
             }
         }
-        let is_mutating = matches!(name, "write" | "patch" | "exec");
+        let is_mutating = matches!(name, "write" | "patch" | "exec" | "download");
         let is_outside = if name == "exec" {
             let cmd = serde_json::from_str::<serde_json::Value>(args).ok()
                 .and_then(|v| v.get("command").and_then(|c| c.as_str()).map(|s| s.to_owned()))
@@ -222,6 +339,12 @@ impl TuiObserver {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
                 let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
                 format!("patch {}", path)
+            }
+            "download" => {
+                let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
+                let path = v.get("path").and_then(|p| p.as_str()).unwrap_or("?");
+                let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("?");
+                format!("download {} → {}", truncate(url, 48), path)
             }
             "exec" => {
                 let v: serde_json::Value = serde_json::from_str(args).unwrap_or_default();
@@ -307,12 +430,49 @@ async fn run_app<B: ratatui::backend::Backend>(
     mut keystore: Keystore,
 ) -> Result<()> {
     let agent = Arc::new(tokio::sync::Mutex::new(Agent::new(config.clone(), chat_backend)));
-    // Set Brave Search API key from keystore (or BRAVE_API_KEY env var)
-    {
+    // Set Brave Search API key from keystore (or BRAVE_API_KEY env var).
+    // Surface the result as a startup toast once the TUI is up (also log to stderr
+    // for non-interactive / pre-TUI visibility).
+    let brave_startup_toast: Option<crate::toast::Toast> = {
+        use crate::toast::Toast;
+        use std::time::Duration;
         let brave_key = keystore.get_brave_key();
+        let toast = if brave_key.is_some() {
+            eprintln!("Brave Search: key loaded from vault/env");
+            Some(
+                Toast::success("Brave Search: key loaded from vault/env")
+                    .with_ttl(Duration::from_secs(4)),
+            )
+        } else if keystore.has_brave_key() {
+            eprintln!(
+                "Brave Search: keystore has a Brave key but it did not decrypt \
+                 (wrong password / unlock failed). Falling back to DuckDuckGo."
+            );
+            Some(
+                Toast::warning(
+                    "Brave Search: key present but did not decrypt — using DuckDuckGo",
+                )
+                .with_ttl(Duration::from_secs(5)),
+            )
+        } else {
+            eprintln!("Brave Search: not configured (using DuckDuckGo HTML scrape)");
+            Some(
+                Toast::info("Brave Search: not configured — using DuckDuckGo")
+                    .with_ttl(Duration::from_secs(4)),
+            )
+        };
         agent.lock().await.brave_key = brave_key;
+        toast
+    };
+    let splash_tips = crate::splash_tips::apply_conditional_tips(
+        crate::splash_tips::load_splash_tips(),
+        // Tip when search will not use Brave this session (not merely "blob on disk").
+        keystore.get_brave_key().is_some(),
+    );
+    let mut app = App::new(&config, splash_tips);
+    if let Some(t) = brave_startup_toast {
+        app.toasts.push(t);
     }
-    let mut app = App::new(&config);
 
     // On (re)start, prepopulate the conversation pane from the prebuilt/default
     // session's log so previous work is visible immediately in the UI panes.
@@ -420,6 +580,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     // Re-apply XML tool call stripping to the live display buffer as a
                     // belt-and-suspenders so that tool XML never appears in the conversation pane.
                     app.current_response = raven_tui::llm::strip_xml_tool_call_blocks(&app.current_response);
+                    app.live_activity.push_token_sample();
                     app.needs_redraw = true;
                     app.left_follow_output = true;
                     app.left_scroll = 10_000;
@@ -439,9 +600,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.api_tps = app.tps;
                     }
                     app.current_thinking.push_str(&t);
+                    app.live_activity.push_token_sample();
                     app.needs_redraw = true;
-                    app.right_follow_output = true;
-                    app.right_scroll = 10_000;
+                    maybe_follow_trace(&mut app);
                 }
                 UiUpdate::ToolStart { name, args } => {
                     // Always ensure tool debug lines start with the tool call icon at the front.
@@ -451,8 +612,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                         &name, &args, &tool_debug,
                     ));
                     app.tool_calls_this_turn += 1;
-                    app.right_follow_output = true;
-                    app.right_scroll = 10_000;
+                    app.live_activity.push_tool();
+                    maybe_follow_trace(&mut app);
                     app.needs_redraw = true;
                 }
                 UiUpdate::PlanSync(exec) => {
@@ -473,16 +634,25 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.trace_lines.push(d.clone());
                         d
                     } else {
-                        // Real tool result: use indented continuation (↳). Combined with the
-                        // preceding ToolStart line, this puts a *single* 🔧 icon on the first
-                        // line of the tool call block/output. No brain icons on tool lines.
-                        let d = format!("   ↳ {}", truncate(&summary, 120));
-                        app.trace_lines.push(d.clone());
-                        d
+                        // Multi-line body so expand/collapse reveals more than a one-liner.
+                        push_tool_result_lines(&mut app.trace_lines, &summary)
                     };
                     app.persist_trace_event(&raven_tui::session::TraceEvent::tool_result(
                         &name, &summary, &display,
                     ));
+                    if name != "system" {
+                        app.live_activity.push_tool_result();
+                    }
+                    // Brave key rejected: one-shot toast + conversation line (toast alone fades ~12s).
+                    if name == "web_search" && raven_tui::tools::take_brave_auth_ui_notice() {
+                        let msg = "Brave Search key rejected — using DuckDuckGo this session. \
+                                   Fix in Settings → brave key.";
+                        app.toasts.push(
+                            crate::toast::Toast::warning(msg)
+                                .with_ttl(std::time::Duration::from_secs(12)),
+                        );
+                        app.left_committed.push(format!("⚠ {msg}"));
+                    }
                     if app.plan.active && !app.plan.steps.is_empty() {
                         if name == "complete_plan_step" {
                             if let Some(observe) = &app.plan.pending_observe_prompt {
@@ -496,45 +666,52 @@ async fn run_app<B: ratatui::backend::Backend>(
                         }
                         app.needs_redraw = true;
                     }
-                    app.right_follow_output = true;
-                    app.right_scroll = 10_000;
+                    maybe_follow_trace(&mut app);
                     app.needs_redraw = true;
                 }
                 UiUpdate::Done { final_text } => {
+                    app.live_activity.push_turn_boundary();
                     // Use the component's filter (which applies strip and never falls back
                     // to raw XML). This is the key circumstance we test.
                     if let Some(to_commit) = clean_final_text_for_pane(&final_text) {
                         app.left_committed.push(to_commit);
                     }
                     if !app.current_thinking.is_empty() {
-                        // Settle the thinking: 1 brain icon per thought block (not per line),
-                        // 1 tool icon at start of tool blocks. Subsequent lines of a thought
-                        // are indented without repeating the icon.
-                        let lines: Vec<&str> = app.current_thinking.lines().collect();
-                        if !lines.is_empty() {
-                            let first = lines[0];
-                            let l = first.trim_start();
-                            let first_settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
-                                first.to_string()
-                            } else {
-                                format!("🧠 {}", first)
-                            };
-                            app.trace_lines.push(first_settled.clone());
-                            app.persist_trace_event(&raven_tui::session::TraceEvent::thinking(&first_settled));
-
-                            for line in &lines[1..] {
-                                let l = line.trim_start();
-                                let settled = if l.starts_with("🔧") || l.starts_with("   ↳") || l.starts_with("⭐") {
-                                    line.to_string()
-                                } else {
-                                    format!("   {}", line)
-                                };
-                                app.trace_lines.push(settled.clone());
-                                app.persist_trace_event(&raven_tui::session::TraceEvent::thinking(&settled));
+                        // Settle the thinking: 1 brain icon per thought block (not per line).
+                        // Soft-wrap so the no-wrap trace pane still shows readable chunks.
+                        let raw = app.current_thinking.clone();
+                        let mut lines: Vec<String> = Vec::new();
+                        for (i, line) in raw.lines().enumerate() {
+                            if lines.len() > TRACE_RESULT_MAX_LINES {
+                                lines.push("… (truncated)".to_string());
+                                break;
                             }
+                            if i == 0 {
+                                let l = line.trim_start();
+                                if l.starts_with('🔧')
+                                    || l.starts_with("   ↳")
+                                    || l.starts_with('⭐')
+                                {
+                                    lines.push(line.to_string());
+                                } else {
+                                    lines.push(format!(
+                                        "🧠 {}",
+                                        truncate(line, TRACE_RESULT_WRAP.saturating_mul(2))
+                                    ));
+                                }
+                            } else {
+                                soft_wrap_into(&mut lines, line, TRACE_RESULT_WRAP, "   ");
+                            }
+                        }
+                        for settled in &lines {
+                            app.trace_lines.push(settled.clone());
+                            app.persist_trace_event(&raven_tui::session::TraceEvent::thinking(
+                                settled,
+                            ));
                         }
                         app.current_thinking.clear();
                     }
+                    maybe_follow_trace(&mut app);
                     app.current_response.clear();
                     app.is_processing = false;
                     // If stop was set (e.g. by Esc to abort a turn), reset it so the main
@@ -619,13 +796,22 @@ async fn run_app<B: ratatui::backend::Backend>(
                 UiUpdate::PlanLoopProceedClassified(intent) => {
                     match intent {
                         raven_tui::plan_intent::PlanProceedIntent::Proceed => {
-                            app.deferred_agent_prompt = Some(
-                                crate::plan_flow::start_plan_execution(
-                                    &mut app,
-                                    &agent,
-                                    &config.workspace,
-                                ),
-                            );
+                            if crate::plan_flow::should_block_proceed(&app.plan) {
+                                app.left_committed.push(
+                                    crate::plan_flow::format_proceed_blocked_message(&app.plan),
+                                );
+                                app.plan.loop_phase =
+                                    crate::plan_state::PlanLoopPhase::AwaitingProceedConsent;
+                                app.plan.recap_offered = true;
+                            } else {
+                                app.deferred_agent_prompt = Some(
+                                    crate::plan_flow::start_plan_execution(
+                                        &mut app,
+                                        &agent,
+                                        &config.workspace,
+                                    ),
+                                );
+                            }
                         }
                         raven_tui::plan_intent::PlanProceedIntent::Cancel => {
                             crate::plan_flow::cancel_plan_mode(&mut app, &agent);
@@ -689,6 +875,14 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.needs_redraw = true;
         }
 
+        // Expire toasts; keep redrawing while any are visible so they dismiss cleanly.
+        if app.toasts.tick() {
+            app.needs_redraw = true;
+        }
+        if app.toasts.needs_redraw() {
+            app.needs_redraw = true;
+        }
+
         if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
             app.spinner_tick = app.spinner_tick.wrapping_add(1);
         }
@@ -705,9 +899,23 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.refresh_picker();
         }
 
-        // Labels
+        // Persist approval mode queued while the agent was busy (mid-turn /mode).
+        let _ = app.try_flush_pending_exec_approval_mode(&agent);
+
+        // Labels — prefer live_exec_mode so the bar matches approvals even before meta flush.
+        let live_approval = app
+            .live_exec_mode
+            .lock()
+            .map(|m| *m)
+            .unwrap_or(raven_tui::session::ExecApprovalMode::Babysitter);
         let (approval_label, goal_text, agent_mode) = if let Ok(ag) = agent.try_lock() {
-            let approval = ag.current_exec_mode().label().to_string();
+            // Prefer session meta when it matches live (fully applied); else show live.
+            let session_mode = ag.current_exec_mode();
+            let approval = if app.pending_exec_approval_mode.is_some() {
+                live_approval.label().to_string()
+            } else {
+                session_mode.label().to_string()
+            };
             let goal = if config.flags.goal_tracking {
                 ag.session().as_ref().and_then(|s| {
                     let g = s.meta.current_goal.as_str();
@@ -717,13 +925,23 @@ async fn run_app<B: ratatui::backend::Backend>(
             let amode = ag.current_agent_mode();
             (approval, goal, amode)
         } else {
-            (app.cached_mode_label.clone(), app.cached_goal_text.clone(), app.cached_agent_mode.clone())
+            (
+                if !app.cached_mode_label.is_empty() {
+                    app.cached_mode_label.clone()
+                } else {
+                    live_approval.label().to_string()
+                },
+                app.cached_goal_text.clone(),
+                app.cached_agent_mode.clone(),
+            )
         };
         app.cached_mode_label = approval_label.clone();
         app.cached_goal_text = goal_text.clone();
         app.cached_agent_mode = agent_mode.clone();
 
-        // Sync plan pane high-level fields from session (agent uses update_goal during clarification)
+        // Sync plan pane high-level fields from session (agent uses update_goal during clarification).
+        // Do NOT clobber `success_criteria` with `achievement_tests`: those are often runnable
+        // verification commands stored via update_goal, while success_criteria is product-level prose.
         if agent_mode == "plan" {
             if let Ok(ag) = agent.try_lock() {
                 if let Some(s) = ag.session() {
@@ -731,8 +949,15 @@ async fn run_app<B: ratatui::backend::Backend>(
                     if !m.current_goal.is_empty() {
                         app.plan.goal = m.current_goal.clone();
                     }
-                    if !m.achievement_tests.is_empty() {
-                        app.plan.success_criteria = m.achievement_tests.join(" | ");
+                    if app.plan.success_criteria.is_empty() {
+                        if let Some(c) = m.completion_criteria.as_deref() {
+                            if !c.trim().is_empty() {
+                                app.plan.success_criteria = c.to_string();
+                            }
+                        }
+                    }
+                    if app.plan.verification_steps.is_empty() && !m.achievement_tests.is_empty() {
+                        app.plan.verification_steps = m.achievement_tests.clone();
                     }
                 }
             }
@@ -806,10 +1031,16 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Draw
-        if app.needs_redraw || app.is_processing || app.scroll_flash_timer > 0 || app.desktop.is_animating() {
+        if app.needs_redraw
+            || app.is_processing
+            || app.scroll_flash_timer > 0
+            || app.desktop.is_animating()
+            || app.toasts.needs_redraw()
+        {
             app.needs_redraw = false;
 
             let search_label = app.search.status_label();
+            let activity_hist = app.live_activity.histogram();
 
             terminal.draw(|f| {
                 let size = f.area();
@@ -885,6 +1116,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         goal_text: &goal_text,
                         search_label: &search_label,
                         tps: app.api_tps,
+                        activity: &activity_hist,
                     });
                 }
 
@@ -974,6 +1206,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                         goal_text: &goal_text,
                         search_label: &search_label,
                         tps: app.api_tps,
+                        activity: &activity_hist,
                     });
                     let input_focused = app.focused_pane == Pane::Input;
                     tui_render::draw_input_bar(f, irect, &tui_render::InputBarData {
@@ -1033,6 +1266,9 @@ async fn run_app<B: ratatui::backend::Backend>(
 
                 // For Overview (Screen 2), the status/conv/input for harness case are drawn inside the content column (see tui_render).
                 // No outer full-width bars for the diorama.
+
+                // Toasts sit above all desktops (top-right), including splash / picker / wiki.
+                crate::toast::draw_toasts(f, size, &app.toasts);
 
                 if app.scroll_flash_timer > 0 { app.scroll_flash_timer -= 1; }
                 if app.desktop.tick() { app.needs_redraw = true; }
