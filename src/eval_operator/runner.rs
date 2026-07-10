@@ -354,7 +354,7 @@ impl Runner {
             println!("(Using exact swebench checkout + harness python context)");
         }
         println!("Equivalent command: cargo run --release --bin raven-tui -- --workspace {} --fresh-session --temperature 1 --approval thunderdome --context-size 65536 --base-url {}", 
-            workspace.display(), &self.llm_base_url);
+            workspace.display(), self.llm_base_url);
         let mut tui_args = vec![
             "run",
             "--release",
