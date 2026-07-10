@@ -56,14 +56,19 @@ jobs:
         run: |
           set -euo pipefail
           docker pull "${{ env.LINUX_BUILD_IMAGE }}"
+          # Official rust images put cargo/rustup under /usr/local/cargo/bin but do not
+          # put that directory on PATH for non-login shells (bash -lc still needs export).
           docker run --rm \
             -v "$PWD":/work \
             -w /work \
             -e CARGO_TERM_COLOR=always \
-            -e CARGO_HOME=/work/.cargo-docker \
             "${{ env.LINUX_BUILD_IMAGE }}" \
             bash -lc '
               set -euo pipefail
+              export PATH="/usr/local/cargo/bin:${PATH:-/usr/bin:/bin}"
+              command -v cargo
+              command -v rustc
+              rustc -V
               TARGET="${{ matrix.target }}"
               if [ "$TARGET" = "x86_64-unknown-linux-gnu" ]; then
                 cargo build --release --no-default-features
@@ -82,6 +87,7 @@ jobs:
           # Report max GLIBC version required (must be <= 2.31 for Ubuntu 20.04)
           BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           echo "Built: $BIN"
+          test -x "$BIN"
           if command -v objdump >/dev/null; then
             echo "GLIBC symbols (highest should be <= 2.31):"
             objdump -T "$BIN" | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -5
@@ -109,7 +115,8 @@ jobs:
           BIN="target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"
           if [[ "${{ matrix.target }}" == aarch64*linux* ]]; then
             docker run --rm -v "$(pwd):/work" -w /work "${{ env.LINUX_BUILD_IMAGE }}" \
-              bash -lc 'apt-get update -qq && apt-get install -y -qq binutils-aarch64-linux-gnu >/dev/null \
+              bash -lc 'export PATH="/usr/local/cargo/bin:${PATH:-/usr/bin:/bin}"
+                apt-get update -qq && apt-get install -y -qq binutils-aarch64-linux-gnu >/dev/null \
                 && aarch64-linux-gnu-strip "target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}"' || true
           else
             strip "$BIN" || true
