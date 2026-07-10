@@ -69,7 +69,7 @@ irm https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/install.p
 
 The **releases/latest** page and **releases/latest/download/…** URLs redirect to the newest tagged release automatically. Each release also keeps versioned archives (e.g. `raven-tui-v0.1.1-…`) for pinning.
 
-Linux builds are compiled with `--no-default-features` (no clipboard — avoids X11/Wayland deps). macOS and Windows builds include clipboard support.
+Linux builds are compiled with `--no-default-features` (no clipboard — avoids X11/Wayland deps) **inside Debian bullseye (glibc 2.31)** so they run on **Ubuntu 20.04+** and other glibc ≥ 2.31 systems. macOS and Windows builds include clipboard support.
 
 <details>
 <summary>Manual extract example (Linux x86_64)</summary>
