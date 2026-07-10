@@ -32,32 +32,39 @@ impl ToolBlock {
     }
 }
 
-/// Scan `trace_lines` and identify all tool blocks.
+/// True if this line starts a new foldable block (tool or thought).
+pub fn is_block_header(line: &str) -> bool {
+    line.starts_with('🔧') || line.starts_with('🧠')
+}
+
+/// True if this line ends a previous block (starts a new major section).
+fn is_block_boundary(line: &str) -> bool {
+    is_block_header(line)
+        || line.starts_with('⭐')
+        || line.starts_with('🔍')
+        || line.starts_with('📌')
+        || line.starts_with('⏹')
+}
+
+/// Scan `trace_lines` and identify foldable blocks (tools + thoughts).
 ///
-/// A block starts at any line beginning with `🔧` and extends until
-/// the next `🔧` header, `🧠` thinking header, or `⭐` judge line.
+/// A block starts at any `🔧` or `🧠` header and extends until the next
+/// block header / judge / system section marker.
 pub fn detect_tool_blocks(trace_lines: &[String]) -> Vec<ToolBlock> {
     let mut blocks = Vec::new();
     let mut i = 0;
 
     while i < trace_lines.len() {
-        if trace_lines[i].starts_with('🔧') {
+        if is_block_header(&trace_lines[i]) {
             let header_idx = i;
-            let tool_name = extract_tool_name(&trace_lines[i]);
+            let tool_name = extract_block_label(&trace_lines[i]);
             let body_start = i + 1;
 
-            // Scan forward for block body lines.
-            // Body lines: `   ↳ ...` or `   ` (3+ space indent) continuations.
+            // Body: indented continuations / result lines until next boundary.
             let mut end = body_start;
             while end < trace_lines.len() {
                 let line = &trace_lines[end];
-                if line.starts_with('🔧')
-                    || line.starts_with('🧠')
-                    || line.starts_with('⭐')
-                    || line.starts_with('🔍')
-                    || line.starts_with('📌')
-                    || line.starts_with('⏹')
-                {
+                if is_block_boundary(line) {
                     break;
                 }
                 end += 1;
@@ -70,7 +77,10 @@ pub fn detect_tool_blocks(trace_lines: &[String]) -> Vec<ToolBlock> {
             let summary = trace_lines
                 .get(body_start)
                 .map(|l| l.trim().to_string())
-                .unwrap_or_default();
+                .unwrap_or_else(|| {
+                    // Header-only thought: use the header text as summary.
+                    extract_block_label(&trace_lines[header_idx])
+                });
 
             blocks.push(ToolBlock {
                 header_idx,
@@ -90,20 +100,30 @@ pub fn detect_tool_blocks(trace_lines: &[String]) -> Vec<ToolBlock> {
     blocks
 }
 
-/// Extract the tool name from a `🔧 name(args)` line.
+/// Extract a short label from a `🔧 name(args)` or `🧠 thought…` header.
+fn extract_block_label(line: &str) -> String {
+    extract_tool_name(line)
+}
+
+/// Back-compat name used by unit tests and call sites.
 fn extract_tool_name(line: &str) -> String {
-    // Skip the 🔧 prefix (4 bytes + space)
-    let after = line
-        .strip_prefix('🔧')
-        .unwrap_or(line)
-        .trim_start();
-    // Take up to the first '(' or end
-    after
-        .split('(')
-        .next()
-        .unwrap_or(after)
-        .trim()
-        .to_string()
+    if let Some(after) = line.strip_prefix('🔧') {
+        let after = after.trim_start();
+        return after
+            .split('(')
+            .next()
+            .unwrap_or(after)
+            .trim()
+            .to_string();
+    }
+    if let Some(after) = line.strip_prefix('🧠') {
+        let s = after.trim();
+        if s.chars().count() > 40 {
+            return s.chars().take(40).collect::<String>() + "…";
+        }
+        return s.to_string();
+    }
+    line.chars().take(40).collect()
 }
 
 /// A line in the visible output after folding.
@@ -195,34 +215,66 @@ pub fn block_for_line(blocks: &[ToolBlock], line_idx: usize) -> Option<usize> {
 }
 
 /// Visible-line index that corresponds to `trace_cursor` (raw trace_lines index).
+///
+/// Important: a collapsed block has both a header `Original(header_idx)` and a
+/// `FoldSummary`. Those must map to **different** stored cursor indices so that
+/// Down/Up can step from the header onto the fold row (and not bounce forever
+/// on the header). Fold summaries store `body_start` (see
+/// [`cursor_line_for_visible`]); headers store `header_idx`.
 pub fn visible_index_for_cursor(
     visible: &[VisibleLine],
     trace_cursor: usize,
     blocks: &[ToolBlock],
 ) -> usize {
+    // Prefer exact Original matches first (headers + expanded body lines).
     for (i, v) in visible.iter().enumerate() {
-        match v {
-            VisibleLine::Original(idx) if *idx == trace_cursor => return i,
-            VisibleLine::FoldSummary { header_idx, .. }
-                if blocks.iter().any(|b| {
-                    b.header_idx == *header_idx
-                        && trace_cursor >= b.header_idx
-                        && trace_cursor < b.end_idx
-                }) =>
-            {
+        if let VisibleLine::Original(idx) = v {
+            if *idx == trace_cursor {
                 return i;
             }
-            _ => {}
+        }
+    }
+    // Collapsed body: cursor is a body index (typically body_start) that is not
+    // currently an Original row — land on the fold summary for that block.
+    for (i, v) in visible.iter().enumerate() {
+        if let VisibleLine::FoldSummary { header_idx, .. } = v {
+            if let Some(b) = blocks.iter().find(|b| b.header_idx == *header_idx) {
+                if b.body_len() > 0
+                    && trace_cursor >= b.body_start
+                    && trace_cursor < b.end_idx
+                {
+                    return i;
+                }
+            }
+        }
+    }
+    // Fallback: any block membership (legacy / off-range).
+    for (i, v) in visible.iter().enumerate() {
+        if let VisibleLine::FoldSummary { header_idx, .. } = v {
+            if blocks.iter().any(|b| {
+                b.header_idx == *header_idx
+                    && trace_cursor >= b.header_idx
+                    && trace_cursor < b.end_idx
+            }) {
+                return i;
+            }
         }
     }
     visible.len().saturating_sub(1)
 }
 
 /// Raw trace_lines index to store in `trace_cursor` for a visible row.
+///
+/// Fold summaries use `body_start` (not `header_idx`) so they are distinct from
+/// the block header when navigating with the caret.
 pub fn cursor_line_for_visible(visible: &[VisibleLine], vis_idx: usize) -> usize {
     match visible.get(vis_idx) {
         Some(VisibleLine::Original(i)) => *i,
-        Some(VisibleLine::FoldSummary { header_idx, .. }) => *header_idx,
+        Some(VisibleLine::FoldSummary { header_idx, .. }) => {
+            // Prefer body_start so the fold row does not share the header index.
+            // Fall back to header if the block has no body (should not happen for FoldSummary).
+            *header_idx + 1
+        }
         None => 0,
     }
 }
@@ -236,7 +288,7 @@ pub fn fold_toggle_header(
     match vline {
         VisibleLine::FoldSummary { header_idx, .. } => Some(*header_idx),
         VisibleLine::Original(idx) => {
-            if trace_lines.get(*idx).is_some_and(|l| l.starts_with('🔧')) {
+            if trace_lines.get(*idx).is_some_and(|l| is_block_header(l)) {
                 Some(*idx)
             } else {
                 block_for_line(blocks, *idx)
@@ -311,14 +363,19 @@ mod tests {
     fn detect_with_thinking_lines() {
         let trace = lines(&[
             "🧠 Thinking about the problem...",
+            "   more thought",
             "🔧 exec(ls)",
             "   ↳ ✅ ok",
             "🧠 Now I see...",
         ]);
         let blocks = detect_tool_blocks(&trace);
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].header_idx, 1);
-        assert_eq!(blocks[0].end_idx, 3);
+        // Two thought blocks + one tool block
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0].header_idx, 0);
+        assert_eq!(blocks[0].end_idx, 2);
+        assert_eq!(blocks[1].header_idx, 2);
+        assert_eq!(blocks[1].end_idx, 4);
+        assert_eq!(blocks[2].header_idx, 4);
     }
 
     #[test]
@@ -380,9 +437,9 @@ mod tests {
         let blocks = detect_tool_blocks(&trace);
         let expanded = HashSet::new();
         let visible = compute_visible_lines(&trace, &blocks, &expanded);
-        // 🧠 line + header + fold summary + 📌 line = 4
+        // thought header (no body) + tool header + fold summary + 📌 line = 4
         assert_eq!(visible.len(), 4);
-        assert_eq!(visible[0], VisibleLine::Original(0)); // thinking
+        assert_eq!(visible[0], VisibleLine::Original(0)); // thinking header
         assert_eq!(visible[3], VisibleLine::Original(3)); // interject
     }
 
@@ -397,7 +454,7 @@ mod tests {
             "   ↳ content",
         ]);
         let blocks = detect_tool_blocks(&trace);
-        assert_eq!(block_for_line(&blocks, 0), None); // thinking line
+        assert_eq!(block_for_line(&blocks, 0), Some(0)); // thinking is a foldable block
         assert_eq!(block_for_line(&blocks, 1), Some(1)); // exec header
         assert_eq!(block_for_line(&blocks, 2), Some(1)); // exec body
         assert_eq!(block_for_line(&blocks, 3), Some(1)); // exec body
@@ -418,5 +475,46 @@ mod tests {
         assert!(blocks.is_empty());
         let visible = compute_visible_lines(&[], &blocks, &HashSet::new());
         assert!(visible.is_empty());
+    }
+
+    #[test]
+    fn down_arrow_can_leave_collapsed_header_onto_fold_row() {
+        // Regression: header + FoldSummary both used to store header_idx, so
+        // Down from the header always re-resolved to the header (caret stuck).
+        let trace = lines(&[
+            "🔧 exec(cargo test)",
+            "   ↳ ✅ 150 passed",
+            "   Compiling...",
+            "🔧 read(foo)",
+            "   ↳ content",
+        ]);
+        let blocks = detect_tool_blocks(&trace);
+        let expanded = HashSet::new();
+        let visible = compute_visible_lines(&trace, &blocks, &expanded);
+        // header0, fold0, header1, fold1
+        assert_eq!(visible.len(), 4);
+
+        let on_header = cursor_line_for_visible(&visible, 0);
+        assert_eq!(on_header, 0);
+        assert_eq!(
+            visible_index_for_cursor(&visible, on_header, &blocks),
+            0
+        );
+
+        let on_fold = cursor_line_for_visible(&visible, 1);
+        assert_ne!(
+            on_fold, on_header,
+            "fold row must not share the header cursor index"
+        );
+        assert_eq!(
+            visible_index_for_cursor(&visible, on_fold, &blocks),
+            1
+        );
+
+        let on_next_header = cursor_line_for_visible(&visible, 2);
+        assert_eq!(
+            visible_index_for_cursor(&visible, on_next_header, &blocks),
+            2
+        );
     }
 }

@@ -650,11 +650,18 @@ fn present_proposal(app: &mut App, agent: &Arc<TokioMutex<Agent>>, mut proposal:
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = ag.session_mut() {
             let _ = s.write_wiki_file("plan.md", &crate::plan_prompts::wiki_template_approved(&app.plan));
+            // achievement_tests = runnable verification; completion_criteria = product outcomes
             let _ = s.update_goal(
                 &app.plan.goal,
                 Some(app.plan.verification_steps.clone()),
                 None,
             );
+            let criteria = app.plan.success_criteria.trim();
+            let _ = s.set_completion_criteria(if criteria.is_empty() {
+                None
+            } else {
+                Some(criteria.to_string())
+            });
         }
     }
     app.needs_redraw = true;
@@ -1209,11 +1216,18 @@ fn approve_plan_for_execution(app: &mut App, agent: &Arc<TokioMutex<Agent>>) {
 
     if let Ok(mut ag) = agent.try_lock() {
         if let Some(s) = &mut ag.session_mut() {
+            // Keep verification commands and product success criteria distinct.
             let _ = s.update_goal(
                 &app.plan.goal,
                 Some(app.plan.verification_steps.clone()),
                 None,
             );
+            let criteria = app.plan.success_criteria.trim();
+            let _ = s.set_completion_criteria(if criteria.is_empty() {
+                None
+            } else {
+                Some(criteria.to_string())
+            });
         }
     }
 }

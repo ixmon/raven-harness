@@ -9,9 +9,74 @@
 //! - Parallel:    `browse_urls(urls)` — concurrent fetch of multiple URLs
 
 use scraper::{Html, Selector};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 const BRAVE_WEB_URL: &str = "https://api.search.brave.com/res/v1/web/search";
+
+/// Stable marker in tool output when Brave rejected the subscription token.
+/// UI / agent use this to clear the session key and surface a one-shot notice.
+pub const BRAVE_AUTH_REJECTED_MARKER: &str = "BRAVE_AUTH_REJECTED";
+
+/// Once auth fails (401/403/invalid subscription), skip Brave for the rest of the process
+/// until [`reset_brave_auth_disabled`] (e.g. user updates the key in Settings).
+static BRAVE_AUTH_DISABLED: AtomicBool = AtomicBool::new(false);
+/// One-shot UI notice pending after a disable transition.
+static BRAVE_AUTH_UI_NOTICE: AtomicBool = AtomicBool::new(false);
+
+/// True after Brave rejected the key this session (until reset).
+pub fn brave_auth_disabled() -> bool {
+    BRAVE_AUTH_DISABLED.load(Ordering::SeqCst)
+}
+
+/// Re-enable Brave attempts (call when the user installs a new key).
+pub fn reset_brave_auth_disabled() {
+    BRAVE_AUTH_DISABLED.store(false, Ordering::SeqCst);
+    BRAVE_AUTH_UI_NOTICE.store(false, Ordering::SeqCst);
+}
+
+/// If a Brave auth failure just disabled the provider, return true once for UI toast/commit.
+pub fn take_brave_auth_ui_notice() -> bool {
+    BRAVE_AUTH_UI_NOTICE.swap(false, Ordering::SeqCst)
+}
+
+fn disable_brave_auth_for_session() {
+    let was = BRAVE_AUTH_DISABLED.swap(true, Ordering::SeqCst);
+    if !was {
+        BRAVE_AUTH_UI_NOTICE.store(true, Ordering::SeqCst);
+    }
+}
+
+/// True if tool output reports a rejected Brave subscription/key.
+pub fn web_search_reports_brave_auth_rejected(output: &str) -> bool {
+    output.contains(BRAVE_AUTH_REJECTED_MARKER)
+}
+
+fn brave_auth_error_detail(status: u16, body: &str) -> Option<String> {
+    if status == 401 || status == 403 {
+        return Some(format!("HTTP {status}"));
+    }
+    if status == 422 {
+        // Brave often returns 422 + SUBSCRIPTION_TOKEN_INVALID for bad keys (not 401).
+        let lower = body.to_ascii_lowercase();
+        if lower.contains("subscription_token_invalid")
+            || lower.contains("token is invalid")
+            || lower.contains("invalid subscription")
+            || lower.contains("\"authentication\"")
+        {
+            let code = serde_json::from_str::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/error/code")
+                        .and_then(|c| c.as_str())
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_else(|| "invalid token".into());
+            return Some(format!("HTTP 422 ({code})"));
+        }
+    }
+    None
+}
 
 /// Build a reqwest client with Chrome-like headers for anti-bot evasion.
 fn build_stealth_client_blocking() -> Result<reqwest::blocking::Client, reqwest::Error> {
@@ -83,24 +148,33 @@ fn brave_search(query: &str, count: usize, api_key: &str) -> Result<String, Stri
         .map_err(|e| format!("Brave API request failed: {}", e))?;
 
     let status = resp.status();
-    if status.as_u16() == 429 {
+    let status_u = status.as_u16();
+    let body_text = resp
+        .text()
+        .map_err(|e| format!("Brave response read error: {}", e))?;
+
+    if status_u == 429 {
         return Err(
             "⚠️ Brave Search rate limited. Please wait 10-15 seconds and try again."
                 .to_string(),
         );
     }
-    if status.as_u16() == 401 || status.as_u16() == 403 {
+    if let Some(detail) = brave_auth_error_detail(status_u, &body_text) {
         return Err(format!(
-            "⚠️ Brave API key rejected (HTTP {}). Check your key in Settings.",
-            status
+            "{BRAVE_AUTH_REJECTED_MARKER}: Brave API key rejected ({detail}). \
+             Fix your key in Settings → brave key (or BRAVE_API_KEY)."
         ));
     }
     if !status.is_success() {
-        return Err(format!("Brave API returned HTTP {}", status));
+        let snippet: String = body_text.chars().take(160).collect();
+        return Err(if snippet.is_empty() {
+            format!("Brave API returned HTTP {status}")
+        } else {
+            format!("Brave API returned HTTP {status}: {snippet}")
+        });
     }
 
-    let body: serde_json::Value = resp
-        .json()
+    let body: serde_json::Value = serde_json::from_str(&body_text)
         .map_err(|e| format!("Brave response parse error: {}", e))?;
 
     let results = body
@@ -142,22 +216,46 @@ fn brave_search(query: &str, count: usize, api_key: &str) -> Result<String, Stri
 // ─── Web Search (public) ────────────────────────────────────────────────────
 
 /// Search the web. Uses Brave API if a key is provided, falls back to DuckDuckGo.
+///
+/// On **auth** failure (401/403 or 422 invalid subscription token), Brave is disabled
+/// for the rest of the session and this call falls back to DuckDuckGo so the agent
+/// can still make progress. Rate limits do **not** disable Brave or fall back.
 pub fn web_search(query: &str, count: usize, brave_key: Option<&str>) -> String {
     if query.trim().is_empty() {
         return "Empty search query".to_string();
     }
     let count = count.clamp(1, 12);
 
+    // Auth already failed this session — do not call Brave again.
+    if brave_auth_disabled() {
+        let ddg = ddg_search(query, count);
+        return if ddg.starts_with("🔍") {
+            format!(
+                "{ddg}\n(note: Brave disabled this session — key was rejected; using DuckDuckGo)"
+            )
+        } else {
+            format!(
+                "⚠️ Brave disabled this session (key rejected earlier). DuckDuckGo:\n\n{ddg}"
+            )
+        };
+    }
+
     // Try Brave first if we have a key
     if let Some(key) = brave_key {
         match brave_search(query, count, key) {
             Ok(results) => return results,
             Err(e) => {
-                // On auth errors, don't fall back — tell user to fix key
-                if e.contains("rejected") {
-                    return e;
+                // Auth: disable Brave for session, fall back to DDG (often still useful).
+                if e.contains(BRAVE_AUTH_REJECTED_MARKER) {
+                    disable_brave_auth_for_session();
+                    let ddg = ddg_search(query, count);
+                    return format!(
+                        "⚠️ {e}\n\
+                         Brave will not be retried until you update the key in Settings. \
+                         Falling back to DuckDuckGo (weaker HTML scrape).\n\n{ddg}"
+                    );
                 }
-                // On rate limit, tell user to retry (don't fall back to DDG)
+                // Rate limit: do not fall back — user should wait and retry.
                 if e.contains("rate limited") {
                     return e;
                 }
@@ -654,6 +752,72 @@ fn extract_links(html: &str, base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Process-global Brave auth flags — serialize tests that touch them.
+    fn brave_auth_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    #[test]
+    fn classifies_422_subscription_token_invalid_as_auth() {
+        let body = r#"{"error":{"code":"SUBSCRIPTION_TOKEN_INVALID","detail":"The provided subscription token is invalid.","meta":{"component":"authentication"},"status":422},"type":"ErrorResponse"}"#;
+        let d = brave_auth_error_detail(422, body).expect("auth");
+        assert!(d.contains("422"), "{d}");
+        assert!(d.contains("SUBSCRIPTION_TOKEN_INVALID"), "{d}");
+        assert!(brave_auth_error_detail(401, "").is_some());
+        assert!(brave_auth_error_detail(403, "").is_some());
+        assert!(brave_auth_error_detail(422, r#"{"error":"unprocessable"}"#).is_none());
+        assert!(brave_auth_error_detail(500, body).is_none());
+    }
+
+    #[test]
+    fn auth_disable_is_session_scoped_and_resettable() {
+        let _g = brave_auth_test_lock();
+        reset_brave_auth_disabled();
+        assert!(!brave_auth_disabled());
+        assert!(!take_brave_auth_ui_notice());
+
+        disable_brave_auth_for_session();
+        assert!(brave_auth_disabled());
+        assert!(take_brave_auth_ui_notice());
+        assert!(!take_brave_auth_ui_notice()); // one-shot
+
+        // Second disable while already disabled does not re-arm the notice.
+        disable_brave_auth_for_session();
+        assert!(brave_auth_disabled());
+        assert!(!take_brave_auth_ui_notice());
+
+        reset_brave_auth_disabled();
+        assert!(!brave_auth_disabled());
+    }
+
+    #[test]
+    fn web_search_skips_brave_when_auth_disabled() {
+        let _g = brave_auth_test_lock();
+        reset_brave_auth_disabled();
+        disable_brave_auth_for_session();
+        let _ = take_brave_auth_ui_notice(); // clear notice for isolation
+
+        // Disabled path must not hit Brave (no network). ddg_search may still run.
+        let out = web_search("rust programming language", 3, Some("fake-key-should-not-be-used"));
+        assert!(
+            out.contains("Brave disabled") || out.contains("key was rejected"),
+            "expected session-disabled note, got: {}",
+            &out[..out.len().min(200)]
+        );
+        assert!(!out.contains("Web search (Brave)"), "{out}");
+        assert!(!out.contains(BRAVE_AUTH_REJECTED_MARKER), "{out}");
+        reset_brave_auth_disabled();
+    }
+
+    #[test]
+    fn web_search_reports_marker() {
+        assert!(web_search_reports_brave_auth_rejected(&format!(
+            "⚠️ {BRAVE_AUTH_REJECTED_MARKER}: nope"
+        )));
+        assert!(!web_search_reports_brave_auth_rejected("ok results"));
+    }
 
     #[test]
     fn brave_search_parses_response() {

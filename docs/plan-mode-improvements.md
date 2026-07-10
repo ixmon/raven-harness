@@ -50,6 +50,15 @@ For every step the agent proposes a real check. Weaker tiers (`attested`, `obser
 
 The JSON-driven loop (`plan_loop.rs`) fetches clarify questions, then a proposal. Before the user sees the recap, `improve_proposal()` in `plan_verification.rs` runs harness-side fixes and validation.
 
+### Success criteria vs verification
+
+| Field | Role |
+|-------|------|
+| `success_criteria` | Product / acceptance outcomes (what must be true when done) |
+| `verification[]` / step `verification` | Runnable commands that prove as much as practical |
+
+The proposal system prompt teaches product-level `success_criteria` (cover capabilities named in the goal; do not put shell commands there). Truncation recovery keeps criteria under ~400 characters (not 100). Execution user prompt shows both fields separately. Session meta stores verification as `achievement_tests` and product criteria as `completion_criteria` so the plan pane is not overwritten with joined build commands.
+
 ### Verification tiers
 
 | Tier | Planning | On `complete_plan_step` (execution) |

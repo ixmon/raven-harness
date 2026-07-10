@@ -479,17 +479,22 @@ pub fn apply_settings_actions(
     settings: &mut SettingsModal,
     agent: &Arc<Mutex<Agent>>,
     keystore: &Keystore,
+    toasts: &mut crate::toast::ToastState,
 ) {
     use crate::settings_modal::SettingsAction;
+
+    let _ = left_committed; // kept for call-site stability; user-facing status uses toasts
 
     for action in actions {
         match action {
             SettingsAction::Redraw => {}
             SettingsAction::Close => settings.active = false,
             SettingsAction::Notify(msg) => {
-                left_committed.push(msg);
+                let kind = crate::toast::infer_kind(&msg);
+                toasts.push(crate::toast::Toast::new(msg, kind));
             }
             SettingsAction::Trace(msg) => {
+                // Probe / switch diagnostics stay in the trace pane (often multi-line).
                 trace_lines.push(msg);
             }
             SettingsAction::DisplayUpdate { model, budget } => {
@@ -501,6 +506,8 @@ pub fn apply_settings_actions(
             }
             SettingsAction::BraveKeyUpdated => {
                 settings.brave_key_configured = keystore.has_brave_key();
+                // New key → allow Brave again (previous auth failure was session-scoped).
+                raven_tui::tools::reset_brave_auth_disabled();
                 let brave_key = keystore.get_brave_key();
                 if let Ok(mut ag) = agent.try_lock() {
                     ag.brave_key = brave_key;

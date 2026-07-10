@@ -14,7 +14,11 @@ pub use self::exec::{
     command_uses_sudo, exec, exec_with_exit_code, is_privileged_package_install,
 };
 pub use self::fs::{grep_files, list_dir, patch_file, read_file, write_file};
-pub use self::web::{browse, browse_urls, download_url, web_search};
+pub use self::web::{
+    brave_auth_disabled, browse, browse_urls, download_url, reset_brave_auth_disabled,
+    take_brave_auth_ui_notice, web_search, web_search_reports_brave_auth_rejected,
+    BRAVE_AUTH_REJECTED_MARKER,
+};
 
 pub mod backend;
 

@@ -11,13 +11,25 @@ pub fn format_plan_steps_json_block(steps: &[PlanStep]) -> String {
 }
 
 /// User message when starting work mode after plan approval (includes step list).
+///
+/// Keeps product-level `success_criteria` separate from runnable `verification_steps`
+/// so the agent does not treat build commands as the acceptance bar.
 pub fn format_plan_execution_user_prompt(plan: &PlanState, workspace: &Path) -> String {
     let mut lines = vec![
         "Execute the approved plan.".to_string(),
         format!("Goal: {}", plan.goal),
     ];
     if !plan.success_criteria.is_empty() {
-        lines.push(format!("Success criteria: {}", plan.success_criteria));
+        lines.push(format!(
+            "Success criteria (product outcomes — what must be true when done): {}",
+            plan.success_criteria
+        ));
+    }
+    if !plan.verification_steps.is_empty() {
+        lines.push("Verification commands (runnable checks; not a substitute for success criteria):".to_string());
+        for v in &plan.verification_steps {
+            lines.push(format!("  • {v}"));
+        }
     }
     let steps_data: Vec<PlanStepData> = plan
         .steps
@@ -60,7 +72,8 @@ pub fn format_plan_execution_user_prompt(plan: &PlanState, workspace: &Path) -> 
     lines.push(String::new());
     lines.push(
         "Canonical plan: session wiki plan.md (read with wiki=true). \
-         Follow the approved steps — they define which paths to use."
+         Follow the approved steps — they define which paths to use. \
+         Steps prove progress; success criteria define done."
             .to_string(),
     );
     let step_num = plan.current_step.saturating_add(1);
@@ -223,7 +236,8 @@ mod tests {
     fn execution_user_prompt_lists_steps_and_wiki_hint() {
         let mut plan = PlanState::default();
         plan.goal = "Build game".into();
-        plan.success_criteria = "Runs".into();
+        plan.success_criteria = "Player can fire; enemies explode".into();
+        plan.verification_steps = vec!["cmake --build build".into(), "./build/galaga".into()];
         plan.current_step = 0;
         plan.steps = vec![PlanStep {
             description: "mkdir galaga".into(),
@@ -240,6 +254,12 @@ mod tests {
         assert!(prompt.contains("Begin with step 1"));
         assert!(prompt.contains("Deliverable location"));
         assert!(prompt.contains("galaga/"));
+        // Product criteria stay separate from runnable verification commands.
+        assert!(prompt.contains("Player can fire; enemies explode"));
+        assert!(prompt.contains("Success criteria (product outcomes"));
+        assert!(prompt.contains("Verification commands"));
+        assert!(prompt.contains("cmake --build build"));
+        assert!(!prompt.contains("Success criteria: cmake --build build | ./build/galaga"));
     }
 
     #[test]

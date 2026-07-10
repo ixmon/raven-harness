@@ -117,6 +117,7 @@ pub async fn handle_key(
             &mut app.settings,
             agent,
             keystore,
+            &mut app.toasts,
         );
         if endpoint_switched {
             if let Ok(ag) = agent.try_lock() {
@@ -367,6 +368,7 @@ async fn handle_input_key(
                 // Note: splash focus cycling and overview slide are handled earlier via handle_picker_key for Splash/Overview.
                 if !app.try_slide_to_workspace() {
                     app.focused_pane = crate::app_state::Pane::Right;
+                    app.activate_trace_cursor_in_viewport();
                 }
                 app.needs_redraw = true;
                 return Ok(true);

@@ -183,6 +183,12 @@ pub struct App {
     pub pending_confirmation: Option<crate::confirmation_dialog::ConfirmationDialog>,
     pub needs_redraw: bool,
 
+    /// Transient top-right status toasts (settings notifications, startup, etc.).
+    pub toasts: crate::toast::ToastState,
+
+    /// Rolling live activity for the harness status-bar sparkline.
+    pub live_activity: crate::live_activity::LiveActivity,
+
     // Mode menu
     pub mode_menu_active: bool,
     pub selected_mode_idx: usize,
@@ -315,6 +321,8 @@ impl App {
             last_turn_end: None,
             pending_confirmation: None,
             needs_redraw: true,
+            toasts: crate::toast::ToastState::default(),
+            live_activity: crate::live_activity::LiveActivity::default(),
             mode_menu_active: false,
             selected_mode_idx: 0,
             approval_modes: [
@@ -608,6 +616,7 @@ impl App {
             Pane::Right => Pane::Input,
             Pane::Input => Pane::Left,
         };
+        self.on_focus_changed();
     }
 
     /// Cycle focus backward: Left → Input → Right → Left
@@ -617,6 +626,17 @@ impl App {
             Pane::Input => Pane::Right,
             Pane::Right => Pane::Left,
         };
+        self.on_focus_changed();
+    }
+
+    /// Side effects when the focused pane changes (trace cursor, follow mode).
+    fn on_focus_changed(&mut self) {
+        if self.focused_pane == Pane::Right {
+            self.activate_trace_cursor_in_viewport();
+        } else if self.trace_cursor_active {
+            // Keep selection state but allow auto-follow again if user leaves.
+            // Cursor highlight only paints when focused on Right (draw uses focused_pane).
+        }
     }
 
     pub(crate) fn pane_max_scroll(&self, pane: Pane) -> u16 {
@@ -844,7 +864,10 @@ impl App {
             Pane::Right => {
                 self.right_follow_output = false;
                 self.right_scroll = 0;
-                self.trace_cursor_active = false;
+                // Keep cursor active and park it on the first visible row.
+                if !self.trace_lines.is_empty() {
+                    self.activate_trace_cursor_in_viewport();
+                }
             }
             Pane::Input => return,
         }
@@ -869,7 +892,14 @@ impl App {
             Pane::Right => {
                 self.right_follow_output = false;
                 self.right_scroll = max;
-                self.trace_cursor_active = false;
+                // Park cursor on the last visible fold-aware line.
+                let visible = self.trace_visible_lines();
+                if !visible.is_empty() {
+                    let vis_idx = visible.len().saturating_sub(1);
+                    self.trace_cursor_active = true;
+                    self.trace_cursor =
+                        crate::trace_fold::cursor_line_for_visible(&visible, vis_idx);
+                }
             }
             Pane::Input => return,
         }

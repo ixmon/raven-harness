@@ -393,6 +393,14 @@ impl Agent {
             .await
             .unwrap_or_else(|e| format!("❌ Tool error: {}", e));
 
+            // Brave key rejected: drop session key so we stop re-sending a dead token.
+            if tool_name == "web_search"
+                && (tools::brave_auth_disabled()
+                    || tools::web_search_reports_brave_auth_rejected(&output))
+            {
+                self.brave_key = None;
+            }
+
             let rec = self.record_tool_action(&tool_name, &raw_args, &output);
             let to_model = rec.output_to_model.clone();
             records.push(rec);
