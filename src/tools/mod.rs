@@ -568,6 +568,15 @@ pub fn tools_for_agent(
             }
             tools
         }
+        // Talk: full tools for optional help, but no goal machinery (avoids re-seeding
+        // a stale current_goal mid-conversation). Super Judge already skips talk.
+        "talk" => {
+            let mut tools = all_tools(flags);
+            tools.retain(|t| {
+                t.function.name != "update_goal" && t.function.name != "define_done"
+            });
+            tools
+        }
         _ => all_tools(flags),
     }
 }
@@ -686,6 +695,21 @@ mod tests {
         ));
         assert!(work_names.contains("complete_plan_step"));
         assert!(work_names.contains("revise_plan_step"));
+
+        let talk_names = super::format_tool_names(&super::tools_for_agent(
+            "talk",
+            &flags,
+            super::PlanToolContext::default(),
+        ));
+        assert!(talk_names.contains("exec") || talk_names.contains("read"));
+        assert!(
+            !talk_names.contains("update_goal"),
+            "talk must not expose update_goal"
+        );
+        assert!(
+            !talk_names.contains("define_done"),
+            "talk must not expose define_done"
+        );
     }
 
     #[test]

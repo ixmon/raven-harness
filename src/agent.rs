@@ -947,7 +947,7 @@ History:
 
         let mut msgs = vec![];
         if let Some(s) = &self.session {
-            let injection = s.get_injection_block(&self.config.flags);
+            let injection = s.get_injection_block(&self.config.flags, &self.current_agent_mode());
             let mut combined = if base.content.as_deref().unwrap_or("").is_empty() {
                 injection
             } else {

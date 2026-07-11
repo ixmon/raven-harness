@@ -41,7 +41,11 @@ Modes should be controllable by the *user* (via `/stance <mode>` or similar comm
 - More willingness to respond with explanations, ask clarifying questions, or discuss tradeoffs.
 - Nudges are gentler or suppressed.
 - Useful when the human wants to steer interactively rather than let it run.
-- Goal is still known but de-emphasized in favor of dialogue.
+- **Implemented (harness):** no goal / achievement-tests / completion-criteria in session injection;
+  no criteria judge, define_done, plan-narration, or hard-safety continuation nudges;
+  Super Judge does not run; `update_goal` / `define_done` tools omitted.
+  Stream error + finish_reason=length recovery still apply.
+- Goal may remain on disk in meta for when the user switches back to work, but is not re-injected.
 
 ### think (or research)
 - Reflective / analytical mode.

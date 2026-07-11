@@ -166,6 +166,13 @@ pub struct RecentActionsSummary {
     pub count: usize,
 }
 
+/// Task-oriented steering (criteria judge, define_done, plan-narration, hard-safety
+/// continuation). Off in conversational `"talk"` mode so old goals / completion
+/// criteria do not keep re-nudging a chat.
+pub fn task_steering_enabled(agent_mode: &str) -> bool {
+    agent_mode != "talk"
+}
+
 // ── Steering state ───────────────────────────────────────────────────────────
 
 /// Mutable steering state that tracks nudge budgets and round counts.
@@ -281,6 +288,14 @@ impl SteeringState {
         // that discarded escalate text and left the agent with a weak kick).
         if plan_execution_incomplete(ctx) && ctx.agent_mode == "work" {
             return self.plan_execution_nudge_decision(ctx);
+        }
+
+        // Talk mode: no task judge, define_done, plan-narration thrash, or hard-safety
+        // "keep going" loops. Keep only stream-error / length recovery above.
+        if !task_steering_enabled(&ctx.agent_mode) {
+            return SteeringDecision::Accept {
+                clear_criteria: false,
+            };
         }
 
         // 3. Criteria-based judge
@@ -902,6 +917,57 @@ mod tests {
         let ctx = text_round("Here's the answer to your question.");
         let d = s.decide_no_tools(&ctx, &no_recent());
         assert!(matches!(d, SteeringDecision::Accept { clear_criteria: false }));
+    }
+
+    #[test]
+    fn talk_mode_skips_criteria_judge() {
+        let mut s = judge_enabled_state();
+        s.total_rounds = 3;
+        let mut ctx = text_round("Sure, happy to chat about that.");
+        ctx.agent_mode = "talk".into();
+        ctx.criteria = Some("All unit tests pass and the API is shipped".into());
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        assert!(
+            matches!(d, SteeringDecision::Accept { .. }),
+            "talk must not invoke criteria judge, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn talk_mode_skips_plan_narration_nudge() {
+        let mut s = basic_state();
+        s.total_rounds = 2;
+        let mut ctx = text_round("Let me implement the fix now for you.");
+        ctx.agent_mode = "talk".into();
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        assert!(
+            matches!(d, SteeringDecision::Accept { .. }),
+            "talk must not plan-narration nudge, got {d:?}"
+        );
+    }
+
+    #[test]
+    fn talk_mode_still_recovers_length() {
+        let mut s = basic_state();
+        s.total_rounds = 1;
+        let mut ctx = text_round("partial");
+        ctx.agent_mode = "talk".into();
+        ctx.finish_reason = Some("length".into());
+        let d = s.decide_no_tools(&ctx, &no_recent());
+        match d {
+            SteeringDecision::Nudge { log_detail, .. } => {
+                assert!(log_detail.contains("length-recovery"), "{log_detail}");
+            }
+            other => panic!("expected length recovery, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task_steering_enabled_matrix() {
+        assert!(!task_steering_enabled("talk"));
+        assert!(task_steering_enabled("work"));
+        assert!(task_steering_enabled("plan"));
+        assert!(task_steering_enabled("think"));
     }
 
     fn plan_exec_round(text: &str, step_index: usize, total: usize) -> RoundContext {

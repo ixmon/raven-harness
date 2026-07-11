@@ -553,16 +553,33 @@ impl Session {
 
     /// Return the block that should be injected into the system prompt / early context.
     /// Keep this small and high-signal.
-    pub fn get_injection_block(&self, flags: &crate::runtime::RuntimeFlags) -> String {
+    ///
+    /// `agent_mode` controls task-oriented sections: in `"talk"`, current goal /
+    /// achievement tests / completion criteria are omitted so a stale goal from an
+    /// earlier task does not derail conversational turns.
+    pub fn get_injection_block(
+        &self,
+        flags: &crate::runtime::RuntimeFlags,
+        agent_mode: &str,
+    ) -> String {
         let m = &self.meta;
         let rc = &m.repo_cache;
+        let conversational = agent_mode == "talk";
 
         let mut block = String::new();
         block.push_str("## SESSION CONTEXT (persistent across restarts)\n");
         block.push_str(&format!("Workspace: {}\n", m.workspace.display()));
         block.push_str(&format!("Session: {}\n\n", m.session_id));
 
-        if flags.goal_tracking {
+        if conversational {
+            block.push_str(
+                "### Run mode: talk\n\
+                 Conversational mode — prefer the latest user message. \
+                 Do not resume an old coding goal unless the user asks.\n\n",
+            );
+        }
+
+        if flags.goal_tracking && !conversational {
             block.push_str("### Current Goal\n");
             block.push_str(&m.current_goal);
             block.push_str("\n\n");
