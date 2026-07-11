@@ -896,6 +896,10 @@ pub fn spawn_agent_turn(
                                 .send(crate::event_loop::UiUpdate::ToolResult {
                                     name: "system".into(),
                                     summary: "⏹ Stopped (Esc)".into(),
+                                    detail: "⏹ Stopped (Esc)".into(),
+                                    args: String::new(),
+                                    model_truncated: false,
+                                    raw_bytes: 0,
                                 })
                                 .await;
                             break;
@@ -904,9 +908,13 @@ pub fn spawn_agent_turn(
                             let _ = tx_c
                                 .send(crate::event_loop::UiUpdate::ToolResult {
                                     name: "system".into(),
-                                    summary:
-                                        "🔍 Super Judge: max review cycles reached, accepting"
+                                    summary: "🔍 Super Judge: max review cycles reached, accepting"
                                             .into(),
+                                    detail: "🔍 Super Judge: max review cycles reached, accepting"
+                                            .into(),
+                                    args: String::new(),
+                                    model_truncated: false,
+                                    raw_bytes: 0,
                                 })
                                 .await;
                             break;
@@ -919,6 +927,10 @@ pub fn spawn_agent_turn(
                                 .send(crate::event_loop::UiUpdate::ToolResult {
                                     name: "system".into(),
                                     summary: "⏹ Stopped (Esc)".into(),
+                                    detail: "⏹ Stopped (Esc)".into(),
+                                    args: String::new(),
+                                    model_truncated: false,
+                                    raw_bytes: 0,
                                 })
                                 .await;
                             break;
@@ -926,13 +938,18 @@ pub fn spawn_agent_turn(
                         let _ = tx_c
                             .send(crate::event_loop::UiUpdate::SuperJudgeBegin)
                             .await;
+                        let review_msg = format!(
+                            "🔍 Super Judge reviewing work (cycle {}/{})",
+                            cycle, MAX_SUPER_JUDGE_CYCLES
+                        );
                         let _ = tx_c
                             .send(crate::event_loop::UiUpdate::ToolResult {
                                 name: "system".into(),
-                                summary: format!(
-                                    "🔍 Super Judge reviewing work (cycle {}/{})",
-                                    cycle, MAX_SUPER_JUDGE_CYCLES
-                                ),
+                                summary: review_msg.clone(),
+                                detail: review_msg,
+                                args: String::new(),
+                                model_truncated: false,
+                                raw_bytes: 0,
                             })
                             .await;
 
@@ -947,6 +964,10 @@ pub fn spawn_agent_turn(
                                 .send(crate::event_loop::UiUpdate::ToolResult {
                                     name: "system".into(),
                                     summary: "⏹ Stopped (Esc)".into(),
+                                    detail: "⏹ Stopped (Esc)".into(),
+                                    args: String::new(),
+                                    model_truncated: false,
+                                    raw_bytes: 0,
                                 })
                                 .await;
                             break;
@@ -954,13 +975,17 @@ pub fn spawn_agent_turn(
 
                         match verdict {
                             raven_tui::super_judge::SuperJudgeVerdict::Complete { note } => {
+                                let msg = format!(
+                                    "🔍 Super Judge: WORK_COMPLETE — {note}"
+                                );
                                 let _ = tx_c
                                     .send(crate::event_loop::UiUpdate::ToolResult {
                                         name: "system".into(),
-                                        summary: format!(
-                                            "🔍 Super Judge: WORK_COMPLETE — {}",
-                                            note
-                                        ),
+                                        summary: msg.clone(),
+                                        detail: msg,
+                                        args: String::new(),
+                                        model_truncated: false,
+                                        raw_bytes: 0,
                                     })
                                     .await;
                                 break;
@@ -971,6 +996,11 @@ pub fn spawn_agent_turn(
                                         name: "system".into(),
                                         summary: "🔍 Super Judge: NEEDS_WORK — nudging agent"
                                             .to_string(),
+                                        detail: "🔍 Super Judge: NEEDS_WORK — nudging agent"
+                                            .to_string(),
+                                        args: String::new(),
+                                        model_truncated: false,
+                                        raw_bytes: 0,
                                     })
                                     .await;
                                 if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
@@ -978,6 +1008,10 @@ pub fn spawn_agent_turn(
                                         .send(crate::event_loop::UiUpdate::ToolResult {
                                             name: "system".into(),
                                             summary: "⏹ Stopped (Esc)".into(),
+                                            detail: "⏹ Stopped (Esc)".into(),
+                                            args: String::new(),
+                                            model_truncated: false,
+                                            raw_bytes: 0,
                                         })
                                         .await;
                                     break;
@@ -1005,13 +1039,17 @@ pub fn spawn_agent_turn(
                                 }
                             }
                             raven_tui::super_judge::SuperJudgeVerdict::DeathSpiral { feedback } => {
+                                let msg = format!(
+                                    "🔍 Super Judge: DEATH_SPIRAL detected — {feedback}"
+                                );
                                 let _ = tx_c
                                     .send(crate::event_loop::UiUpdate::ToolResult {
                                         name: "system".into(),
-                                        summary: format!(
-                                            "🔍 Super Judge: DEATH_SPIRAL detected — {}",
-                                            feedback
-                                        ),
+                                        summary: msg.clone(),
+                                        detail: msg,
+                                        args: String::new(),
+                                        model_truncated: false,
+                                        raw_bytes: 0,
                                     })
                                     .await;
                                 if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1019,6 +1057,10 @@ pub fn spawn_agent_turn(
                                         .send(crate::event_loop::UiUpdate::ToolResult {
                                             name: "system".into(),
                                             summary: "⏹ Stopped (Esc)".into(),
+                                            detail: "⏹ Stopped (Esc)".into(),
+                                            args: String::new(),
+                                            model_truncated: false,
+                                            raw_bytes: 0,
                                         })
                                         .await;
                                     break;
@@ -1047,10 +1089,15 @@ pub fn spawn_agent_turn(
                                 break;
                             }
                             raven_tui::super_judge::SuperJudgeVerdict::Skipped { reason } => {
+                                let msg = format!("🔍 Super Judge: skipped — {reason}");
                                 let _ = tx_c
                                     .send(crate::event_loop::UiUpdate::ToolResult {
                                         name: "system".into(),
-                                        summary: format!("🔍 Super Judge: skipped — {}", reason),
+                                        summary: msg.clone(),
+                                        detail: msg,
+                                        args: String::new(),
+                                        model_truncated: false,
+                                        raw_bytes: 0,
                                     })
                                     .await;
                                 break;

@@ -792,6 +792,18 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Collapse finished tool/thought blocks (keep error blocks expanded via fold rules).
+    /// Used when a new tool starts or a turn settles — live block stays expanded until then.
+    pub fn collapse_settled_tool_blocks(&mut self) {
+        if self.trace_expanded.is_empty() {
+            return;
+        }
+        let blocks = crate::trace_fold::detect_tool_blocks(&self.trace_lines);
+        self.trace_expanded
+            .retain(|idx| blocks.iter().any(|b| b.header_idx == *idx && b.is_error));
+        self.needs_redraw = true;
+    }
+
     /// Jump scroll position from a click/drag on the pane scrollbar track.
     pub fn scroll_pane_from_row(&mut self, pane: Pane, row: u16) {
         let (area, line_count, content_h, scroll, follow) = match pane {
