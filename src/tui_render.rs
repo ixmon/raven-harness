@@ -311,11 +311,12 @@ pub fn breadcrumb_target_at(
 
 pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
     let show_spark = data.activity.iter().any(|&v| v > 0) && area.width >= 28;
-    // Right-side sparkline slot (label + bars); left holds the usual status fields.
+    // Right-side sparkline only (no label — short tags read as truncated words on
+    // narrow bars). Width can later follow a CSS media-query-style density pass.
     let spark_w = if show_spark {
-        (data.activity.len() as u16 + 10)
+        (data.activity.len() as u16 + 2)
             .min(area.width / 3)
-            .max(14)
+            .max(12)
     } else {
         0
     };
@@ -396,21 +397,10 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
     f.render_widget(Paragraph::new(Line::from(spans)), text_area);
 
     if let Some(sa) = spark_area {
-        let parts = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(6), Constraint::Min(4)])
-            .split(sa);
-        f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                " act ",
-                Style::default().fg(Color::DarkGray),
-            ))),
-            parts[0],
-        );
         let spark = Sparkline::default()
             .data(data.activity)
             .style(Style::default().fg(Color::Rgb(0xa0, 0x80, 0xff)));
-        f.render_widget(spark, parts[1]);
+        f.render_widget(spark, sa);
     }
 }
 
