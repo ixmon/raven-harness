@@ -754,7 +754,10 @@ pub fn draw_confirmation_modal(
             "[N]",
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("o (Esc)", Style::default().fg(Color::Gray)),
+        Span::styled(
+            "o / Esc deny+pause  (type freely if input not empty)",
+            Style::default().fg(Color::Gray),
+        ),
     ]));
 
     let popup = Paragraph::new(Text::from(popup_lines)).block(

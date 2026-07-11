@@ -181,6 +181,14 @@ pub struct App {
 
     // Modal confirmations (tool approval, plan entry, …)
     pub pending_confirmation: Option<crate::confirmation_dialog::ConfirmationDialog>,
+    /// Tool approvals waiting until the input is idle and empty (or until pause clears).
+    pub deferred_approvals:
+        std::collections::VecDeque<(String, tokio::sync::oneshot::Sender<bool>)>,
+    /// After an explicit tool deny/Esc: auto-deny further approvals until the user
+    /// sends a message (or otherwise clears the pause).
+    pub approvals_paused: bool,
+    /// Last time the user edited the input box (for approval debounce).
+    pub last_input_activity: Option<std::time::Instant>,
     pub needs_redraw: bool,
 
     /// Transient top-right status toasts (settings notifications, startup, etc.).
@@ -320,6 +328,9 @@ impl App {
             last_token_time: None,
             last_turn_end: None,
             pending_confirmation: None,
+            deferred_approvals: std::collections::VecDeque::new(),
+            approvals_paused: false,
+            last_input_activity: None,
             needs_redraw: true,
             toasts: crate::toast::ToastState::default(),
             live_activity: crate::live_activity::LiveActivity::default(),
@@ -444,11 +455,102 @@ impl App {
             && !matches!(self.focused_pane, Pane::Input)
     }
 
+    /// How long the input must be idle (and empty) before showing a tool approval.
+    pub const APPROVAL_INPUT_IDLE: std::time::Duration = std::time::Duration::from_millis(1500);
+
+    /// Record that the user is editing the input (debounces approval modals).
+    pub fn touch_input_activity(&mut self) {
+        self.last_input_activity = Some(std::time::Instant::now());
+    }
+
+    /// True when it is safe to show a y/n tool approval modal.
+    pub fn input_ready_for_approval_modal(&self) -> bool {
+        if self.approvals_paused {
+            return false;
+        }
+        if !self.input.trim().is_empty() {
+            return false;
+        }
+        match self.last_input_activity {
+            None => true,
+            Some(t) => t.elapsed() >= Self::APPROVAL_INPUT_IDLE,
+        }
+    }
+
+    /// Auto-deny any queued tool approvals (e.g. after pause/deny).
+    pub fn deny_deferred_approvals(&mut self) {
+        while let Some((_, responder)) = self.deferred_approvals.pop_front() {
+            let _ = responder.send(false);
+        }
+    }
+
+    /// Clear the post-deny pause so new approvals may be shown again.
+    pub fn clear_approvals_pause(&mut self) {
+        self.approvals_paused = false;
+    }
+
+    /// Receive a tool approval request: show now, defer until idle, or auto-deny if paused.
+    pub fn enqueue_tool_approval(
+        &mut self,
+        description: String,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    ) {
+        if self.approvals_paused {
+            let _ = responder.send(false);
+            return;
+        }
+        if self.pending_confirmation.is_some() || !self.input_ready_for_approval_modal() {
+            self.deferred_approvals.push_back((description, responder));
+            self.needs_redraw = true;
+            return;
+        }
+        self.pending_confirmation =
+            Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
+                description,
+                responder,
+            });
+        self.needs_redraw = true;
+    }
+
+    /// Promote one deferred approval to the modal when input is ready.
+    pub fn promote_deferred_approval(&mut self) {
+        if self.pending_confirmation.is_some() || self.approvals_paused {
+            return;
+        }
+        if !self.input_ready_for_approval_modal() {
+            return;
+        }
+        if let Some((description, responder)) = self.deferred_approvals.pop_front() {
+            self.pending_confirmation =
+                Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
+                    description,
+                    responder,
+                });
+            self.needs_redraw = true;
+        }
+    }
+
+    fn deny_tool_approval_and_pause(
+        &mut self,
+        responder: tokio::sync::oneshot::Sender<bool>,
+    ) -> crate::confirmation_dialog::ConfirmationKeyOutcome {
+        let _ = responder.send(false);
+        self.approvals_paused = true;
+        self.deny_deferred_approvals();
+        self.left_committed
+            .push("⛔ Action denied — agent paused so you can type".to_string());
+        self.left_follow_output = true;
+        self.left_scroll = 10_000;
+        self.needs_redraw = true;
+        crate::confirmation_dialog::ConfirmationKeyOutcome::ToolDeniedPause
+    }
+
     /// Insert a character at the current cursor position.
     pub fn insert_char(&mut self, c: char) {
         self.clamp_cursor();
         self.input.insert(self.cursor_pos, c);
         self.cursor_pos += c.len_utf8();
+        self.touch_input_activity();
     }
 
     pub fn insert_str_at_cursor(&mut self, s: &str) {
@@ -458,14 +560,21 @@ impl App {
         self.clamp_cursor();
         self.input.insert_str(self.cursor_pos, s);
         self.cursor_pos += s.len();
+        self.touch_input_activity();
     }
 
     pub fn apply_edit_action(&mut self, action: EditAction) {
         match action {
             EditAction::Insert(c) => self.insert_char(c),
             EditAction::InsertStr(s) => self.insert_str_at_cursor(&s),
-            EditAction::Backspace => self.delete_char_before(),
-            EditAction::Delete => self.delete_char_at(),
+            EditAction::Backspace => {
+                self.delete_char_before();
+                self.touch_input_activity();
+            }
+            EditAction::Delete => {
+                self.delete_char_at();
+                self.touch_input_activity();
+            }
             EditAction::Left => self.move_cursor_left(),
             EditAction::Right => self.move_cursor_right(),
             EditAction::Home => self.move_cursor_home(),
@@ -1026,6 +1135,8 @@ impl App {
             Some(crate::confirmation_dialog::ConfirmationDialog::PlanEntry { .. }) => {}
             None => {}
         }
+        self.deny_deferred_approvals();
+        self.clear_approvals_pause();
         self.left_committed
             .push(format!("You (interject, now): {}", text));
         self.trace_lines
@@ -1073,6 +1184,11 @@ impl App {
     }
 
     /// Handle a key when a confirmation modal is open.
+    ///
+    /// Tool approval `y`/`n` only apply when the input box is empty (so typing a
+    /// clarification does not accidentally approve/deny). Esc always denies a tool
+    /// approval and pauses the turn. Other keys re-queue the approval and fall
+    /// through to normal input handling.
     pub fn handle_confirmation_key(
         &mut self,
         key: crossterm::event::KeyEvent,
@@ -1081,29 +1197,60 @@ impl App {
         let Some(dialog) = self.pending_confirmation.take() else {
             return ConfirmationKeyOutcome::NotHandled;
         };
-        let confirmed = match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => true,
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => false,
-            _ => {
-                self.pending_confirmation = Some(dialog);
-                return ConfirmationKeyOutcome::Handled;
-            }
-        };
+        let input_empty = self.input.trim().is_empty();
+
         match dialog {
-            ConfirmationDialog::ToolApproval { responder, .. } => {
-                let _ = responder.send(confirmed);
-                self.left_committed.push(if confirmed {
-                    "✅ Action approved".to_string()
-                } else {
-                    "⛔ Action denied".to_string()
-                });
-                self.left_follow_output = true;
-                self.left_scroll = 10_000;
-                ConfirmationKeyOutcome::Handled
-            }
-            ConfirmationDialog::PlanEntry { goal } => ConfirmationKeyOutcome::PlanEntry {
-                goal,
-                confirmed,
+            ConfirmationDialog::ToolApproval {
+                description,
+                responder,
+            } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if input_empty => {
+                    let _ = responder.send(true);
+                    self.left_committed
+                        .push("✅ Action approved".to_string());
+                    self.left_follow_output = true;
+                    self.left_scroll = 10_000;
+                    ConfirmationKeyOutcome::Handled
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if input_empty => {
+                    self.deny_tool_approval_and_pause(responder)
+                }
+                KeyCode::Esc => self.deny_tool_approval_and_pause(responder),
+                _ => {
+                    // Typing / non-empty y/n: hide modal, defer approval, let input get the key.
+                    self.deferred_approvals
+                        .push_front((description, responder));
+                    self.touch_input_activity();
+                    ConfirmationKeyOutcome::NotHandled
+                }
+            },
+            ConfirmationDialog::PlanEntry { goal } => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') if input_empty => {
+                    ConfirmationKeyOutcome::PlanEntry {
+                        goal,
+                        confirmed: true,
+                    }
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if input_empty => {
+                    ConfirmationKeyOutcome::PlanEntry {
+                        goal,
+                        confirmed: false,
+                    }
+                }
+                KeyCode::Esc => ConfirmationKeyOutcome::PlanEntry {
+                    goal,
+                    confirmed: false,
+                },
+                _ => {
+                    // Keep modal; non-y/n keys fall through only when typing into input.
+                    self.pending_confirmation =
+                        Some(ConfirmationDialog::PlanEntry { goal });
+                    if input_empty {
+                        ConfirmationKeyOutcome::Handled
+                    } else {
+                        ConfirmationKeyOutcome::NotHandled
+                    }
+                }
             },
         }
     }

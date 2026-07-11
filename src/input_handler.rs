@@ -532,6 +532,7 @@ async fn handle_input_key(
                 }
                 // Submit queued interject or instant interject (not slash menu attempts)
                 if !prompt.starts_with('/') {
+                    app.clear_approvals_pause();
                     if is_ctrl {
                         app.submit_instant_interject(
                             app.input.clone(),
@@ -663,6 +664,7 @@ async fn handle_input_key(
                 if !agent_prompt.starts_with("Execute the approved plan.") {
                     app.left_committed.push(format!("> {}", agent_prompt));
                 }
+                app.clear_approvals_pause();
                 app.clear_input();
                 app.needs_redraw = true;
 

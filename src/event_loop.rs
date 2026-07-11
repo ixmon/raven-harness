@@ -949,16 +949,11 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Tool approval requests from TuiObserver::approve_tool().
-        // The observer sends (description, oneshot::Sender<bool>) when a tool needs
-        // user approval. We store them so the UI can show the popup and the key
-        // handler can respond with Y/N.
+        // Defer while the user is typing / input non-empty; auto-deny if approvals_paused.
         while let Ok((desc, responder)) = approval_req_rx.try_recv() {
-            app.pending_confirmation = Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
-                description: desc,
-                responder,
-            });
-            app.needs_redraw = true;
+            app.enqueue_tool_approval(desc, responder);
         }
+        app.promote_deferred_approval();
 
         // Defensive cleanup: never allow brain icon prepended to tool call/debug lines
         // (🔧 start or indented ↳ result). Ensures single tool icon at start of each tool block.
@@ -1391,6 +1386,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                 match app.handle_confirmation_key(*k) {
                     crate::confirmation_dialog::ConfirmationKeyOutcome::NotHandled => {}
                     crate::confirmation_dialog::ConfirmationKeyOutcome::Handled => {
+                        app.needs_redraw = true;
+                        continue;
+                    }
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::ToolDeniedPause => {
+                        // Stop the in-flight turn so further tools do not pile up.
+                        stop_signal.store(true, Ordering::SeqCst);
+                        app.trace_lines.push(
+                            "⏹ Agent paused after deny — type a message or wait for the turn to end"
+                                .to_string(),
+                        );
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
                         app.needs_redraw = true;
                         continue;
                     }

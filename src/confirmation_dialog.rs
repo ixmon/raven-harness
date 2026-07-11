@@ -64,7 +64,11 @@ impl ConfirmationDialog {
 /// Result of handling a key while a confirmation modal is open.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConfirmationKeyOutcome {
+    /// No modal, or key should fall through to normal input handling.
     NotHandled,
+    /// Modal consumed the key (approved, or internal handling).
     Handled,
+    /// User denied a tool approval — pause the agent turn so they can type.
+    ToolDeniedPause,
     PlanEntry { goal: String, confirmed: bool },
 }
