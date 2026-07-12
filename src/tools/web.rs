@@ -204,8 +204,8 @@ fn brave_search(query: &str, count: usize, api_key: &str) -> Result<String, Stri
             .unwrap_or("");
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, title, url));
         if !desc.is_empty() {
-            // Truncate descriptions to keep context manageable
-            let desc_trunc = if desc.len() > 300 { &desc[..300] } else { desc };
+            // Char-safe truncate (byte slices panic on multi-byte chars, e.g. '·').
+            let desc_trunc = super::safe_truncate(desc, 300);
             out.push_str(&format!("   {}\n", desc_trunc));
         }
         out.push('\n');
@@ -817,6 +817,20 @@ mod tests {
             "⚠️ {BRAVE_AUTH_REJECTED_MARKER}: nope"
         )));
         assert!(!web_search_reports_brave_auth_rejected("ok results"));
+    }
+
+    #[test]
+    fn search_desc_truncate_does_not_split_multibyte_char() {
+        // Panic was: &desc[..300] when byte 300 landed inside '·' (U+00B7, 2 bytes).
+        let mut desc = "a".repeat(299);
+        desc.push('·');
+        desc.push_str(" more text after the middot");
+        let trunc = crate::tools::safe_truncate(&desc, 300);
+        assert!(trunc.len() <= 300);
+        assert!(desc.is_char_boundary(trunc.len()));
+        assert!(!trunc.ends_with('\u{FFFD}'));
+        // Must not panic if used like the old code path intended.
+        let _ = format!("   {}\n", trunc);
     }
 
     #[test]
