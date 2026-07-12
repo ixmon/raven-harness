@@ -81,7 +81,7 @@ pub fn map_key_to_edit(key: &KeyEvent) -> Option<EditAction> {
             '\t' | '\n' | '\r' => None,
             c if c.is_control() => None,
             // Don't insert when Control/Alt is held (except bindings above)
-            c if ctrl || key.modifiers.contains(KeyModifiers::ALT) => None,
+            _ if ctrl || key.modifiers.contains(KeyModifiers::ALT) => None,
             c => Some(EditAction::Insert(c)),
         },
         _ => None,
