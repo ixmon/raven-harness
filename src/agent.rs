@@ -43,19 +43,56 @@ const SUMMARY_CHAR_LIMIT: usize = 1600;
 const GOAL_TRUNCATE: usize = 160;
 const RECENT_SUMMARY_TRUNCATE: usize = 1800;
 
+/// Max sanitized tool output kept for the operator trace (not the model).
+const UI_TOOL_OUTPUT_CAP: usize = 256 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ActionRecord {
     pub tool: String,
-    #[allow(dead_code)]
     pub args: String,
+    /// Short teaser (first line of model payload) for collapsed chrome.
     pub summary: String,
     /// Sanitized + truncated payload fed back to the model.
     pub output_to_model: String,
-    #[allow(dead_code)]
+    /// Sanitized output for the human trace pane (larger cap; never injected as model context).
+    pub output_for_ui: String,
     pub raw_bytes: usize,
+    /// True when `output_to_model` was truncated for context budget.
     pub truncated: bool,
     /// Rough token estimate for the content sent to the model (for cache/efficiency metrics).
     pub estimated_tokens: u32,
+}
+
+impl ActionRecord {
+    /// Harness/system trace line (nudge, judge, denial) — same text for UI and summary.
+    pub fn system_trace(summary: impl Into<String>) -> Self {
+        let summary = summary.into();
+        Self {
+            tool: "system".into(),
+            args: String::new(),
+            summary: summary.clone(),
+            output_to_model: String::new(),
+            output_for_ui: summary,
+            raw_bytes: 0,
+            truncated: false,
+            estimated_tokens: 0,
+        }
+    }
+
+    /// Denial or other non-execution outcome for a named tool.
+    pub fn tool_notice(tool: &str, args: &str, message: impl Into<String>) -> Self {
+        let message = message.into();
+        Self {
+            tool: tool.to_string(),
+            args: args.to_string(),
+            summary: message.clone(),
+            output_to_model: message.clone(),
+            output_for_ui: message,
+            raw_bytes: 0,
+            truncated: false,
+            estimated_tokens: 5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -288,12 +325,23 @@ impl Agent {
         let budget = self.config.context_budget.tool_result_bytes;
         let truncated = sanitized.len() > budget;
         let to_model = self.truncate_for_context(&sanitized);
+        let output_for_ui = if sanitized.len() > UI_TOOL_OUTPUT_CAP {
+            format!(
+                "{}...\n... ({} bytes total, UI capped at {} for display)",
+                tools::safe_truncate(&sanitized, UI_TOOL_OUTPUT_CAP),
+                sanitized.len(),
+                UI_TOOL_OUTPUT_CAP
+            )
+        } else {
+            sanitized
+        };
         let estimated = estimate_tokens(&to_model);
         ActionRecord {
             tool: tool.to_string(),
             args: args.to_string(),
             summary: to_model.lines().next().unwrap_or("").to_string(),
             output_to_model: to_model,
+            output_for_ui,
             raw_bytes: raw_output.len(),
             truncated,
             estimated_tokens: estimated,
@@ -369,15 +417,7 @@ impl Agent {
             if let Some(denial) = self.plan_mode_denial(&tool_name, &raw_args) {
                 self.record_tool_denial(tc, &denial);
                 // Create a record so the driver surfaces it in the trace pane too.
-                let rec = ActionRecord {
-                    tool: tool_name.clone(),
-                    args: raw_args.clone(),
-                    summary: denial.clone(),
-                    output_to_model: denial,
-                    raw_bytes: 0,
-                    truncated: false,
-                    estimated_tokens: 10,
-                };
+                let rec = ActionRecord::tool_notice(&tool_name, &raw_args, denial);
                 records.push(rec);
                 continue;
             }

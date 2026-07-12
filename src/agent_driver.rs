@@ -366,15 +366,11 @@ pub async fn drive_turn_with_tools(
                 if let Some(denial) = agent.plan_mode_denial(&tc.function.name, &tc.function.arguments) {
                     agent.record_tool_denial(tc, &denial);
                     // Surface the denial in the trace pane immediately.
-                    let rec = crate::agent::ActionRecord {
-                        tool: tc.function.name.clone(),
-                        args: tc.function.arguments.clone(),
-                        summary: denial.clone(),
-                        output_to_model: denial.clone(),
-                        raw_bytes: 0,
-                        truncated: false,
-                        estimated_tokens: 5,
-                    };
+                    let rec = crate::agent::ActionRecord::tool_notice(
+                        &tc.function.name,
+                        &tc.function.arguments,
+                        denial,
+                    );
                     observer.on_tool_result(&rec);
                     continue;
                 }
@@ -548,15 +544,7 @@ async fn execute_decision(
             agent.log_harness_event_with_round(&log_event, &log_detail, steering.total_rounds);
 
             // Emit a system trace record for visibility
-            observer.on_tool_result(&ActionRecord {
-                tool: "system".into(),
-                args: "".into(),
-                summary: log_detail,
-                output_to_model: "".into(),
-                raw_bytes: 0,
-                truncated: false,
-                estimated_tokens: 0,
-            });
+            observer.on_tool_result(&ActionRecord::system_trace(log_detail));
 
             if use_continuation_nudge {
                 agent.push_continuation_nudge();
@@ -573,15 +561,7 @@ async fn execute_decision(
 
             // Log the judge decision
             let summary = format!("⭐ JUDGE ({}): {:?}", context, verdict);
-            observer.on_tool_result(&ActionRecord {
-                tool: "system".into(),
-                args: "".into(),
-                summary: summary.clone(),
-                output_to_model: "".into(),
-                raw_bytes: 0,
-                truncated: false,
-                estimated_tokens: 0,
-            });
+            observer.on_tool_result(&ActionRecord::system_trace(summary.clone()));
             agent.log_harness_event_with_round("judge", &summary, steering.total_rounds);
 
             // Store in session for quick access

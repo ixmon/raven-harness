@@ -34,7 +34,19 @@ pub enum UiUpdate {
     Token(String),
     Thinking(String),
     ToolStart { name: String, args: String },
-    ToolResult { name: String, summary: String },
+    /// Tool finished. `summary` is the collapsed teaser; `detail` is the operator-facing
+    /// body (full args context + output). Model context is unaffected.
+    ToolResult {
+        name: String,
+        summary: String,
+        /// Full body for the trace fold (empty → use `summary` only, e.g. system lines).
+        detail: String,
+        /// Full tool args JSON/text for expand view.
+        args: String,
+        /// Model payload was truncated for context budget.
+        model_truncated: bool,
+        raw_bytes: usize,
+    },
     /// Plan execution progress (sent while agent mutex is held — no try_lock needed).
     PlanSync(raven_tui::plan_md::PlanExecutionState),
     RoundLimitHit {
@@ -82,9 +94,22 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Max body lines kept in the trace pane for a single tool result (expandable).
-const TRACE_RESULT_MAX_LINES: usize = 48;
+const TRACE_RESULT_MAX_LINES: usize = 200;
 /// Soft wrap width for long result lines so they stay one-row tall (no pane wrap).
 const TRACE_RESULT_WRAP: usize = 96;
+
+/// Helper for system/nudge ToolResult updates (summary-only).
+fn system_tool_result(summary: impl Into<String>) -> UiUpdate {
+    let summary = summary.into();
+    UiUpdate::ToolResult {
+        name: "system".into(),
+        summary: summary.clone(),
+        detail: summary,
+        args: String::new(),
+        model_truncated: false,
+        raw_bytes: 0,
+    }
+}
 
 /// Push a tool result into `trace_lines` as a multi-line block body.
 /// Returns the primary display line (for persistence / first-line summary).
@@ -231,28 +256,38 @@ impl TurnObserver for TuiObserver {
     fn on_token(&mut self, t: &str) { let _ = self.tx.try_send(UiUpdate::Token(t.to_string())); }
     fn on_thinking(&mut self, t: &str) { let _ = self.tx.try_send(UiUpdate::Thinking(t.to_string())); }
     fn on_tool_start(&mut self, name: &str, args: &str) {
-        let _ = self.tx.try_send(UiUpdate::ToolStart { name: name.to_string(), args: args.to_string() });
+        let _ = self.tx.try_send(UiUpdate::ToolStart {
+            name: name.to_string(),
+            args: args.to_string(),
+        });
     }
     fn on_tool_result(&mut self, record: &ActionRecord) {
-        let _ = self.tx.try_send(UiUpdate::ToolResult { name: record.tool.clone(), summary: record.summary.clone() });
+        let _ = self.tx.try_send(UiUpdate::ToolResult {
+            name: record.tool.clone(),
+            summary: record.summary.clone(),
+            detail: record.output_for_ui.clone(),
+            args: record.args.clone(),
+            model_truncated: record.truncated,
+            raw_bytes: record.raw_bytes,
+        });
     }
     fn on_plan_sync(&mut self, state: &raven_tui::plan_execution::PlanExecutionState) {
         let _ = self.tx.try_send(UiUpdate::PlanSync(state.clone()));
     }
     fn on_nudge(&mut self, count: u32, max: u32) {
-        let _ = self.tx.try_send(UiUpdate::ToolResult {
-            name: "system".into(),
-            summary: format!("Nudging agent to continue (text-only pause {}/{})", count, max),
-        });
+        let _ = self.tx.try_send(system_tool_result(format!(
+            "Nudging agent to continue (text-only pause {}/{})",
+            count, max
+        )));
     }
     fn on_round_limit(&mut self, continuation: u32, max: u32, exhausted: bool) {
         let _ = self.tx.try_send(UiUpdate::RoundLimitHit { continuation, max_continuations: max, exhausted });
     }
     fn on_stuck(&mut self, reason: &str, suggested: &str) {
-        let _ = self.tx.try_send(UiUpdate::ToolResult {
-            name: "system".into(),
-            summary: format!("⚠ Agent looping: {}. Ask user: {}", reason, suggested),
-        });
+        let _ = self.tx.try_send(system_tool_result(format!(
+            "⚠ Agent looping: {}. Ask user: {}",
+            reason, suggested
+        )));
     }
     fn on_context_usage(&mut self, tokens: u32) {
         let _ = self.tx.try_send(UiUpdate::ContextUsage { used_tokens: tokens });
@@ -285,12 +320,24 @@ impl TurnObserver for TuiObserver {
             _ => {
                 let deny = format!("DENIED: The user refused to approve this {} action. Do NOT retry the same action.", name);
                 self.denials_this_turn += 1;
-                let _ = self.tx.send(UiUpdate::ToolResult { name: name.clone(), summary: deny.clone() }).await;
+                let _ = self
+                    .tx
+                    .send(UiUpdate::ToolResult {
+                        name: name.clone(),
+                        summary: deny.clone(),
+                        detail: deny.clone(),
+                        args: args.to_string(),
+                        model_truncated: false,
+                        raw_bytes: 0,
+                    })
+                    .await;
                 if self.denials_this_turn >= 3 {
-                    let _ = self.tx.send(UiUpdate::ToolResult {
-                        name: "system".into(),
-                        summary: "3 actions denied this turn — stopping tool loop.".into(),
-                    }).await;
+                    let _ = self
+                        .tx
+                        .send(system_tool_result(
+                            "3 actions denied this turn — stopping tool loop.",
+                        ))
+                        .await;
                     self.halt_tools = true;
                 }
                 false
@@ -605,9 +652,19 @@ async fn run_app<B: ratatui::backend::Backend>(
                     maybe_follow_trace(&mut app);
                 }
                 UiUpdate::ToolStart { name, args } => {
-                    // Always ensure tool debug lines start with the tool call icon at the front.
-                    let tool_debug = format!("🔧 {}({})", name, truncate(&args, 90));
+                    // Collapse prior tool blocks (like settling thought) so only the live
+                    // call stays expanded — errors remain expanded via fold rules.
+                    app.collapse_settled_tool_blocks();
+
+                    let header_idx = app.trace_lines.len();
+                    let short_args = truncate(&args, 90);
+                    let tool_debug = format!("🔧 {}({})", name, short_args);
                     app.trace_lines.push(tool_debug.clone());
+                    // Full args under the header when truncated or multi-line.
+                    if args.chars().count() > 90 || args.contains('\n') {
+                        push_tool_result_lines(&mut app.trace_lines, &format!("args: {args}"));
+                    }
+                    app.trace_expanded.insert(header_idx);
                     app.persist_trace_event(&raven_tui::session::TraceEvent::tool_start(
                         &name, &args, &tool_debug,
                     ));
@@ -623,7 +680,14 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.needs_redraw = true;
                     }
                 }
-                UiUpdate::ToolResult { name, summary } => {
+                UiUpdate::ToolResult {
+                    name,
+                    summary,
+                    detail,
+                    args,
+                    model_truncated,
+                    raw_bytes,
+                } => {
                     let display = if name == "system" && summary.contains("JUDGE") {
                         let d = format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140));
                         app.trace_lines.push(d.clone());
@@ -631,11 +695,49 @@ async fn run_app<B: ratatui::backend::Backend>(
                     } else if name == "system" {
                         // system debug notes (nudges, stuck, denials etc.) keep a 🔧 marker
                         let d = format!("🔧 {}", truncate(&summary, 120));
+                        let header_idx = app.trace_lines.len();
                         app.trace_lines.push(d.clone());
+                        if detail.lines().count() > 1 {
+                            push_tool_result_lines(&mut app.trace_lines, &detail);
+                            app.trace_expanded.insert(header_idx);
+                        }
                         d
                     } else {
-                        // Multi-line body so expand/collapse reveals more than a one-liner.
-                        push_tool_result_lines(&mut app.trace_lines, &summary)
+                        // Attach result body to the open tool block (last 🔧 header).
+                        // Prefer operator detail; fall back to summary teaser.
+                        let mut body = String::new();
+                        if !args.is_empty()
+                            && !app
+                                .trace_lines
+                                .iter()
+                                .rev()
+                                .take(30)
+                                .any(|l| l.contains("args:"))
+                            && (args.chars().count() > 90 || args.contains('\n'))
+                        {
+                            body.push_str("args: ");
+                            body.push_str(&args);
+                            body.push('\n');
+                        }
+                        if !detail.trim().is_empty() {
+                            body.push_str(&detail);
+                        } else {
+                            body.push_str(&summary);
+                        }
+                        if model_truncated {
+                            body.push_str(&format!(
+                                "\n… (model context truncated; raw tool output {} bytes — UI shows larger cap)",
+                                raw_bytes
+                            ));
+                        }
+                        let header_idx = app
+                            .trace_lines
+                            .iter()
+                            .rposition(|l| l.starts_with('🔧'))
+                            .unwrap_or(app.trace_lines.len().saturating_sub(1));
+                        let d = push_tool_result_lines(&mut app.trace_lines, &body);
+                        app.trace_expanded.insert(header_idx);
+                        d
                     };
                     app.persist_trace_event(&raven_tui::session::TraceEvent::tool_result(
                         &name, &summary, &display,
@@ -671,6 +773,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
                 UiUpdate::Done { final_text } => {
                     app.live_activity.push_turn_boundary();
+                    // Settle tool folds like thinking: collapse non-error blocks.
+                    app.collapse_settled_tool_blocks();
                     // Use the component's filter (which applies strip and never falls back
                     // to raw XML). This is the key circumstance we test.
                     if let Some(to_commit) = clean_final_text_for_pane(&final_text) {
@@ -845,16 +949,11 @@ async fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Tool approval requests from TuiObserver::approve_tool().
-        // The observer sends (description, oneshot::Sender<bool>) when a tool needs
-        // user approval. We store them so the UI can show the popup and the key
-        // handler can respond with Y/N.
+        // Defer while the user is typing / input non-empty; auto-deny if approvals_paused.
         while let Ok((desc, responder)) = approval_req_rx.try_recv() {
-            app.pending_confirmation = Some(crate::confirmation_dialog::ConfirmationDialog::ToolApproval {
-                description: desc,
-                responder,
-            });
-            app.needs_redraw = true;
+            app.enqueue_tool_approval(desc, responder);
         }
+        app.promote_deferred_approval();
 
         // Defensive cleanup: never allow brain icon prepended to tool call/debug lines
         // (🔧 start or indented ↳ result). Ensures single tool icon at start of each tool block.
@@ -1287,6 +1386,18 @@ async fn run_app<B: ratatui::backend::Backend>(
                 match app.handle_confirmation_key(*k) {
                     crate::confirmation_dialog::ConfirmationKeyOutcome::NotHandled => {}
                     crate::confirmation_dialog::ConfirmationKeyOutcome::Handled => {
+                        app.needs_redraw = true;
+                        continue;
+                    }
+                    crate::confirmation_dialog::ConfirmationKeyOutcome::ToolDeniedPause => {
+                        // Stop the in-flight turn so further tools do not pile up.
+                        stop_signal.store(true, Ordering::SeqCst);
+                        app.trace_lines.push(
+                            "⏹ Agent paused after deny — type a message or wait for the turn to end"
+                                .to_string(),
+                        );
+                        app.right_follow_output = true;
+                        app.right_scroll = 10_000;
                         app.needs_redraw = true;
                         continue;
                     }
