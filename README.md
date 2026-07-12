@@ -41,6 +41,26 @@ curl -fsSL https://raw.githubusercontent.com/ixmon/raven-harness/main/scripts/in
 
 </details>
 
+### Updates
+
+Installed builds can check GitHub for a newer release:
+
+```bash
+# Force check + optional reinstall (uses scripts/install.sh)
+raven-tui --update
+raven-tui --update --yes   # non-interactive
+
+# Opt out of the once-per-day startup prompt
+raven-tui --no-update-check
+# or: RAVEN_NO_UPDATE_CHECK=1
+```
+
+On interactive startup (TTY), Raven checks at most **once per day**. If a newer tag exists, it prompts:
+
+`A new release of raven-tui is available (…); Would you like to update it? [y/N]`
+
+Saying **yes** re-runs the install script into `~/.raven-hotel/bin/` and exits so you can restart. Saying **no** skips that version until a newer one appears (still only checks daily). State is stored in `~/.raven-hotel/update_check.json`.
+
 <details>
 <summary><b>Windows</b> (PowerShell)</summary>
 

@@ -187,11 +187,20 @@ async fn handle_search_key(app: &mut App, key: crossterm::event::KeyEvent) -> Re
             Ok(true)
         }
         KeyCode::Backspace => {
-            app.search.query = app.search.query.trim_end().to_string();
+            let mut q = app.search.query.clone();
+            q.pop();
+            app.search.query = q;
             app.needs_redraw = true;
             Ok(true)
         }
-        KeyCode::Char(c) => {
+        KeyCode::Char(c) if crate::key_edit::is_backspace_key(&key) || matches!(c, '\x08' | '\x7f') => {
+            let mut q = app.search.query.clone();
+            q.pop();
+            app.search.query = q;
+            app.needs_redraw = true;
+            Ok(true)
+        }
+        KeyCode::Char(c) if !c.is_control() => {
             app.search.query.push(c);
             app.needs_redraw = true;
             Ok(true)
