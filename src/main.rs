@@ -47,6 +47,7 @@ mod toast;
 mod tui_app;
 mod tui_render;
 mod trace_fold;
+mod self_update;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -148,11 +149,30 @@ struct Args {
     /// then exit. Useful for debugging prompt construction without running inference.
     #[arg(long)]
     dump_prompt: bool,
+
+    /// Check GitHub for a newer raven-tui release and offer to reinstall via install.sh.
+    /// Exits after a successful update so you can restart the new binary.
+    #[arg(long)]
+    update: bool,
+
+    /// With `--update`, install without prompting [y/N].
+    #[arg(long, requires = "update")]
+    yes: bool,
+
+    /// Skip the once-per-day automatic update check on interactive startup.
+    #[arg(long, env = "RAVEN_NO_UPDATE_CHECK")]
+    no_update_check: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    // ── Self-update (before anything heavy) ───────────────────────────────
+    if args.update {
+        let _ = self_update::run_forced_update(args.yes)?;
+        return Ok(());
+    }
 
     // ── Resolve all env vars once ─────────────────────────────────────────
     let mut flags = raven_tui::runtime::RuntimeFlags::from_env();
@@ -218,6 +238,15 @@ async fn main() -> Result<()> {
         anyhow::bail!(
             "RAVEN_EVAL=1 requires --prompt or a smoke scenario with a prompt (set RAVEN_EVAL_SCENARIO)"
         );
+    }
+
+    // Once per day (interactive TUI only): offer to reinstall from GitHub latest.
+    if is_interactive_tui
+        && !args.no_update_check
+        && !args.dump_prompt
+        && !eval_mode
+    {
+        self_update::maybe_daily_startup_check();
     }
 
     // Resolve API key: --api-key > LLM_API_KEY > OPENROUTER_API_KEY
