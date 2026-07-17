@@ -6,7 +6,7 @@
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -46,6 +46,10 @@ pub enum UiUpdate {
         /// Model payload was truncated for context budget.
         model_truncated: bool,
         raw_bytes: usize,
+        /// When true, next draw invalidates the differential buffer so every cell is
+        /// rewritten (repairs out-of-band tty ghosts without `terminal.clear()` flash).
+        /// Set for `exec` tool results as a safety net after quiet-child isolation.
+        force_full_redraw: bool,
     },
     /// Plan execution progress (sent while agent mutex is held — no try_lock needed).
     PlanSync(raven_tui::plan_md::PlanExecutionState),
@@ -108,6 +112,19 @@ fn system_tool_result(summary: impl Into<String>) -> UiUpdate {
         args: String::new(),
         model_truncated: false,
         raw_bytes: 0,
+        force_full_redraw: false,
+    }
+}
+
+/// Schedule a coalesced content-pane redraw (token/thinking/trace stream).
+/// First event in a burst sets the deadline; later events share it (throttle).
+fn schedule_content_redraw(app: &mut App) {
+    app.pane_dirty.set_content();
+    if app.content_redraw_at.is_none() {
+        app.content_redraw_at = Some(
+            Instant::now()
+                + Duration::from_millis(crate::app_state::CONTENT_REDRAW_INTERVAL_MS),
+        );
     }
 }
 
@@ -269,6 +286,7 @@ impl TurnObserver for TuiObserver {
             args: record.args.clone(),
             model_truncated: record.truncated,
             raw_bytes: record.raw_bytes,
+            force_full_redraw: record.tool == "exec",
         });
     }
     fn on_plan_sync(&mut self, state: &raven_tui::plan_execution::PlanExecutionState) {
@@ -329,6 +347,7 @@ impl TurnObserver for TuiObserver {
                         args: args.to_string(),
                         model_truncated: false,
                         raw_bytes: 0,
+                        force_full_redraw: false,
                     })
                     .await;
                 if self.denials_this_turn >= 3 {
@@ -628,7 +647,9 @@ async fn run_app<B: ratatui::backend::Backend>(
                     // belt-and-suspenders so that tool XML never appears in the conversation pane.
                     app.current_response = raven_tui::llm::strip_xml_tool_call_blocks(&app.current_response);
                     app.live_activity.push_token_sample();
-                    app.needs_redraw = true;
+                    // Coalesce stream paints — do not force needs_redraw every token.
+                    schedule_content_redraw(&mut app);
+                    app.pane_dirty.set_status(); // tps / sparkline
                     app.left_follow_output = true;
                     app.left_scroll = 10_000;
                 }
@@ -648,7 +669,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     }
                     app.current_thinking.push_str(&t);
                     app.live_activity.push_token_sample();
-                    app.needs_redraw = true;
+                    schedule_content_redraw(&mut app);
+                    app.pane_dirty.set_status();
                     maybe_follow_trace(&mut app);
                 }
                 UiUpdate::ToolStart { name, args } => {
@@ -671,6 +693,8 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.tool_calls_this_turn += 1;
                     app.live_activity.push_tool();
                     maybe_follow_trace(&mut app);
+                    // Tool boundaries are user-visible — paint soon (still coalesced a tick).
+                    schedule_content_redraw(&mut app);
                     app.needs_redraw = true;
                 }
                 UiUpdate::PlanSync(exec) => {
@@ -687,6 +711,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     args,
                     model_truncated,
                     raw_bytes,
+                    force_full_redraw,
                 } => {
                     let display = if name == "system" && summary.contains("JUDGE") {
                         let d = format!("   ⭐⭐ JUDGE: {}", truncate(&summary, 140));
@@ -769,6 +794,12 @@ async fn run_app<B: ratatui::backend::Backend>(
                         app.needs_redraw = true;
                     }
                     maybe_follow_trace(&mut app);
+                    // Exec may still leave rare ghost cells; force a full *buffer*
+                    // invalidation (not terminal.clear) so the next paint rewrites cells.
+                    if force_full_redraw {
+                        app.force_full_redraw = true;
+                    }
+                    schedule_content_redraw(&mut app);
                     app.needs_redraw = true;
                 }
                 UiUpdate::Done { final_text } => {
@@ -853,6 +884,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
                 UiUpdate::ContextUsage { used_tokens } => {
                     app.ctx_used_tokens = used_tokens;
+                    app.pane_dirty.set_status();
                     app.needs_redraw = true;
                 }
                 UiUpdate::ApprovalRequested => {
@@ -862,6 +894,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                     app.api_prompt_tokens = prompt_tokens;
                     app.api_completion_tokens = completion_tokens;
                     app.api_total_tokens = total_tokens;
+                    app.pane_dirty.set_status();
                     app.needs_redraw = true;
                 }
                 UiUpdate::SuperJudgeBegin => {
@@ -982,13 +1015,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.needs_redraw = true;
         }
 
-        if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
-            app.spinner_tick = app.spinner_tick.wrapping_add(1);
-        }
-        if app.plan.active {
-            app.plan.spinner_tick = app.plan.spinner_tick.wrapping_add(1);
-            app.needs_redraw = true;
-        }
+        // Spinner ticks advance when we paint animations (see draw gate below),
+        // not on every event-loop iteration — that was forcing ~30Hz full redraws.
 
         if (matches!(app.desktop.active, crate::desktop::ActiveDesktop::Picker)
             || matches!(app.desktop.active, crate::desktop::ActiveDesktop::Splash)
@@ -1129,14 +1157,43 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.picker.last_summary_height = 25;
         }
 
-        // Draw
-        if app.needs_redraw
-            || app.is_processing
+        // Draw — event-driven + throttled animation/content (not every loop tick).
+        let now = Instant::now();
+        let content_due = app.pane_dirty.content
+            && app
+                .content_redraw_at
+                .is_some_and(|t| now >= t);
+        let animating = (app.is_processing && !stop_signal.load(Ordering::SeqCst))
+            || app.plan.active
             || app.scroll_flash_timer > 0
             || app.desktop.is_animating()
-            || app.toasts.needs_redraw()
-        {
+            || app.toasts.needs_redraw();
+        let anim_due = animating
+            && app.last_anim_draw.is_none_or(|t| {
+                now.duration_since(t)
+                    >= Duration::from_millis(crate::app_state::ANIM_REDRAW_INTERVAL_MS)
+            });
+
+        if app.needs_redraw || content_due || anim_due {
             app.needs_redraw = false;
+            app.content_redraw_at = None;
+            app.pane_dirty.clear();
+            app.last_anim_draw = Some(now);
+
+            if app.is_processing && !stop_signal.load(Ordering::SeqCst) {
+                app.spinner_tick = app.spinner_tick.wrapping_add(1);
+            }
+            if app.plan.active {
+                app.plan.spinner_tick = app.plan.spinner_tick.wrapping_add(1);
+            }
+
+            if app.force_full_redraw {
+                app.force_full_redraw = false;
+                // Invalidate the previous frame buffer without clearing the physical
+                // screen. Next flush diffs against empty → rewrites every cell (repairs
+                // curl/tty ghosts without a dramatic black flash).
+                terminal.swap_buffers();
+            }
 
             let search_label = app.search.status_label();
             let activity_hist = app.live_activity.histogram();

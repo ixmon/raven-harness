@@ -135,8 +135,37 @@ fn fallback_clarify_question() -> PlanQuestion {
     }
 }
 
+fn history_has_question_id(history: &[PlanQaEntry], id: &str) -> bool {
+    history.iter().any(|e| e.question_id == id)
+}
+
+/// When the model returns garbage/truncated JSON we used to always re-ask the
+/// hard-coded "scope" question — which reappears after every failed round even
+/// if the user already answered it. Prefer advancing to a proposal once any
+/// answers exist; only use the canned question on the first clarify.
+fn fallback_after_clarify_failure(history: &[PlanQaEntry]) -> PlanModelPayload {
+    // After the user has answered anything, never re-show the canned "scope"
+    // question — advance to proposal with whatever we have.
+    if !history.is_empty() {
+        return PlanModelPayload::Ready {
+            message: Some(
+                "Clarify model failed (truncated/invalid JSON); drafting proposal from answers so far."
+                    .into(),
+            ),
+        };
+    }
+    PlanModelPayload::Clarify {
+        question: fallback_clarify_question(),
+    }
+}
+
 fn is_truncation_error(err: &str) -> bool {
     err.contains("truncated JSON") || err.contains("finish_reason=length")
+}
+
+/// True when the model re-asked a question id already recorded in qa_history.
+pub fn is_duplicate_clarify_question(history: &[PlanQaEntry], question: &PlanQuestion) -> bool {
+    history_has_question_id(history, &question.id)
 }
 
 const CLARIFY_SYSTEM: &str = r#"You are the planning engine for a coding-agent TUI. Reply with JSON ONLY — no markdown outside a single JSON object, no prose.
@@ -152,6 +181,7 @@ Rules:
 - Keep JSON tiny: question.prompt <= 100 chars, option labels <= 35 chars, max 4 options
 - No long parenthetical examples in prompt or labels — use short labels
 - Exactly ONE question per response when type is clarify
+- Never re-ask a question whose id already appears in Prior clarifications — pick a new decision or type ready
 - recommend must match an option id when options are present
 - If nothing important remains, use type ready"#;
 
@@ -254,10 +284,29 @@ pub async fn fetch_clarification(
     )
     .await
     {
+        Ok(PlanModelPayload::Clarify { question })
+            if is_duplicate_clarify_question(history, &question) =>
+        {
+            // Model ignored prior Q&A (common on tiny/quantized models).
+            Ok(PlanModelPayload::Ready {
+                message: Some(format!(
+                    "Skipping repeat question “{}”; drafting proposal from answers so far.",
+                    question.prompt
+                )),
+            })
+        }
         Ok(payload) => Ok(payload),
-        Err(e) if is_truncation_error(&e) => Ok(PlanModelPayload::Clarify {
-            question: fallback_clarify_question(),
-        }),
+        // Truncation / parse failure: never re-emit the canned scope Q after history exists.
+        Err(e) if is_truncation_error(&e) => Ok(fallback_after_clarify_failure(history)),
+        // Empty content / hard errors after the user already answered → still try to proceed
+        // rather than stranding the loop with no next question.
+        Err(e) if !history.is_empty() => {
+            Ok(PlanModelPayload::Ready {
+                message: Some(format!(
+                    "Clarify model error ({e}); drafting proposal from answers so far."
+                )),
+            })
+        }
         Err(e) => Err(e),
     }
 }

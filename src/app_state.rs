@@ -48,6 +48,36 @@ pub enum Pane {
     Input,
 }
 
+/// Coalesce streaming token/thinking/tool-trace content updates (throttle).
+/// First update in a burst schedules a draw; further updates in the window share it.
+pub const CONTENT_REDRAW_INTERVAL_MS: u64 = 50;
+
+/// Cap animation redraws (spinner, gauge, plan pulse, toasts) while the agent runs.
+/// Avoids full-frame paints every ~30ms event-loop tick.
+pub const ANIM_REDRAW_INTERVAL_MS: u64 = 100;
+
+/// Coarse dirty flags for *when* to draw (not true region clipping — ratatui still
+/// paints a full frame; we use this to throttle content vs status vs animation).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PaneDirty {
+    pub content: bool,
+    pub status: bool,
+}
+
+impl PaneDirty {
+    pub fn set_content(&mut self) {
+        self.content = true;
+    }
+
+    pub fn set_status(&mut self) {
+        self.status = true;
+    }
+
+    pub fn clear(&mut self) {
+        *self = PaneDirty::default();
+    }
+}
+
 /// Focus within the session/workspace picker screen.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PickerFocus {
@@ -142,6 +172,10 @@ pub struct App {
     pub right_follow_output: bool,
     pub focused_pane: Pane,
     pub scroll_flash_timer: u8,
+    /// When set, a coalesced content redraw is due at this instant (token streaming).
+    pub content_redraw_at: Option<std::time::Instant>,
+    /// Last time we painted for animation (spinner / gauge / plan pulse).
+    pub last_anim_draw: Option<std::time::Instant>,
 
     // Trace pane cursor (interactive navigation + fold/unfold)
     pub trace_cursor: usize,       // highlighted line index in trace_lines
@@ -190,6 +224,12 @@ pub struct App {
     /// Last time the user edited the input box (for approval debounce).
     pub last_input_activity: Option<std::time::Instant>,
     pub needs_redraw: bool,
+    /// When set, next draw invalidates ratatui's previous buffer (via
+    /// `swap_buffers`) so every cell is rewritten — repairs ghost cells from
+    /// out-of-band tty writes without a black `terminal.clear()` flash.
+    pub force_full_redraw: bool,
+    /// Coarse dirty flags for throttled content / status redraw scheduling.
+    pub pane_dirty: crate::app_state::PaneDirty,
 
     /// Transient top-right status toasts (settings notifications, startup, etc.).
     pub toasts: crate::toast::ToastState,
@@ -307,6 +347,8 @@ impl App {
             right_follow_output: true,
             focused_pane: Pane::Left,
             scroll_flash_timer: 0,
+            content_redraw_at: None,
+            last_anim_draw: None,
             trace_cursor: 0,
             trace_cursor_active: false,
             trace_expanded: std::collections::HashSet::new(),
@@ -332,6 +374,8 @@ impl App {
             approvals_paused: false,
             last_input_activity: None,
             needs_redraw: true,
+            force_full_redraw: false,
+            pane_dirty: PaneDirty::default(),
             toasts: crate::toast::ToastState::default(),
             live_activity: crate::live_activity::LiveActivity::default(),
             mode_menu_active: false,
@@ -586,14 +630,23 @@ impl App {
         if !self.settings.active {
             return;
         }
-        if matches!(
-            self.settings.mode,
-            crate::settings_modal::SettingsMode::Adding
-                | crate::settings_modal::SettingsMode::Editing
-        ) {
-            self.settings
-                .apply_edit_action(EditAction::InsertStr(text.to_string()));
-            self.needs_redraw = true;
+        use crate::settings_modal::SettingsMode;
+        match self.settings.mode {
+            SettingsMode::Adding | SettingsMode::Editing | SettingsMode::BraveKey => {
+                self.settings
+                    .apply_edit_action(EditAction::InsertStr(text.to_string()));
+                self.needs_redraw = true;
+            }
+            SettingsMode::OpenRouterBrowse => {
+                let clean: String = text
+                    .chars()
+                    .filter(|c| !c.is_control() || *c == ' ')
+                    .collect();
+                self.settings.or_query.push_str(&clean);
+                self.settings.rebuild_or_view();
+                self.needs_redraw = true;
+            }
+            SettingsMode::List => {}
         }
     }
 

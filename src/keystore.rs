@@ -287,6 +287,37 @@ impl Keystore {
         }))
     }
 
+    /// Set the launch endpoint from an InferenceEndpoint (used when switching endpoints in settings).
+    pub fn set_launch_endpoint(&mut self, ep: &raven_tui::config::InferenceEndpoint) -> Result<()> {
+        let api_key = ep.api_key.as_deref();
+
+        let key_update = match api_key {
+            None => KeyUpdate::Keep,
+            Some("") => KeyUpdate::Remove,
+            Some(key) => KeyUpdate::Replace(self.encrypt_key(key)?),
+        };
+
+        let mut launch = self.file.launch.take().unwrap_or_default();
+        launch.label = ep.label.clone();
+        launch.base_url = ep.base_url.clone();
+        launch.model = ep.model.clone();
+
+        match key_update {
+            KeyUpdate::Keep => {}
+            KeyUpdate::Remove => {
+                launch.encrypted_key = None;
+                launch.has_key = false;
+            }
+            KeyUpdate::Replace(encrypted) => {
+                launch.encrypted_key = Some(encrypted);
+                launch.has_key = true;
+            }
+        }
+
+        self.file.launch = Some(launch);
+        self.save()
+    }
+
     /// Persist launch defaults (settings edit on index 0).
     pub fn set_launch_defaults(
         &mut self,

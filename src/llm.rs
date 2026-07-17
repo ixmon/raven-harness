@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -145,10 +145,12 @@ impl LlmClient {
             body["response_format"] = json!({ "type": "json_object" });
         }
 
-        // Enable reasoning/thinking for providers that support it (OpenRouter, etc.)
+        // OpenRouter reasoning: only send when explicitly set. Forcing
+        // `enabled: true` breaks many free/simple models (stream errors).
         if is_openrouter(&self.config.base_url) {
-            let enabled = req.reasoning_enabled.unwrap_or(true);
-            body["reasoning"] = json!({ "enabled": enabled });
+            if let Some(enabled) = req.reasoning_enabled {
+                body["reasoning"] = json!({ "enabled": enabled });
+            }
         }
 
         let mut request = self.http.post(self.config.chat_url()).json(&body);
@@ -236,10 +238,12 @@ impl LlmClient {
             body["tools"] = serde_json::to_value(tools)?;
         }
 
-        // Enable reasoning/thinking for providers that support it
+        // OpenRouter reasoning: only when explicitly requested (see non-stream path).
         let openrouter = is_openrouter(&self.config.base_url);
         if openrouter {
-            body["reasoning"] = json!({ "enabled": true });
+            if let Some(enabled) = req.reasoning_enabled {
+                body["reasoning"] = json!({ "enabled": enabled });
+            }
         }
 
         // Spawn the actual streaming work so the caller can immediately get the receiver
@@ -498,6 +502,82 @@ pub fn is_openrouter(base_url: &str) -> bool {
     base_url.contains("openrouter.ai")
 }
 
+/// Classify provider/stream errors for UI and auto-retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LlmErrorKind {
+    RateLimit,
+    Reasoning,
+    Auth,
+    Other,
+}
+
+/// Strip the `LLM error: ` prefix if present and classify the remainder.
+pub fn classify_llm_error(msg: &str) -> LlmErrorKind {
+    let m = msg
+        .strip_prefix("LLM error:")
+        .unwrap_or(msg)
+        .trim()
+        .to_ascii_lowercase();
+    if m.contains("429")
+        || m.contains("rate limit")
+        || m.contains("rate-limit")
+        || m.contains("too many requests")
+        || m.contains("temporarily rate-limited")
+    {
+        return LlmErrorKind::RateLimit;
+    }
+    if m.contains("401")
+        || m.contains("403")
+        || m.contains("unauthorized")
+        || m.contains("invalid api key")
+        || m.contains("user not found")
+    {
+        return LlmErrorKind::Auth;
+    }
+    // Reasoning / thinking feature rejections from OpenRouter or models.
+    if m.contains("reasoning")
+        || m.contains("thinking")
+        || m.contains("include_reasoning")
+        || (m.contains("unsupported") && (m.contains("parameter") || m.contains("field")))
+    {
+        return LlmErrorKind::Reasoning;
+    }
+    LlmErrorKind::Other
+}
+
+/// Short operator-facing line for the trace pane.
+pub fn format_llm_error_trace(msg: &str) -> String {
+    let raw = msg.strip_prefix("LLM error:").unwrap_or(msg).trim();
+    let kind = classify_llm_error(msg);
+    let preview: String = raw.chars().take(160).collect();
+    match kind {
+        LlmErrorKind::RateLimit => format!("⚠ OpenRouter/provider rate limit (429) — {preview}"),
+        LlmErrorKind::Reasoning => {
+            format!("⚠ Reasoning/thinking rejected by provider — {preview}")
+        }
+        LlmErrorKind::Auth => format!("⚠ Auth error talking to LLM — {preview}"),
+        LlmErrorKind::Other => format!("⚠ LLM error — {preview}"),
+    }
+}
+
+/// Heuristic: model id looks like a chain-of-thought / reasoning SKU.
+pub fn model_likely_supports_reasoning(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Free-tier routes often break when reasoning is forced — keep Auto off for :free.
+    if m.contains(":free") {
+        return false;
+    }
+    m.contains("r1")
+        || m.contains("reason")
+        || m.contains("thinking")
+        || m.contains("/o1")
+        || m.contains("/o3")
+        || m.contains("o1-")
+        || m.contains("o3-")
+        || m.ends_with("-o1")
+        || m.ends_with("-o3")
+}
+
 /// Whether this endpoint has a metered (paid) balance we can query.
 pub fn is_metered_endpoint(base_url: &str) -> bool {
     is_openrouter(base_url)
@@ -579,6 +659,108 @@ fn parse_openrouter_key_limit(body: &serde_json::Value) -> Option<OpenRouterBala
         return None;
     }
     remaining.as_f64().map(OpenRouterBalance)
+}
+
+/// One row from OpenRouter `GET /models` (catalog browser).
+#[derive(Debug, Clone)]
+pub struct OpenRouterModelInfo {
+    pub id: String,
+    pub name: String,
+    pub context_length: u32,
+    /// USD per token (OpenRouter string pricing), 0.0 if free/unknown.
+    pub prompt_price: f64,
+    pub completion_price: f64,
+}
+
+impl OpenRouterModelInfo {
+    pub fn is_free(&self) -> bool {
+        self.id.ends_with(":free")
+            || (self.prompt_price <= 0.0 && self.completion_price <= 0.0)
+    }
+
+    /// Rough USD per 1M prompt tokens for display/sort.
+    pub fn prompt_per_million(&self) -> f64 {
+        self.prompt_price * 1_000_000.0
+    }
+
+    pub fn price_label(&self) -> String {
+        if self.is_free() {
+            "$0".into()
+        } else {
+            let p = self.prompt_per_million();
+            if p < 0.01 {
+                format!("~${:.4}/M", p)
+            } else {
+                format!("${:.2}/M", p)
+            }
+        }
+    }
+
+    pub fn short_label(&self) -> String {
+        self.id
+            .rsplit('/')
+            .next()
+            .unwrap_or(self.id.as_str())
+            .to_string()
+    }
+}
+
+/// Fetch the full OpenRouter model catalog for the authenticated key.
+pub async fn fetch_openrouter_models(api_key: &str) -> Result<Vec<OpenRouterModelInfo>, String> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let body = openrouter_get(&client, "/models", api_key)
+        .await
+        .ok_or_else(|| "OpenRouter /models request failed".to_string())?;
+    parse_openrouter_models_catalog(&body)
+        .ok_or_else(|| "could not parse OpenRouter /models response".to_string())
+}
+
+fn parse_price_str(v: Option<&Value>) -> f64 {
+    v.and_then(|x| {
+        x.as_f64()
+            .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+    })
+    .unwrap_or(0.0)
+}
+
+/// Parse `GET /models` JSON into catalog rows.
+pub fn parse_openrouter_models_catalog(body: &Value) -> Option<Vec<OpenRouterModelInfo>> {
+    let data = body.get("data")?.as_array()?;
+    let mut out = Vec::with_capacity(data.len());
+    for m in data {
+        let id = m.get("id")?.as_str()?.to_string();
+        if id.is_empty() {
+            continue;
+        }
+        let name = m
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(id.as_str())
+            .to_string();
+        let context_length = m
+            .get("context_length")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                m.get("top_provider")
+                    .and_then(|t| t.get("context_length"))
+                    .and_then(|v| v.as_u64())
+            })
+            .unwrap_or(0) as u32;
+        let pricing = m.get("pricing");
+        let prompt_price = parse_price_str(pricing.and_then(|p| p.get("prompt")));
+        let completion_price = parse_price_str(pricing.and_then(|p| p.get("completion")));
+        out.push(OpenRouterModelInfo {
+            id,
+            name,
+            context_length,
+            prompt_price,
+            completion_price,
+        });
+    }
+    Some(out)
 }
 
 /// Accumulate streaming tool-call fragments keyed by index.
@@ -813,5 +995,49 @@ mod tests {
             "data": { "limit_remaining": null }
         });
         assert_eq!(parse_openrouter_key_limit(&body), None);
+    }
+
+    #[test]
+    fn parse_openrouter_models_catalog_basic() {
+        let body = serde_json::json!({
+            "data": [
+                {
+                    "id": "deepseek/deepseek-r1:free",
+                    "name": "DeepSeek R1 Free",
+                    "context_length": 163840,
+                    "pricing": { "prompt": "0", "completion": "0" }
+                },
+                {
+                    "id": "anthropic/claude-sonnet-4",
+                    "name": "Claude Sonnet",
+                    "context_length": 200000,
+                    "pricing": { "prompt": "0.000003", "completion": "0.000015" }
+                }
+            ]
+        });
+        let rows = parse_openrouter_models_catalog(&body).expect("parse");
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].is_free());
+        assert!(!rows[1].is_free());
+        assert_eq!(rows[0].short_label(), "deepseek-r1:free");
+        assert!((rows[1].prompt_per_million() - 3.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn classify_rate_limit_and_reasoning_errors() {
+        assert_eq!(
+            classify_llm_error("LLM error: 429: rate limit exceeded"),
+            LlmErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_llm_error("LLM error: 400: reasoning is not supported"),
+            LlmErrorKind::Reasoning
+        );
+        assert!(format_llm_error_trace("LLM error: 429 Too Many Requests")
+            .contains("rate limit"));
+        assert!(!model_likely_supports_reasoning(
+            "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"
+        ));
+        assert!(model_likely_supports_reasoning("deepseek/deepseek-r1"));
     }
 }

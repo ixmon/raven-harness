@@ -156,6 +156,40 @@ fn sudo_failure_hint(output: &str) -> Option<String> {
     }
 }
 
+/// Apply env + stdio so child CLIs are less likely to scribble on the TUI tty.
+///
+/// - Pipe stdout/stderr (capture, never inherit).
+/// - `TERM=dumb` / `CI=1` / `NO_COLOR=1` quiet progress bars and color probes.
+/// - On Unix, `setsid()` in the child drops the controlling terminal so even
+///   tools that open `/dev/tty` for progress are less likely to hit our screen.
+fn configure_quiet_child(cmd: &mut TokioCommand) {
+    cmd.env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("CI", "1")
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .env("SUDO_ASKPASS", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    #[cfg(unix)]
+    {
+        // SAFETY: pre_exec runs only in the forked child, before exec. setsid is
+        // async-signal-safe and detaches from the parent's controlling terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                // Best-effort: failure leaves the child in the parent's session.
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                let _ = setsid();
+                Ok(())
+            });
+        }
+    }
+}
+
 async fn run_shell_command(
     command: &str,
     workspace: &Path,
@@ -169,34 +203,22 @@ async fn run_shell_command(
     let ws = workspace.to_path_buf();
 
     #[cfg(unix)]
-    let child = match TokioCommand::new("/bin/bash")
-        .arg("-c")
-        .arg(&cmd)
-        .current_dir(&ws)
-        .env("NO_COLOR", "1")
-        .env("DEBIAN_FRONTEND", "noninteractive")
-        .env("SUDO_ASKPASS", "")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => return (None, format!("(exec spawn error: {e})")),
+    let mut child_cmd = {
+        let mut c = TokioCommand::new("/bin/bash");
+        c.arg("-c").arg(&cmd).current_dir(&ws);
+        c
     };
 
     #[cfg(windows)]
-    let child = match TokioCommand::new("cmd")
-        .arg("/C")
-        .arg(&cmd)
-        .current_dir(&ws)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+    let mut child_cmd = {
+        let mut c = TokioCommand::new("cmd");
+        c.arg("/C").arg(&cmd).current_dir(&ws);
+        c
+    };
+
+    configure_quiet_child(&mut child_cmd);
+
+    let child = match child_cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (None, format!("(exec spawn error: {e})")),
     };

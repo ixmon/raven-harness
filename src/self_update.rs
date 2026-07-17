@@ -95,8 +95,11 @@ fn parse_semver(s: &str) -> (u64, u64, u64) {
 }
 
 /// Fetch latest release tag from GitHub (e.g. `v0.1.9`).
-pub fn fetch_latest_tag() -> Result<String> {
-    let client = reqwest::blocking::Client::builder()
+///
+/// Async so we never nest a `reqwest::blocking` runtime inside `#[tokio::main]`
+/// (that panics on drop: "Cannot drop a runtime in a context where blocking is not allowed").
+pub async fn fetch_latest_tag() -> Result<String> {
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(12))
         .user_agent(format!("raven-tui/{}", current_version()))
         .build()
@@ -106,13 +109,14 @@ pub fn fetch_latest_tag() -> Result<String> {
         .get(RELEASE_API)
         .header("Accept", "application/vnd.github+json")
         .send()
+        .await
         .context("requesting GitHub releases/latest")?;
 
     if !resp.status().is_success() {
         bail!("GitHub releases API returned HTTP {}", resp.status());
     }
 
-    let body: serde_json::Value = resp.json().context("parsing release JSON")?;
+    let body: serde_json::Value = resp.json().await.context("parsing release JSON")?;
     let tag = body
         .get("tag_name")
         .and_then(|t| t.as_str())
@@ -152,10 +156,12 @@ pub fn run_install_script() -> Result<()> {
 
 /// Force update check (`--update`). With `assume_yes`, skip the y/n prompt.
 /// Returns whether an install was performed.
-pub fn run_forced_update(assume_yes: bool) -> Result<bool> {
+pub async fn run_forced_update(assume_yes: bool) -> Result<bool> {
     let current = current_version();
     eprintln!("==> Checking for updates (running {current})…");
-    let latest = fetch_latest_tag().context("could not fetch latest release")?;
+    let latest = fetch_latest_tag()
+        .await
+        .context("could not fetch latest release")?;
     eprintln!("==> Latest release: {latest}");
 
     if !is_newer(&latest, current) {
@@ -193,7 +199,7 @@ pub fn run_forced_update(assume_yes: bool) -> Result<bool> {
 }
 
 /// Once-per-day check for interactive TUI startup. Never fails the app hard.
-pub fn maybe_daily_startup_check() {
+pub async fn maybe_daily_startup_check() {
     if std::env::var_os("RAVEN_NO_UPDATE_CHECK").is_some() {
         return;
     }
@@ -208,7 +214,7 @@ pub fn maybe_daily_startup_check() {
     }
 
     let current = current_version();
-    let latest = match fetch_latest_tag() {
+    let latest = match fetch_latest_tag().await {
         Ok(t) => t,
         Err(e) => {
             // Soft-fail: offline, rate limit, etc.

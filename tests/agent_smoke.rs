@@ -40,6 +40,7 @@ fn eval_config(
         enable_judge: !scenario.disable_judge,
         flags: raven_tui::runtime::RuntimeFlags::default(),
         harness: raven_tui::runtime::EvalHarness::default(),
+        openrouter_reasoning: raven_tui::config::OpenRouterReasoningMode::Auto,
     };
     (config, workspace)
 }

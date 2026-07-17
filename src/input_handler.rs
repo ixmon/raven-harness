@@ -911,6 +911,7 @@ pub fn spawn_agent_turn(
                                     args: String::new(),
                                     model_truncated: false,
                                     raw_bytes: 0,
+                                    force_full_redraw: false,
                                 })
                                 .await;
                             break;
@@ -926,6 +927,7 @@ pub fn spawn_agent_turn(
                                     args: String::new(),
                                     model_truncated: false,
                                     raw_bytes: 0,
+                                    force_full_redraw: false,
                                 })
                                 .await;
                             break;
@@ -942,6 +944,7 @@ pub fn spawn_agent_turn(
                                     args: String::new(),
                                     model_truncated: false,
                                     raw_bytes: 0,
+                                    force_full_redraw: false,
                                 })
                                 .await;
                             break;
@@ -961,6 +964,7 @@ pub fn spawn_agent_turn(
                                 args: String::new(),
                                 model_truncated: false,
                                 raw_bytes: 0,
+                                    force_full_redraw: false,
                             })
                             .await;
 
@@ -979,6 +983,7 @@ pub fn spawn_agent_turn(
                                     args: String::new(),
                                     model_truncated: false,
                                     raw_bytes: 0,
+                                    force_full_redraw: false,
                                 })
                                 .await;
                             break;
@@ -997,6 +1002,7 @@ pub fn spawn_agent_turn(
                                         args: String::new(),
                                         model_truncated: false,
                                         raw_bytes: 0,
+                                    force_full_redraw: false,
                                     })
                                     .await;
                                 break;
@@ -1012,6 +1018,7 @@ pub fn spawn_agent_turn(
                                         args: String::new(),
                                         model_truncated: false,
                                         raw_bytes: 0,
+                                    force_full_redraw: false,
                                     })
                                     .await;
                                 if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1023,6 +1030,7 @@ pub fn spawn_agent_turn(
                                             args: String::new(),
                                             model_truncated: false,
                                             raw_bytes: 0,
+                                    force_full_redraw: false,
                                         })
                                         .await;
                                     break;
@@ -1061,6 +1069,7 @@ pub fn spawn_agent_turn(
                                         args: String::new(),
                                         model_truncated: false,
                                         raw_bytes: 0,
+                                    force_full_redraw: false,
                                     })
                                     .await;
                                 if stop_c.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1072,6 +1081,7 @@ pub fn spawn_agent_turn(
                                             args: String::new(),
                                             model_truncated: false,
                                             raw_bytes: 0,
+                                    force_full_redraw: false,
                                         })
                                         .await;
                                     break;
@@ -1109,6 +1119,7 @@ pub fn spawn_agent_turn(
                                         args: String::new(),
                                         model_truncated: false,
                                         raw_bytes: 0,
+                                    force_full_redraw: false,
                                     })
                                     .await;
                                 break;

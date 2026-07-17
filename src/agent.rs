@@ -208,6 +208,9 @@ pub struct Agent {
     pub brave_key: Option<String>,
     /// Mirror of TUI plan execution state (synced before each turn).
     pub plan_exec: crate::plan_execution::PlanExecutionState,
+    /// Session override after Auto detects a reasoning-related provider error.
+    /// `Some(false)` forces reasoning off until the user changes mode or endpoint.
+    openrouter_reasoning_session: Option<bool>,
 }
 
 impl Agent {
@@ -253,7 +256,53 @@ impl Agent {
             judge: Some(Judge::new(client_arc)),
             brave_key: None,
             plan_exec: crate::plan_execution::PlanExecutionState::default(),
+            openrouter_reasoning_session: None,
         }
+    }
+
+    /// Resolve whether to send OpenRouter `reasoning.enabled` for the next request.
+    pub fn resolve_openrouter_reasoning(&self) -> Option<bool> {
+        use crate::config::OpenRouterReasoningMode;
+        use crate::llm::{is_openrouter, model_likely_supports_reasoning};
+
+        if !is_openrouter(&self.config.base_url) {
+            return None;
+        }
+        if let Some(forced) = self.openrouter_reasoning_session {
+            return Some(forced);
+        }
+        match self.config.openrouter_reasoning {
+            OpenRouterReasoningMode::On => Some(true),
+            OpenRouterReasoningMode::Off => Some(false),
+            OpenRouterReasoningMode::Auto => {
+                if model_likely_supports_reasoning(&self.config.model) {
+                    Some(true)
+                } else {
+                    // Omit field for ordinary / free models (provider default).
+                    None
+                }
+            }
+        }
+    }
+
+    /// User or harness set of OpenRouter reasoning policy (`auto`/`on`/`off`).
+    pub fn set_openrouter_reasoning_mode(&mut self, mode: crate::config::OpenRouterReasoningMode) {
+        self.config.openrouter_reasoning = mode;
+        // Clear session auto-disable so On/Auto can try again.
+        self.openrouter_reasoning_session = None;
+    }
+
+    pub fn openrouter_reasoning_mode(&self) -> crate::config::OpenRouterReasoningMode {
+        self.config.openrouter_reasoning
+    }
+
+    /// After a reasoning-related provider error under Auto/On, disable for session.
+    pub fn note_reasoning_provider_failure(&mut self) {
+        self.openrouter_reasoning_session = Some(false);
+    }
+
+    pub fn reasoning_session_forced_off(&self) -> bool {
+        self.openrouter_reasoning_session == Some(false)
     }
 
     pub fn set_plan_execution(&mut self, state: crate::plan_execution::PlanExecutionState) {
@@ -377,7 +426,7 @@ impl Agent {
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
-            reasoning_enabled: None,
+            reasoning_enabled: self.resolve_openrouter_reasoning(),
             json_object_mode: None,
         };
 
@@ -575,7 +624,7 @@ impl Agent {
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
-            reasoning_enabled: None,
+            reasoning_enabled: self.resolve_openrouter_reasoning(),
             json_object_mode: None,
         };
         self.client.lock().await.chat_stream(req).await
@@ -595,7 +644,7 @@ impl Agent {
             temperature: self.config.temperature,
             max_tokens: self.config.max_tokens,
             stream: true,
-            reasoning_enabled: None,
+            reasoning_enabled: self.resolve_openrouter_reasoning(),
             json_object_mode: None,
         };
         self.client.lock().await.chat_stream(req).await
@@ -1486,6 +1535,8 @@ History:
         self.config.model = endpoint.model.clone();
         self.config.api_key = endpoint.api_key.clone();
         self.config.context_budget = budget;
+        // New model may support reasoning even if the previous free tier forced it off.
+        self.openrouter_reasoning_session = None;
         self.client.lock().await.reset_http(self.config.clone());
     }
 
@@ -1650,6 +1701,7 @@ mod integration_tests {
             enable_judge: false,
             flags: crate::runtime::RuntimeFlags::default(),
             harness: crate::runtime::EvalHarness::default(),
+            openrouter_reasoning: crate::config::OpenRouterReasoningMode::Auto,
         }
     }
 

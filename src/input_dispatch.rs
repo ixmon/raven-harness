@@ -68,7 +68,7 @@ pub fn filtered_slash_commands<'a>(
 }
 
 const PROCESSING_SAFE_SLASH: &[&str] = &[
-    "approval-mode", "run-mode", "status", "settings", "search", "help", "?",
+    "approval-mode", "run-mode", "status", "settings", "search", "help", "?", "reasoning",
 ];
 
 fn slash_name_allowed_while_processing(name: &str) -> bool {
@@ -183,7 +183,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
             SlashDispatch::Handled
         }
         "status" => {
-            let (endpoint_label, model, base_url, workspace, approval_label, agent_mode) =
+            let (endpoint_label, model, base_url, workspace, approval_label, agent_mode, reasoning) =
                 if let Ok(ag) = ctx.agent.try_lock() {
                     let cfg = ag.current_config();
                     let label = ctx
@@ -192,6 +192,12 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                         .get(ctx.settings.active_endpoint_idx)
                         .map(|e| e.label.clone())
                         .unwrap_or_else(|| "session".to_string());
+                    let rmode = ag.openrouter_reasoning_mode().as_str();
+                    let rnote = if ag.reasoning_session_forced_off() {
+                        format!("{rmode} (session: forced off after error)")
+                    } else {
+                        rmode.to_string()
+                    };
                     (
                         label,
                         cfg.model.clone(),
@@ -199,6 +205,7 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                         cfg.workspace.display().to_string(),
                         ag.current_exec_mode().label().to_string(),
                         ag.current_agent_mode(),
+                        rnote,
                     )
                 } else {
                     (
@@ -208,19 +215,74 @@ pub fn dispatch_slash_command(prompt: &str, ctx: &mut SlashContext<'_>) -> Slash
                         ctx.config.workspace.display().to_string(),
                         "unknown".to_string(),
                         "talk".to_string(),
+                        ctx.config.openrouter_reasoning.as_str().to_string(),
                     )
                 };
             let status = format!(
-                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Approval:  {}\n  Run Mode:  {}\n  History:   {} entries",
+                "Session status\n  Endpoint:  {}\n  Model:     {}\n  Base URL:  {}\n  Workspace: {}\n  Approval:  {}\n  Run Mode:  {}\n  Reasoning: {}\n  History:   {} entries",
                 endpoint_label,
                 model,
                 base_url,
                 workspace,
                 approval_label,
                 agent_mode,
+                reasoning,
                 ctx.left_committed.len()
             );
             ctx.left_committed.push(status);
+            scroll_left(ctx.left_committed);
+            clear_slash_input(ctx);
+            *ctx.slash_selected = 0;
+            SlashDispatch::Handled
+        }
+        "reasoning" => {
+            // prompt is e.g. "/reasoning off" or "/reasoning"
+            let rest = prompt
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("")
+                .to_string();
+            if rest.is_empty() || rest == "?" || rest == "status" {
+                let msg = if let Ok(ag) = ctx.agent.try_lock() {
+                    let mode = ag.openrouter_reasoning_mode().as_str();
+                    let eff = ag.resolve_openrouter_reasoning();
+                    let eff_s = match eff {
+                        Some(true) => "send enabled=true",
+                        Some(false) => "send enabled=false",
+                        None => "omit field (provider default)",
+                    };
+                    let forced = if ag.reasoning_session_forced_off() {
+                        " · session forced off after provider error"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "OpenRouter reasoning: {mode} → {eff_s}{forced}\n  /reasoning auto|on|off"
+                    )
+                } else {
+                    "Agent busy — try /reasoning again in a moment.".into()
+                };
+                ctx.left_committed.push(msg);
+            } else if let Some(mode) = raven_tui::config::OpenRouterReasoningMode::parse(&rest) {
+                if let Ok(mut ag) = ctx.agent.try_lock() {
+                    ag.set_openrouter_reasoning_mode(mode);
+                    ctx.left_committed.push(format!(
+                        "OpenRouter reasoning set to {}.",
+                        mode.as_str()
+                    ));
+                    ctx.trace_lines.push(format!(
+                        "🔧 OpenRouter reasoning → {}",
+                        mode.as_str()
+                    ));
+                } else {
+                    ctx.left_committed
+                        .push("Agent busy — could not change reasoning mode.".into());
+                }
+            } else {
+                ctx.left_committed.push(format!(
+                    "Unknown reasoning mode {rest:?}. Use: /reasoning auto|on|off"
+                ));
+            }
             scroll_left(ctx.left_committed);
             clear_slash_input(ctx);
             *ctx.slash_selected = 0;
@@ -406,6 +468,10 @@ pub fn default_slash_commands() -> Vec<SlashCommand> {
             desc: "Manage inference endpoints",
         },
         SlashCommand {
+            name: "reasoning",
+            desc: "OpenRouter reasoning: /reasoning auto|on|off",
+        },
+        SlashCommand {
             name: "search",
             desc: "Search conversation or trace pane",
         },
@@ -448,6 +514,7 @@ Available commands:
 /plan done     Force-complete the executing plan (user override)
 /run-mode      Set run mode (talk, think, research, work, dream, plan)
 /settings      Manage inference endpoints (add/switch/edit/delete)
+/reasoning     OpenRouter reasoning mode: auto (default) | on | off
 /search        Search conversation or trace (or Ctrl-F)
 /quit or /exit Quit the TUI
 
@@ -545,6 +612,7 @@ mod tests {
             enable_judge: false,
             flags: raven_tui::runtime::RuntimeFlags::default(),
             harness: raven_tui::runtime::EvalHarness::default(),
+            openrouter_reasoning: raven_tui::config::OpenRouterReasoningMode::Auto,
         };
         let agent = Arc::new(Mutex::new(Agent::new(
             config.clone(),

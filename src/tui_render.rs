@@ -310,10 +310,10 @@ pub fn breadcrumb_target_at(
 }
 
 pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
-    let show_spark = data.activity.iter().any(|&v| v > 0) && area.width >= 28;
-    // Right-side sparkline only (no label — short tags read as truncated words on
-    // narrow bars). Width can later follow a CSS media-query-style density pass.
-    let spark_w = if show_spark {
+    // Always reserve sparkline space once the bar is wide enough so the text
+    // half does not jump when the first activity sample arrives (that layout
+    // thrash contributed to intermittent "status on a second line" ghosts).
+    let spark_w = if area.width >= 28 && !data.activity.is_empty() {
         (data.activity.len() as u16 + 2)
             .min(area.width / 3)
             .max(12)
@@ -330,11 +330,17 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
         (area, None)
     };
 
+    // Solid bg so this one row always overwrites residual cells on repaint.
+    let bar_bg = Style::default().bg(Color::Black);
+
     let ctx = data.budget;
+    let mode_short = data.mode_label.split(" - ").next().unwrap_or("?");
+    let goal_budget = if spark_w > 0 { 24 } else { 40 };
     let mut spans = vec![
-        Span::styled(" ⦖ ", Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))),
+        // Trailing space after wide emoji avoids collision when terminals undercount width.
+        Span::styled(" 🥨 ", Style::default().fg(Color::Rgb(0xc0, 0x80, 0xff))),
         Span::styled(
-            data.display_model,
+            truncate_str(data.display_model, 28),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -368,41 +374,49 @@ pub fn draw_status_bar(f: &mut Frame, area: Rect, data: &StatusBarData<'_>) {
         ),
         Span::styled("  │  ", Style::default().fg(Color::Rgb(0x4a, 0x4a, 0x58))),
         Span::styled("Approval:", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            data.mode_label.split(" - ").next().unwrap_or("?"),
-            Style::default().fg(Color::Yellow),
-        ),
+        Span::styled(mode_short, Style::default().fg(Color::Yellow)),
         Span::styled("  │  ", Style::default().fg(Color::Rgb(0x40, 0x40, 0x4e))),
         Span::styled("Run Mode:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            data.agent_mode,
+            truncate_str(data.agent_mode, 12),
             Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff)),
         ),
         Span::styled("  │  ", Style::default().fg(Color::Rgb(0x38, 0x38, 0x44))),
         Span::styled("goal:", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            truncate_str(data.goal_text, if spark_w > 0 { 24 } else { 40 }),
+            truncate_str(data.goal_text, goal_budget),
             Style::default().fg(Color::Rgb(0xa0, 0xd0, 0xff)),
         ),
     ];
     if !data.search_label.is_empty() {
         spans.push(Span::styled("  │  ", Style::default().fg(Color::DarkGray)));
         spans.push(Span::styled(
-            data.search_label,
+            truncate_str(data.search_label, 16),
             Style::default()
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), text_area);
+
+    // No wrap — single layout row; Paragraph clips. Bg fills the row.
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(bar_bg),
+        text_area,
+    );
 
     if let Some(sa) = spark_area {
+        f.render_widget(Paragraph::new("").style(bar_bg), sa);
         let spark = Sparkline::default()
             .data(data.activity)
-            .style(Style::default().fg(Color::Rgb(0xa0, 0x80, 0xff)));
+            .style(
+                Style::default()
+                    .fg(Color::Rgb(0xa0, 0x80, 0xff))
+                    .bg(Color::Black),
+            );
         f.render_widget(spark, sa);
     }
 }
+
 
 fn balance_label_style(label: &str) -> Style {
     if label == "$∞" {
