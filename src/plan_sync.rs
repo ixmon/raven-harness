@@ -218,6 +218,7 @@ mod tests {
             enable_judge: false,
             flags: raven_tui::runtime::RuntimeFlags::default(),
             harness: raven_tui::runtime::EvalHarness::default(),
+            openrouter_reasoning: raven_tui::config::OpenRouterReasoningMode::Auto,
         };
         let chat = ChatBackend::Mock(MockChatBackend::new(vec![]));
         let mut ag = Agent::new(cfg, chat);

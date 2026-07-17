@@ -15,6 +15,9 @@ debug/
 *.swp
 *~
 *.swo
+# Vim swap variants (e.g. .swl / .swm / .swn when .swp is blocked)
+*.sw[a-z]
+.sw[a-z]
 
 # OS generated files (recursive to catch them in subdirectories)
 **/.DS_Store

@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
 
     // ── Self-update (before anything heavy) ───────────────────────────────
     if args.update {
-        let _ = self_update::run_forced_update(args.yes)?;
+        let _ = self_update::run_forced_update(args.yes).await?;
         return Ok(());
     }
 
@@ -241,12 +241,14 @@ async fn main() -> Result<()> {
     }
 
     // Once per day (interactive TUI only): offer to reinstall from GitHub latest.
+    // Must be async (not reqwest::blocking) — nesting a Tokio runtime inside
+    // #[tokio::main] panics on drop.
     if is_interactive_tui
         && !args.no_update_check
         && !args.dump_prompt
         && !eval_mode
     {
-        self_update::maybe_daily_startup_check();
+        self_update::maybe_daily_startup_check().await;
     }
 
     // Resolve API key: --api-key > LLM_API_KEY > OPENROUTER_API_KEY
@@ -508,6 +510,7 @@ async fn main() -> Result<()> {
             enable_judge: flags.enable_judge,
             flags: flags.clone(),
             harness: harness.clone(),
+            openrouter_reasoning: raven_tui::config::OpenRouterReasoningMode::Auto,
         };
         let chat_backend = if use_mock_llm {
             let scenario = smoke_scenario
@@ -611,6 +614,7 @@ async fn main() -> Result<()> {
         enable_judge: flags.enable_judge,
         flags: flags.clone(),
         harness,
+        openrouter_reasoning: raven_tui::config::OpenRouterReasoningMode::Auto,
     };
 
     // --dump-prompt without --prompt: show the system prompt + injection block

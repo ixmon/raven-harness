@@ -230,6 +230,7 @@ pub async fn drive_turn_with_tools(
             let (raw_round_text, tool_calls, usage, finish_reason, round_thinking) = {
                 let mut attempt = 0u32;
                 loop {
+                    let reasoning_before = agent.resolve_openrouter_reasoning();
                     let stream = match agent
                         .send_streaming_request(tools_for_request.clone())
                         .await
@@ -245,9 +246,53 @@ pub async fn drive_turn_with_tools(
 
                     let (text, calls, usg, fr, thk) = consume_stream(stream, observer).await;
 
-                    if text.starts_with("LLM error:") && attempt < MAX_STREAM_RETRIES {
-                        attempt += 1;
-                        continue;
+                    if text.starts_with("LLM error:") {
+                        use crate::llm::{
+                            classify_llm_error, format_llm_error_trace, LlmErrorKind,
+                        };
+                        let kind = classify_llm_error(&text);
+                        // Always put a clear line in the trace (429 especially).
+                        observer.on_tool_result(&ActionRecord::system_trace(
+                            format_llm_error_trace(&text),
+                        ));
+                        agent.log_harness_event(
+                            match kind {
+                                LlmErrorKind::RateLimit => "llm-rate-limit",
+                                LlmErrorKind::Reasoning => "llm-reasoning-error",
+                                LlmErrorKind::Auth => "llm-auth-error",
+                                LlmErrorKind::Other => "llm-error",
+                            },
+                            &text,
+                        );
+
+                        // If we explicitly enabled reasoning and the provider rejected it,
+                        // force Off for the session and retry once with reasoning disabled.
+                        if kind == LlmErrorKind::Reasoning
+                            && reasoning_before == Some(true)
+                            && !agent.reasoning_session_forced_off()
+                        {
+                            agent.note_reasoning_provider_failure();
+                            observer.on_tool_result(&ActionRecord::system_trace(
+                                "🔧 Reasoning disabled for this session after provider rejection — retrying",
+                            ));
+                            attempt += 1;
+                            continue;
+                        }
+
+                        if kind == LlmErrorKind::RateLimit && attempt < MAX_STREAM_RETRIES {
+                            attempt += 1;
+                            // Brief backoff so free-tier 429s aren't hammered.
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                400 * u64::from(attempt),
+                            ))
+                            .await;
+                            continue;
+                        }
+
+                        if attempt < MAX_STREAM_RETRIES && kind == LlmErrorKind::Other {
+                            attempt += 1;
+                            continue;
+                        }
                     }
                     break (text, calls, usg, fr, thk);
                 }
@@ -795,9 +840,16 @@ async fn consume_stream(
                 finish_reason = fr;
             }
             StreamChunk::Error(e) => {
+                let detail: String = e.chars().take(600).collect();
+                let msg = format!("LLM error: {detail}");
                 if text.is_empty() {
-                    text = format!("LLM error: {}", e);
+                    text = msg;
                 }
+                // Conversation line; classified trace line is added in drive_turn.
+                observer.on_token(&format!(
+                    "\n⚠ {}\n",
+                    crate::llm::format_llm_error_trace(&format!("LLM error: {detail}"))
+                ));
             }
         }
     }

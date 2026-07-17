@@ -586,6 +586,23 @@ pub fn handle_plan_loop_model_payload(
 ) {
     match payload {
         PlanModelPayload::Clarify { question } => {
+            // Duplicates are normally converted to Ready in fetch_clarification
+            // (which then drafts a proposal). If one still lands here, do not
+            // re-display the same question — leave a breadcrumb and idle.
+            if raven_tui::plan_loop::is_duplicate_clarify_question(
+                &app.plan.qa_history,
+                &question,
+            ) {
+                app.left_committed.push(format!(
+                    "Ignoring repeat question “{}” (already answered). \
+                     Send another answer or type a free-text note to continue.",
+                    question.prompt
+                ));
+                app.plan.pending_question = Some(question);
+                app.plan.loop_phase = PlanLoopPhase::AwaitingUserAnswer;
+                app.needs_redraw = true;
+                return;
+            }
             app.plan.pending_question = Some(question.clone());
             app.plan.loop_phase = PlanLoopPhase::AwaitingUserAnswer;
             app.left_committed

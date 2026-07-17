@@ -68,6 +68,38 @@ impl ContextBudget {
     }
 }
 
+/// OpenRouter extended thinking / `reasoning` request field.
+///
+/// - **Auto** — enable only for known reasoning model ids; on a provider error
+///   that looks reasoning-related, disable for the session and retry.
+/// - **On** / **Off** — force `reasoning.enabled` true/false.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum OpenRouterReasoningMode {
+    #[default]
+    Auto,
+    On,
+    Off,
+}
+
+impl OpenRouterReasoningMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" | "default" => Some(Self::Auto),
+            "on" | "true" | "1" | "enable" | "enabled" => Some(Self::On),
+            "off" | "false" | "0" | "disable" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub base_url: String,
@@ -92,6 +124,8 @@ pub struct Config {
     pub flags: RuntimeFlags,
     /// Eval harness plumbing (python paths, metrics output, etc.). Empty in normal use.
     pub harness: EvalHarness,
+    /// OpenRouter reasoning field policy (no-op for non-OpenRouter endpoints).
+    pub openrouter_reasoning: OpenRouterReasoningMode,
 }
 
 impl Config {
