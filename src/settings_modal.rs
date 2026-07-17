@@ -1417,12 +1417,11 @@ async fn handle_or_browse_key(
         }
         KeyCode::Char(c)
             if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && (c.is_ascii_graphic() || c == ' ') =>
         {
-            if c.is_ascii_graphic() || c == ' ' {
-                settings.or_query.push(c);
-                settings.rebuild_or_view();
-            }
+            settings.or_query.push(c);
+            settings.rebuild_or_view();
         }
         _ => {}
     }
